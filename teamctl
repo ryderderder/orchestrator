@@ -4190,6 +4190,142 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
 
 
 # --------------------------------------------------------------------------
+# bare `teamctl` — the front door. With no subcommand on a real terminal it
+# launches the user's default lead session: the default chat provider,
+# model, and effort (from [lead] chat_* in config, falling back to the
+# routing preference), with lead mode enabled, in the teamctl tmux session.
+# Provider-agnostic: whichever CLI the user prefers becomes the front door.
+# --------------------------------------------------------------------------
+
+def _chat_defaults() -> tuple[str, str, str]:
+    """([lead] chat_provider, chat_model, chat_effort) from config."""
+    lead = load_config().get("lead") or {}
+    return (str(lead.get("chat_provider") or ""),
+            str(lead.get("chat_model") or ""),
+            str(lead.get("chat_effort") or ""))
+
+
+def _resolve_chat() -> tuple[str | None, str, str, str]:
+    """Resolve the lead chat as (provider, model, effort, error).
+
+    provider is None with a human error when there is no honest default or
+    the chosen provider isn't ready (not installed / locked out / unknown)
+    — the message names the fix, never a stack trace."""
+    prov, model, effort = _chat_defaults()
+    if prov and prov not in PROVIDERS:
+        return None, "", "", (f"[lead] chat_provider is '{prov}', which is "
+                              "not a known provider — fix it with `teamctl "
+                              "settings` or `teamctl config lead.chat_provider "
+                              "claude|codex|grok`.")
+    if not prov:
+        prov = default_provider()
+    if prov is None:
+        avail = [p for p in ROUTABLE if provider_state(p)[0] in
+                 ("ready", "quiet")]
+        if avail:
+            return None, "", "", (
+                "no default chat provider set and several are available "
+                f"({', '.join(avail)}). Pick one: `teamctl config "
+                "lead.chat_provider <name>` (or `teamctl settings`).")
+        return None, "", "", (
+            "no provider is signed in. Sign one in, then run `teamctl` "
+            "again — see `teamctl providers`.")
+
+    state, _note = provider_state(prov)
+    if state == "not installed":
+        return None, "", "", (
+            f"{prov} is not installed. Install it (see `teamctl providers`), "
+            "or pick another with `teamctl config lead.chat_provider <name>`.")
+    if state == "locked out":
+        return None, "", "", (
+            f"{prov} is installed but signed out — sign in with "
+            f"`{LOGIN_HINTS.get(prov, prov + ' login')}`, then run `teamctl`.")
+    if state == "unknown":
+        return None, "", "", (
+            f"{prov}'s login state can't be read — check the CLI, or pick "
+            "another with `teamctl config lead.chat_provider <name>`.")
+
+    d_model, d_effort = provider_defaults(prov)
+    return prov, (model or d_model or ""), (effort or d_effort or ""), ""
+
+
+def _launch_plan(in_tmux_flag: bool, provider: str, model: str,
+                 effort: str, cwd: str) -> dict:
+    """Pure description of how the launcher would start the lead chat, so
+    the decision is testable without exec'ing anything.
+
+    mode 'exec' — already in tmux: replace this process with the provider
+    CLI (the front door IS the lead chat). mode 'new-session' — outside
+    tmux: attach-or-create the 'teamctl' session running the provider."""
+    argv = list(PROVIDERS[provider]) + interactive_flags(provider, model,
+                                                          effort)
+    if in_tmux_flag:
+        return {"mode": "exec", "argv": argv, "provider": provider,
+                "model": model, "effort": effort}
+    launch = build_launch_line(provider, "", cwd, model, effort)
+    return {"mode": "new-session", "session": "teamctl", "launch": launch,
+            "argv": ["tmux", "new-session", "-A", "-s", "teamctl", launch],
+            "provider": provider, "model": model, "effort": effort}
+
+
+def _ensure_lead_mode(provider: str) -> None:
+    """Enable lead mode for the chat provider if it isn't already — the
+    front door is the full team-lead experience. Idempotent and quiet;
+    installs only the block (plus the skill for claude), never the
+    interactive hook prompt."""
+    status = _lead_status()
+    if status["blocks"].get(provider) == "installed":
+        return
+    changes: list[tuple[str, str]] = []
+    if provider == "claude" and status["skill"] != "installed":
+        _lead_install_skill(changes)
+    _lead_install_block(provider, changes)
+    if changes:
+        print(_fg("dim", f"· enabled lead mode for {provider} "
+                         "(reverse: teamctl lead off)"))
+
+
+def cmd_launch(args: argparse.Namespace) -> int:
+    """Bare `teamctl`: open the default lead session."""
+    # first run with no config → funnel through express init, then launch
+    if not config_path().exists():
+        print(_fg("dim", "first run — configuring defaults…\n"))
+        _init_express(argparse.Namespace(custom=False, yes=False))
+        print()
+
+    provider, model, effort, err = _resolve_chat()
+    if provider is None:
+        print(f"teamctl: {err}", file=sys.stderr)
+        return 1
+
+    cwd = os.getcwd()
+    plan = _launch_plan(in_tmux(), provider, model, effort, cwd)
+
+    if getattr(args, "dry_run", False):
+        tag = f"{provider}" + (f"/{model}" if model else "")
+        if plan["mode"] == "exec":
+            print(f"launch: {tag} in this tmux pane (lead chat)")
+        else:
+            print(f"launch: {tag} in tmux session 'teamctl'")
+        print("  " + " ".join(shlex.quote(a) for a in plan["argv"]))
+        return 0
+
+    _maybe_spawn_update_check()
+    _ensure_lead_mode(provider)
+
+    if plan["mode"] == "new-session" and shutil.which("tmux") is None:
+        print("teamctl: tmux is not installed — the lead session needs it. "
+              "Install tmux, or run your provider CLI directly.",
+              file=sys.stderr)
+        return 2
+    try:
+        os.execvp(plan["argv"][0], plan["argv"])
+    except OSError as exc:                         # pragma: no cover - exec
+        print(f"teamctl: could not launch {provider}: {exc}", file=sys.stderr)
+        return 2
+
+
+# --------------------------------------------------------------------------
 # `teamctl config` — show and adjust ~/.config/agent-team/config.toml
 # --------------------------------------------------------------------------
 
@@ -4809,6 +4945,15 @@ def build_parser() -> argparse.ArgumentParser:
                           "(Claude Code) without asking")
     lp2.set_defaults(func=cmd_lead)
 
+    lnp = sub.add_parser(
+        "launch",
+        help="open the default lead session (also what bare `teamctl` does "
+             "on a terminal): the default chat provider, in the teamctl "
+             "tmux session, with lead mode on")
+    lnp.add_argument("--dry-run", action="store_true",
+                     help="print the launch plan without starting anything")
+    lnp.set_defaults(func=cmd_launch)
+
     stp = sub.add_parser(
         "settings",
         help="interactive settings cockpit (dark-room curses UI over the "
@@ -4948,6 +5093,16 @@ def main(argv: list[str] | None = None) -> int:
     # `--help` documents it)
     if argv[:1] == ["statusline"]:
         return cmd_statusline()
+    # bare `teamctl` on a real terminal is the front door: open the default
+    # lead session. Piped/CI (no tty) keeps the usage text unchanged, so
+    # scripts and `teamctl | cat` behave exactly as before.
+    if not argv:
+        try:
+            interactive = sys.stdin.isatty() and sys.stdout.isatty()
+        except (AttributeError, ValueError):
+            interactive = False
+        if interactive:
+            argv = ["launch"]
     args = build_parser().parse_args(argv)
     try:
         return args.func(args)

@@ -1503,6 +1503,102 @@ class UpdatePromptTests(_LatticeHome):
             tc.subprocess.Popen = orig_popen
 
 
+class LaunchTests(_LatticeHome):
+    """Bare `teamctl` front door: default-chat resolution, honest failures,
+    and the in-tmux vs outside-tmux launch plan — all headless (the exec is
+    driven by --dry-run / _launch_plan, never actually run)."""
+
+    def _cfg(self, text):
+        cfg = self.home / ".config" / "agent-team"
+        cfg.mkdir(parents=True, exist_ok=True)
+        (cfg / "config.toml").write_text(text)
+
+    def test_resolve_uses_explicit_chat_provider_and_model(self):
+        self.installed.add("codex")
+        seed_signin(self.home, "codex")
+        self._cfg('[lead]\nchat_provider = "codex"\nchat_model = "gpt-5.6"\n')
+        prov, model, effort, err = tc._resolve_chat()
+        self.assertEqual((prov, model, err), ("codex", "gpt-5.6", ""))
+
+    def test_resolve_falls_back_to_routing_preference(self):
+        self.installed |= {"codex", "claude"}
+        seed_signin(self.home, "codex", "claude")
+        self._cfg('[routing]\npreference = ["codex", "claude"]\n')
+        prov, _m, _e, err = tc._resolve_chat()
+        self.assertEqual((prov, err), ("codex", ""))
+
+    def test_resolve_provider_model_default_flows_through(self):
+        self.installed.add("codex")
+        seed_signin(self.home, "codex")
+        self._cfg('[routing]\npreference = ["codex"]\n'
+                  '[providers.codex]\nmodel = "gpt-5.6"\n')
+        prov, model, _e, err = tc._resolve_chat()
+        self.assertEqual((prov, model, err), ("codex", "gpt-5.6", ""))
+
+    def test_locked_out_provider_is_an_honest_error(self):
+        self.installed.add("codex")                 # installed, not signed in
+        self._cfg('[lead]\nchat_provider = "codex"\n')
+        prov, _m, _e, err = tc._resolve_chat()
+        self.assertIsNone(prov)
+        self.assertIn("signed out", err)
+        self.assertIn("codex login", err)
+
+    def test_not_installed_provider_is_an_honest_error(self):
+        self._cfg('[lead]\nchat_provider = "grok"\n')   # grok absent
+        prov, _m, _e, err = tc._resolve_chat()
+        self.assertIsNone(prov)
+        self.assertIn("not installed", err)
+
+    def test_unknown_chat_provider_is_reported(self):
+        self._cfg('[lead]\nchat_provider = "gpt"\n')
+        prov, _m, _e, err = tc._resolve_chat()
+        self.assertIsNone(prov)
+        self.assertIn("not a known provider", err)
+
+    def test_several_available_no_default_asks(self):
+        self.installed |= {"codex", "claude"}
+        seed_signin(self.home, "codex", "claude")
+        self._cfg('[output]\nverbosity = "normal"\n')   # no routing, no chat
+        prov, _m, _e, err = tc._resolve_chat()
+        self.assertIsNone(prov)
+        self.assertIn("several are available", err)
+
+    def test_launch_plan_outside_tmux_is_new_session(self):
+        plan = tc._launch_plan(False, "codex", "gpt-5.6", "high", "/w")
+        self.assertEqual(plan["mode"], "new-session")
+        self.assertEqual(plan["argv"][:4],
+                         ["tmux", "new-session", "-A", "-s"])
+        self.assertIn("teamctl", plan["argv"])
+        self.assertIn("gpt-5.6", plan["launch"])
+
+    def test_launch_plan_inside_tmux_execs_in_pane(self):
+        plan = tc._launch_plan(True, "codex", "", "high", "/w")
+        self.assertEqual(plan["mode"], "exec")
+        self.assertEqual(plan["argv"][0], "codex")
+        self.assertIn("model_reasoning_effort=\"high\"",
+                      " ".join(plan["argv"]))
+
+    def test_dry_run_reports_plan_and_touches_nothing(self):
+        self.installed.add("codex")
+        seed_signin(self.home, "codex")
+        self._cfg('[lead]\nchat_provider = "codex"\n')
+        rc, out, _ = self._run("launch", "--dry-run")
+        self.assertEqual(rc, 0)
+        self.assertIn("launch: codex", out)
+        # dry-run must not enable lead mode
+        self.assertFalse((self.home / ".claude" / "CLAUDE.md").exists())
+
+    def test_bare_no_tty_keeps_usage_behaviour(self):
+        # main() only routes bare -> launch on a real tty; under redirected
+        # stdio (this test) it must fall through to argparse's usage error
+        import contextlib
+        import io
+        with contextlib.redirect_stderr(io.StringIO()), \
+                self.assertRaises(SystemExit) as cm:
+            tc.main([])
+        self.assertEqual(cm.exception.code, 2)      # argparse: required cmd
+
+
 class InitTests(_AuthSandbox, unittest.TestCase):
     """`teamctl init` (express) and `init --custom` (rich wizard, exercised
     through its scripted line-prompt fallback: redirected stdio is not a

@@ -158,6 +158,22 @@ your package manager (brew / apt-get / dnf / pacman) — it always asks first
 use sudo, and `--no-deps` skips the offers entirely. Provider CLIs are never
 auto-installed; their official install one-liners are printed instead.
 
+## The front door
+
+```sh
+teamctl        # ← just this
+```
+
+Type `teamctl` on its own in a terminal and you're in: it opens your
+default chat provider as the **lead** — in the `teamctl` tmux session, with
+lead mode enabled — the full team-lead experience in one word. The default
+provider/model/effort come from your config (`[lead] chat_provider` /
+`chat_model` / `chat_effort`, falling back to your routing preference or
+the only signed-in provider); set them in `teamctl settings`. If nothing's
+signed in, or the chosen provider is locked out, it says so and names the
+fix — never a stack trace. Piped or in CI (no terminal), bare `teamctl`
+prints usage as before.
+
 ## Quickstart
 
 ```sh
