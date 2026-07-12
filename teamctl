@@ -307,7 +307,9 @@ def _open_pane(cmd: str, existing: list[str]) -> str:
         else:
             flag = "-h" if w >= 2 * h else "-v"
 
-    argv = ["split-window", flag, "-P", "-F", "#{pane_id}"]
+    # -d: never move focus to the new pane — spawning a teammate must not
+    # steal the user's cursor from whatever pane they are working in.
+    argv = ["split-window", flag, "-d", "-P", "-F", "#{pane_id}"]
     if target:
         argv += ["-t", target]
     argv.append(cmd)

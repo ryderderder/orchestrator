@@ -575,6 +575,30 @@ class LiveTmuxTests(unittest.TestCase):
         Path(str(self.tmp) + ".tmp").unlink(missing_ok=True)
         os.environ.pop("TEAMCTL_STATE", None)
 
+    @staticmethod
+    def _active_pane() -> str:
+        # the ACTIVE pane of the current window (display-message with no -t
+        # would resolve to the invoking pane, not the active one)
+        out = tc.tmux("list-panes", "-F", "#{pane_id} #{pane_active}").stdout
+        for line in out.splitlines():
+            pane, active = line.split()
+            if active == "1":
+                return pane
+        return ""
+
+    def test_spawn_does_not_steal_focus(self):
+        # regression: split-window without -d moves the user's cursor into
+        # the new teammate pane; spawn must leave the active pane alone.
+        before = self._active_pane()
+        self.assertEqual(tc.main(["spawn", "t_alpha", "--provider", "shell"]), 0)
+        try:
+            after = self._active_pane()
+            spawned = tc.load_state()["teammates"]["t_alpha"]["pane_id"]
+            self.assertNotEqual(after, spawned, "focus moved to the new pane")
+            self.assertEqual(before, after, "active pane changed during spawn")
+        finally:
+            tc.main(["shutdown", "t_alpha"])
+
     def test_spawn_list_duplicate_shutdown(self):
         self.assertEqual(tc.main(["spawn", "t_alpha", "--provider", "shell"]), 0)
         state = tc.load_state()
