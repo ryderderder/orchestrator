@@ -123,7 +123,7 @@ If `NO_COLOR`, `TEAMCTL_PLAIN=1`, or non-TTY: print final frame only, no delays.
 ### 2.1 Microcopy bank (use as-is or near-as-is)
 
 1. `scanning the dark for providers`  
-2. `ready` / `quiet` / `locked out` — status words (not “available / not installed / not authenticated”)  
+2. `ready` / `quiet` / `locked out` / `not installed` — status words (the v0.4.0 provider state lattice; never “available / not authenticated”)  
 3. `defaults locked`  
 4. `nothing to configure. yet.`  
 5. `pick a model — or leave the CLI its secrets`  
@@ -137,13 +137,26 @@ If `NO_COLOR`, `TEAMCTL_PLAIN=1`, or non-TTY: print final frame only, no delays.
 
 **Avoid:** “Great choice!”, “You’re all set 🎉”, “Let’s get you onboarded”, “Almost there!”, exclamation spam.
 
-**Status word map**
+**Status word map** *(v0.4.0 amendment — the provider state lattice)*
+
+The original spec had one word (`quiet`) for both “not on PATH” and
+“signed in but silent”, and the first real install read that as breakage:
+three different truths, one ambiguous label. Since v0.4.0 every surface
+(this frame, `providers`, `usage`, the installer screen) uses one word
+per truth:
 
 | Detection | Word | Color |
 |-----------|------|-------|
-| installed + authed | `ready` | `fg_ok` / accent |
-| not on PATH | `quiet` | `fg_dim` |
-| on PATH, not authed | `locked out` | `fg_warn` |
+| installed + signed in + usage numbers known | `ready` | `fg_ok` |
+| installed + signed in, no usage numbers yet | `quiet` — with the dim inline hint `— signed in, wakes on first use` | `fg_soft` |
+| on PATH, not signed in | `locked out` | `fg_warn` |
+| not on PATH | `not installed` | `fg_dim` |
+| auth artifacts unreadable | `unknown` | `fg_dim` |
+
+`quiet` and `ready` are equally usable: usage data changes the word, not
+the eligibility (both are configured and routed). Signed-in detection is
+content-validated against each CLI's own login artifacts — see the README
+“Provider states” table.
 
 ---
 
@@ -168,9 +181,9 @@ Express is the default when stdin/stdout is a TTY. No mode picker.
 5. Print Express frame.  
 6. Exit 0. Do **not** offer tmux/statusline/lead in Express.
 
-If **zero** providers ready: still write a minimal config (verbosity + delegation only), show the frame with all `quiet`/`locked out`, and one extra dim line: `log a provider in, then re-run`.
+If **zero** providers usable: still write a minimal config (verbosity + delegation only), show the frame with the honest per-provider words, and one extra dim line — `log a provider in, then re-run` when something is `locked out`, else `install a provider CLI, then re-run`.
 
-### 3.3 Exact mockup — happy path (2 ready, 1 quiet)
+### 3.3 Exact mockup — happy path (1 ready, 1 quiet, 1 not installed)
 
 **Line budget:** 16 content lines (within 12–18).  
 **Width:** keep ≤ 56 cols for the moment; rest of terminal stays empty (breathing room).
@@ -180,11 +193,11 @@ If **zero** providers ready: still write a minimal config (verbosity + delegatio
          ━━━━━━━━━━━━━━━━━
 
   · claude      ready
-  · codex       ready
-  · grok        quiet
+  · codex       quiet — signed in, wakes on first use
+  · grok        not installed
 
   defaults locked
-    route     codex › claude
+    route     claude › codex
     model     (cli default)
     effort    high
     voice     normal
@@ -217,15 +230,15 @@ If **zero** providers ready: still write a minimal config (verbosity + delegatio
   customize →  teamctl init --custom
 ```
 
-### 3.5 Exact mockup — none ready
+### 3.5 Exact mockup — nothing installed
 
 ```text
             t e a m c t l
          ━━━━━━━━━━━━━━━━━
 
-  · claude      quiet
-  · codex       quiet
-  · grok        quiet
+  · claude      not installed
+  · codex       not installed
+  · grok        not installed
 
   defaults locked
     route     —
@@ -235,12 +248,12 @@ If **zero** providers ready: still write a minimal config (verbosity + delegatio
     lead      ask
 
   wrote  ~/.config/agent-team/config.toml
-  log a provider in, then re-run
+  install a provider CLI, then re-run
 
   customize →  teamctl init --custom
 ```
 
-### 3.6 Exact mockup — installed, not authed
+### 3.6 Exact mockup — installed, not signed in
 
 ```text
             t e a m c t l
@@ -248,7 +261,7 @@ If **zero** providers ready: still write a minimal config (verbosity + delegatio
 
   · claude      locked out
   · codex       ready
-  · grok        quiet
+  · grok        not installed
 
   defaults locked
     route     codex
@@ -269,8 +282,9 @@ wordmark:     ESC[38;5;51m  + letter-spaced "t e a m c t l" + ESC[0m
 rule:         ESC[38;5;238m + "━━━━━━━━━━━━━━━━━" + ESC[0m
 bullet:       ESC[38;5;240m "·" ESC[0m
 ready:        ESC[38;5;114m ready ESC[0m
-quiet:        ESC[38;5;240m quiet ESC[0m
+quiet:        ESC[38;5;44m quiet ESC[0m  + dim inline hint ESC[38;5;240m — signed in, wakes on first use ESC[0m
 locked out:   ESC[38;5;180m locked out ESC[0m
+not installed: ESC[38;5;240m not installed ESC[0m
 section:      ESC[38;5;252m defaults locked ESC[0m
 keys:         ESC[38;5;240m route/model/... ESC[0m
 values:       ESC[38;5;252m ... ESC[0m

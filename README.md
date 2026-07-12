@@ -87,6 +87,56 @@ following, in order:
 
 [![ci](https://github.com/ryderderder/teamctl/actions/workflows/ci.yml/badge.svg)](https://github.com/ryderderder/teamctl/actions/workflows/ci.yml)
 
+## Updating
+
+```sh
+teamctl update --check     # installed vs latest, from your install source
+teamctl update             # replace ~/.local/bin/teamctl + claude-statusline
+```
+
+The installer records where teamctl came from (`install-meta.json` in the
+state dir: a git clone, the curl one-liner, or a plain local copy).
+`update` re-fetches from that source and atomically replaces the
+installed copies: git checkouts fetch and read the files out of
+`FETCH_HEAD` (your checkout is never moved or dirtied), private repos go
+through an authenticated `gh`, public installs through curl. Your config
+(`~/.config/agent-team/`) and state are never touched. An unreachable
+source prints the reason per route — never a stack trace — and a download
+that doesn't compile is refused.
+
+teamctl also runs a **background version check** at most once a day
+(fully detached, silent on any failure, never blocking a command). When a
+newer version is known, one dim line appears at session start and under
+`providers`/`usage`:
+
+    · teamctl X.Y.Z available — teamctl update
+
+Tune it in the config under `[update]`: `check = true|false` and
+`mode = "prompt" | "auto" | "off"` — `auto` applies a known-newer version
+at session start (an explicit opt-in; never the default), `off` never
+mentions updates. Installs made before v0.4.0 have no recorded source:
+re-run `install.sh` once and `teamctl update` works from then on.
+
+## Provider states
+
+Every surface that names a provider — `teamctl providers`, `teamctl
+usage`, the init frames, the installer's detection screen — speaks the
+same word lattice, so different truths never share one ambiguous label:
+
+| state | meaning | what to do |
+|---|---|---|
+| `ready` | installed, signed in, usage numbers known (shown inline) | nothing — spawn away |
+| `quiet` | installed and signed in; no usage numbers seen yet | nothing — it wakes on first use (each surface shows the exact wake hint) |
+| `locked out` | installed but not signed in | the CLI's own login: `claude auth login` / `codex login` / `grok login` |
+| `not installed` | CLI not on PATH | the installer prints the official install one-liners |
+| `unknown` | auth artifacts exist but can't be read | reported honestly instead of guessing — check the CLI |
+
+`quiet` and `ready` providers are equally usable for spawning and
+routing — usage data changes the word, not the eligibility. Residual
+usage artifacts left by an *uninstalled* CLI (e.g. leftover
+`~/.codex/sessions` rollouts) are flagged as `not installed — residual
+usage history found` and never rendered as a live provider.
+
 ## Requirements
 
 | platform | status |
@@ -278,7 +328,8 @@ Three ways in, same config file every way (canonical design:
 [docs/design/installer-spec.md](docs/design/installer-spec.md)):
 
 - **`teamctl init` — express (the default).** Zero questions: detects your
-  provider CLIs (`ready` / `quiet` / `locked out`), locks sane defaults
+  provider CLIs (the [provider state lattice](#provider-states):
+  `ready` / `quiet` / `locked out` / `not installed`), locks sane defaults
   (each CLI's own model, effort `high`, routing in alphabetical order,
   delegation `ask`, voice `normal`), writes the config, and prints one
   compact frame. Done in seconds; `--yes` keeps its scripted contract
@@ -492,11 +543,16 @@ anything (or anyone) able to run teamctl can steer every teammate.
   provides a standard Linux userland and is the supported route there, but
   hasn't been separately tested.
 - Provider CLIs must already be installed and logged in; teamctl never
-  handles credentials itself. **Login detection is heuristic**: it infers
-  login from observed artifacts (`~/.claude.json`, `~/.codex/auth.json`,
-  `~/.grok/auth.json` — with signs-of-CLI-use as grok's last-resort
-  fallback, never bare directory existence). A CLI update that moves them
-  shows up as "not-authed"; the CLIs themselves stay the source of truth.
+  handles credentials itself. **Login detection reads observed
+  artifacts**, content-validated (never bare file existence): claude's
+  `.credentials.json` / `oauthAccount` in `~/.claude.json` / the macOS
+  Keychain item (attribute lookup only — the secret is never read);
+  codex's `~/.codex/auth.json` tokens; grok's `~/.grok/auth.json`
+  credential entries, with signs-of-CLI-use as grok's flagged last-resort
+  fallback. Exported provider API keys count too. Each artifact was
+  verified against a live signed-in install, but a CLI update that moves
+  them shows up as `locked out` (and an unreadable artifact as
+  `unknown`); the CLIs themselves stay the source of truth.
 
 ## Credits
 

@@ -365,7 +365,7 @@ class VersionTests(unittest.TestCase):
             tc.main(["--version"])
         self.assertEqual(cm.exception.code, 0)
         self.assertIn(tc.VERSION, buf.getvalue())
-        self.assertEqual(tc.VERSION, "0.4.0-dev")
+        self.assertEqual(tc.VERSION, "0.4.0")
 
 
 class CliTests(unittest.TestCase):
