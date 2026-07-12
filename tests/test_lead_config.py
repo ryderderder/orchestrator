@@ -105,6 +105,28 @@ class LeadOnTests(ThrowawayHomeTestCase):
         self.assertTrue(bak.exists())
         self.assertNotIn(tc.LEAD_MD_BEGIN, bak.read_text())
 
+    def test_on_refreshes_stale_block_in_place(self):
+        self.claude_md.parent.mkdir(parents=True)
+        stale = tc.LEAD_MD_BEGIN + "\nOLD RULES from v0.1\n" + tc.LEAD_MD_END + "\n"
+        self.claude_md.write_text("# before\n" + stale + "# after\n")
+        rc, out, _ = self.run_cli(["lead", "on"], answers=["n"])
+        self.assertEqual(rc, 0)
+        text = self.claude_md.read_text()
+        self.assertEqual(text.count(tc.LEAD_MD_BEGIN), 1)
+        self.assertNotIn("OLD RULES", text)
+        self.assertIn("teamctl usage", text)             # fresh block content
+        # refreshed IN PLACE: still between the surrounding content
+        self.assertLess(text.index("# before"), text.index(tc.LEAD_MD_BEGIN))
+        self.assertLess(text.index(tc.LEAD_MD_END), text.index("# after"))
+        self.assertIn("updated the teamctl-lead block", out)
+        bak = Path(str(self.claude_md) + ".bak-teamctl")
+        self.assertIn("OLD RULES", bak.read_text())
+        # an up-to-date block is left alone
+        rc, out, _ = self.run_cli(["lead", "on"], answers=["n"])
+        self.assertEqual(rc, 0)
+        self.assertIn("skipping", out)
+        self.assertEqual(self.claude_md.read_text(), text)
+
     def test_on_updates_changed_skill_with_backup(self):
         self.assertEqual(self.run_cli(["lead", "on"])[0], 0)
         self.skill_md.write_text("stale contents")
@@ -363,6 +385,12 @@ class ConfigShowSetTests(ThrowawayHomeTestCase):
         self.assertEqual(rc, 0)
         data = tomllib.loads(self.cfg.read_text())
         self.assertIs(data["output"]["fancy"], True)
+        # bare integers become TOML ints (e.g. layout.lead_width)
+        rc, _, _ = self.run_cli(["config", "layout.lead_width", "33"])
+        self.assertEqual(rc, 0)
+        data = tomllib.loads(self.cfg.read_text())
+        self.assertEqual(data["layout"]["lead_width"], 33)
+        self.assertIsInstance(data["layout"]["lead_width"], int)
 
     def test_get_single_key(self):
         self._seed()

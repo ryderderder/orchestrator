@@ -17,11 +17,48 @@ Field sources (see the Claude Code statusLine documentation):
                                       in which case the ctx segment is
                                       omitted rather than a number invented
 
-Stdlib only (json, sys), so it stays well within the tight time budget
-status-line commands need to meet.
+Side effect: the stdin JSON also carries `rate_limits.five_hour/seven_day`
+(used_percentage 0-100 and resets_at epoch seconds -- documented statusLine
+fields, present for Claude subscribers after the first API response). Those
+are cached to ~/.local/state/agent-team/claude-usage.json so `teamctl usage`
+can report real Claude usage. The dump is best-effort and atomic; nothing in
+it can break the status line itself.
+
+Stdlib only (json, os, sys, time), so it stays well within the tight time
+budget status-line commands need to meet.
 """
 import json
+import os
 import sys
+import time
+
+
+def dump_usage(data):
+    """Best-effort cache of rate_limits for `teamctl usage`. Never raises."""
+    try:
+        rl = data.get("rate_limits")
+        if not isinstance(rl, dict):
+            return
+        windows = {}
+        for win in ("five_hour", "seven_day"):
+            w = rl.get(win)
+            if isinstance(w, dict):
+                windows[win] = {
+                    "used_percentage": w.get("used_percentage"),
+                    "resets_at": w.get("resets_at"),
+                }
+        if not windows:
+            return
+        d = os.path.join(os.path.expanduser("~"),
+                         ".local", "state", "agent-team")
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, "claude-usage.json")
+        tmp = "%s.tmp%d" % (path, os.getpid())
+        with open(tmp, "w") as fh:
+            json.dump({"captured_at": time.time(), "rate_limits": windows}, fh)
+        os.replace(tmp, path)  # atomic: readers never see a partial file
+    except Exception:
+        pass  # the status line must never break over caching
 
 
 def main():
@@ -42,6 +79,7 @@ def main():
     # else: genuinely unknown -- do not fabricate a number.
 
     print(" · ".join(parts))
+    dump_usage(data)
 
 
 if __name__ == "__main__":

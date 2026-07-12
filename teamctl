@@ -280,24 +280,71 @@ def _pane_size(pane_id: str) -> tuple[int, int]:
         return 0, 0
 
 
+def _window_panes(lead: str) -> list[str]:
+    """All pane ids in the window containing `lead`."""
+    try:
+        out = tmux("list-panes", "-t", lead, "-F", "#{pane_id}").stdout
+    except subprocess.CalledProcessError:
+        return []
+    return [line.strip() for line in out.splitlines() if line.strip()]
+
+
+def _split_candidates(lead: str | None, existing: list[str]) -> list[str]:
+    """Panes a new teammate may split: every pane in the lead's window except
+    the lead itself — so teammates fold into the right-hand grid even when
+    non-teamctl panes (e.g. native agent panes) already occupy it, instead of
+    carving slivers off the lead. Falls back to the tracked-teammate list,
+    then (empty) to splitting the lead."""
+    if lead:
+        panes = [p for p in _window_panes(lead) if p != lead]
+        if panes:
+            return panes
+    live = live_pane_ids()
+    return [p for p in existing if p in live]
+
+
+def lead_width_percent() -> int:
+    """Configured lead-pane width share ([layout] lead_width, % of the
+    window), clamped to 20–80. Default 50."""
+    raw = (load_config().get("layout") or {}).get("lead_width", 50)
+    try:
+        pct = int(raw)
+    except (TypeError, ValueError):
+        pct = 50
+    return max(20, min(80, pct))
+
+
+def _enforce_lead_width() -> None:
+    """Re-assert the lead pane's width after layout changes: every spawn and
+    shutdown re-tiles the window, and without this the lead pane gradually
+    loses (or hoards) columns."""
+    lead = os.environ.get("TMUX_PANE")
+    if not lead:
+        return
+    tmux("resize-pane", "-t", lead, "-x", f"{lead_width_percent()}%",
+         check=False)
+
+
 def _open_pane(cmd: str, existing: list[str]) -> str:
     """Open a teammate as a PANE in the lead's window, keeping the lead on the
     left and teammates in a grid of squares to its right.
 
     The first teammate splits the lead pane horizontally (taking the right
-    half). Each later teammate splits the largest existing teammate pane,
+    half). Each later teammate splits the largest other pane in the window
+    (teamctl-tracked or not, so foreign panes fold into the same grid),
     choosing the split direction that keeps panes square-looking (a terminal
     cell is ~2x taller than wide, so a pane reads as square when width is
     about twice its height). Four teammates thus form a 2x2 grid beside the
-    lead; the lead pane itself is never re-split after the first."""
+    lead; the lead pane itself is never re-split after the first, and its
+    width is re-pinned to the configured [layout] lead_width share."""
     lead = os.environ.get("TMUX_PANE")
-    live = [p for p in existing if p in live_pane_ids()]
+    candidates = _split_candidates(lead, existing)
 
-    if not live:
+    if not candidates:
         target, flag = lead, "-h"
     else:
         target, best_area, w, h = None, -1, 0, 0
-        for p in live:
+        for p in candidates:
             pw, ph = _pane_size(p)
             if pw * ph > best_area:
                 target, best_area, w, h = p, pw * ph, pw, ph
@@ -313,7 +360,10 @@ def _open_pane(cmd: str, existing: list[str]) -> str:
     if target:
         argv += ["-t", target]
     argv.append(cmd)
-    return tmux(*argv).stdout.strip()
+    pane_id = tmux(*argv).stdout.strip()
+    # pin the lead's width back to its configured share of the window
+    _enforce_lead_width()
+    return pane_id
 
 
 def _set_pane_title(pane_id: str, role: str, model: str = "") -> None:
@@ -516,6 +566,7 @@ def cmd_shutdown(args: argparse.Namespace) -> int:
         del state["teammates"][args.role]
         save_state(state)
 
+    _enforce_lead_width()
     print(f"shut down teammate '{args.role}' (pane {pane_id})")
     return 0
 
@@ -853,9 +904,37 @@ def _fmt_reset(resets_at, now) -> str:
     return f"{when} (in {mins // 60}h{mins % 60:02d}m)"
 
 
+def _fmt_age(seconds: float) -> str:
+    s = max(0, int(seconds))
+    if s < 60:
+        return f"{s}s ago"
+    if s < 3600:
+        return f"{s // 60}m ago"
+    return f"{s // 3600}h{(s % 3600) // 60:02d}m ago"
+
+
+def claude_usage() -> dict | None:
+    """Claude 5h/weekly windows, cached by the teamctl claude-statusline.
+
+    Claude Code pipes `rate_limits.five_hour/seven_day` (used_percentage,
+    resets_at — documented statusLine fields, present for subscribers after
+    the first API response) into the status line; ours dumps them to
+    claude-usage.json next to the state file. Absent/partial data is normal."""
+    path = state_path().parent / "claude-usage.json"
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("rate_limits"), dict):
+        return None
+    return data
+
+
 def cmd_usage(args: argparse.Namespace) -> int:
     """Real provider usage %/reset where the provider exposes it locally.
-    Also refreshes the routing signal: Codex at 100% on its 5h window is
+    Also refreshes routing signals: a provider at 100% on its 5h window is
     marked exhausted so `route` skips it until it resets."""
     now = time.time()
     rl = codex_usage()
@@ -871,10 +950,30 @@ def cmd_usage(args: argparse.Namespace) -> int:
             _record_provider_signal("codex", "exhausted",
                                     resets_at=pw.get("resets_at"))
 
+    cu = claude_usage()
+    claude = {}
+    claude_captured = None
+    if cu:
+        claude_captured = cu.get("captured_at")
+        for key, label in (("five_hour", "5h"), ("seven_day", "weekly")):
+            w = cu["rate_limits"].get(key) or {}
+            if isinstance(w, dict) and w.get("used_percentage") is not None:
+                claude[label] = {"used_percent": w["used_percentage"],
+                                 "resets_at": w.get("resets_at")}
+        fh = cu["rate_limits"].get("five_hour") or {}
+        if isinstance(fh, dict) and (fh.get("used_percentage") or 0) >= 100 \
+                and (fh.get("resets_at") or 0) > now:
+            _record_provider_signal("claude", "exhausted",
+                                    resets_at=fh.get("resets_at"))
+
     if args.json:
+        claude_json = None
+        if claude:
+            claude_json = dict(claude)
+            claude_json["captured_at"] = claude_captured
         print(json.dumps({
             "codex": codex or None,
-            "claude": None,
+            "claude": claude_json,
             "grok": None,
         }, indent=2))
         return 0
@@ -886,8 +985,16 @@ def cmd_usage(args: argparse.Namespace) -> int:
                   f"resets {_fmt_reset(w['resets_at'], now)}")
     else:
         print(f"{'codex':<8}  no local usage data found")
-    print(f"{'claude':<8}  account quota not exposed locally; live context shows "
-          "in Claude Code's own status line")
+    if claude:
+        age = (_fmt_age(now - claude_captured)
+               if isinstance(claude_captured, (int, float)) else "age unknown")
+        for label, w in claude.items():
+            print(f"{'claude':<8}  {label}: {w['used_percent']:.0f}% used, "
+                  f"resets {_fmt_reset(w['resets_at'], now)}")
+        print(f"{'claude':<8}  (source: statusline cache, {age})")
+    else:
+        print(f"{'claude':<8}  no data yet — run any Claude Code turn with the "
+              "teamctl statusline installed (`teamctl init`)")
     print(f"{'grok':<8}   no local usage data exposed")
     return 0
 
@@ -1416,11 +1523,39 @@ def _lead_install_skill(changes: list[tuple[str, str]]) -> None:
     changes.append((f"installed {skill_md}", "teamctl lead off"))
 
 
+def _extract_lead_block(text: str) -> str:
+    """The first BEGIN..END teamctl-lead block in `text`, markers included
+    (through to end-of-text if the END marker is missing), or ''."""
+    out, inside = [], False
+    for line in text.splitlines(keepends=True):
+        if line.strip() == LEAD_MD_BEGIN:
+            inside = True
+        if inside:
+            out.append(line)
+        if inside and line.strip() == LEAD_MD_END:
+            break
+    return "".join(out)
+
+
 def _lead_install_claude_md(changes: list[tuple[str, str]]) -> None:
     cm = _lead_paths()["claude_md"]
     text = cm.read_text() if cm.exists() else ""
     if LEAD_MD_BEGIN in text:
-        print(f"{cm} already contains the teamctl-lead block — skipping.")
+        current = _extract_lead_block(text)
+        if current.rstrip("\n") == LEAD_CLAUDE_BLOCK.rstrip("\n"):
+            print(f"{cm} already contains the current teamctl-lead block "
+                  "— skipping.")
+            return
+        # stale block from an older teamctl: refresh it in place (like the
+        # skill file), leaving everything around it untouched
+        bak = Path(str(cm) + ".bak-teamctl")
+        shutil.copy2(cm, bak)
+        replacement = (LEAD_CLAUDE_BLOCK if current.endswith("\n")
+                       else LEAD_CLAUDE_BLOCK.rstrip("\n"))
+        cm.write_text(text.replace(current, replacement, 1))
+        print(f"updated the teamctl-lead block in {cm} (backup: {bak})")
+        changes.append((f"updated the teamctl-lead block in {cm}",
+                        f"restore {bak}, or run `teamctl lead off`"))
         return
     if cm.exists():
         bak = Path(str(cm) + ".bak-teamctl")
@@ -1731,12 +1866,15 @@ def _set_dotted(data: dict, dotted: str, value) -> None:
 
 def _parse_config_value(key: str, raw: str):
     """CLI string -> config value. Comma-separated (or routing.preference)
-    becomes a list of strings; true/false a bool; everything else a string."""
+    becomes a list of strings; true/false a bool; a bare integer an int
+    (e.g. layout.lead_width); everything else a string."""
     raw = raw.strip()
     if key == "routing.preference" or "," in raw:
         return [s.strip() for s in raw.split(",") if s.strip()]
     if raw.lower() in ("true", "false"):
         return raw.lower() == "true"
+    if raw.isdigit() or (raw.startswith("-") and raw[1:].isdigit()):
+        return int(raw)
     return raw
 
 

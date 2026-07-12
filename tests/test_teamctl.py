@@ -216,6 +216,61 @@ class CliTests(unittest.TestCase):
                 os.environ["TMUX"] = saved
 
 
+class LayoutTests(unittest.TestCase):
+    """lead_width_percent clamping, split-candidate selection, and the
+    resize call — all with tmux interactions monkeypatched."""
+
+    def setUp(self):
+        self._config = tc.load_config
+        self._window_panes = tc._window_panes
+        self._live = tc.live_pane_ids
+        self._tmux = tc.tmux
+        self._pane = os.environ.get("TMUX_PANE")
+
+    def tearDown(self):
+        tc.load_config = self._config
+        tc._window_panes = self._window_panes
+        tc.live_pane_ids = self._live
+        tc.tmux = self._tmux
+        if self._pane is None:
+            os.environ.pop("TMUX_PANE", None)
+        else:
+            os.environ["TMUX_PANE"] = self._pane
+
+    def test_lead_width_percent_clamps_and_defaults(self):
+        cases = [({}, 50),
+                 ({"layout": {"lead_width": 33}}, 33),
+                 ({"layout": {"lead_width": "33"}}, 33),
+                 ({"layout": {"lead_width": 90}}, 80),
+                 ({"layout": {"lead_width": 5}}, 20),
+                 ({"layout": {"lead_width": "wide"}}, 50)]
+        for cfg, want in cases:
+            tc.load_config = lambda cfg=cfg: cfg
+            self.assertEqual(tc.lead_width_percent(), want, cfg)
+
+    def test_split_candidates_exclude_lead_and_fall_back(self):
+        tc._window_panes = lambda lead: ["%1", "%2", "%3"]
+        self.assertEqual(tc._split_candidates("%1", []), ["%2", "%3"])
+        # window listing empty -> tracked teammates that are still live
+        tc._window_panes = lambda lead: []
+        tc.live_pane_ids = lambda: {"%9"}
+        self.assertEqual(tc._split_candidates("%1", ["%9", "%7"]), ["%9"])
+        # no lead at all -> tracked fallback too
+        self.assertEqual(tc._split_candidates(None, ["%9"]), ["%9"])
+
+    def test_enforce_lead_width_resizes_lead_only_when_known(self):
+        calls = []
+        tc.tmux = lambda *a, **k: calls.append(a)
+        tc.load_config = lambda: {"layout": {"lead_width": 33}}
+        os.environ.pop("TMUX_PANE", None)
+        tc._enforce_lead_width()
+        self.assertEqual(calls, [])                     # no lead -> no resize
+        os.environ["TMUX_PANE"] = "%5"
+        tc._enforce_lead_width()
+        self.assertEqual(calls,
+                         [("resize-pane", "-t", "%5", "-x", "33%")])
+
+
 class TmuxMissingTests(unittest.TestCase):
     def test_clean_error_when_tmux_absent(self):
         original = tc.subprocess.run
@@ -562,24 +617,43 @@ class ResultWaitLivenessTests(unittest.TestCase):
 
 @unittest.skipUnless(os.environ.get("TMUX"), "requires a live tmux session")
 class LiveTmuxTests(unittest.TestCase):
+    """Every live test runs in a dedicated throwaway tmux WINDOW: teamctl
+    treats the window's own first pane as the lead (via TMUX_PANE). This
+    keeps test panes out of the user's real window and gives them a
+    predictably roomy layout — in a crowded real window, test panes came up
+    tiny and wrapped output made pane-content assertions flaky."""
+
     def setUp(self):
         self.tmp = HERE / ".test-live-state.json"
         os.environ["TEAMCTL_STATE"] = str(self.tmp)
         self.tmp.unlink(missing_ok=True)
+        out = tc.tmux("new-window", "-d", "-n", "teamctl-tests",
+                      "-P", "-F", "#{window_id} #{pane_id}").stdout.split()
+        self.window_id, self.lead_pane = out[0], out[1]
+        # as generous a canvas as the tmux build allows (no-op pre-2.9)
+        tc.tmux("resize-window", "-t", self.window_id, "-x", "220", "-y", "50",
+                check=False)
+        self._tmux_pane = os.environ.get("TMUX_PANE")
+        os.environ["TMUX_PANE"] = self.lead_pane
 
     def tearDown(self):
         # best-effort cleanup of any pane we left behind
         for role in ("t_alpha", "t_beta", "rt_mate", "orphan_mate", "kill_mate"):
             tc.main(["shutdown", role])
+        tc.tmux("kill-window", "-t", self.window_id, check=False)
+        if self._tmux_pane is None:
+            os.environ.pop("TMUX_PANE", None)
+        else:
+            os.environ["TMUX_PANE"] = self._tmux_pane
         self.tmp.unlink(missing_ok=True)
         Path(str(self.tmp) + ".tmp").unlink(missing_ok=True)
         os.environ.pop("TEAMCTL_STATE", None)
 
-    @staticmethod
-    def _active_pane() -> str:
-        # the ACTIVE pane of the current window (display-message with no -t
+    def _active_pane(self) -> str:
+        # the ACTIVE pane of the throwaway window (display-message with no -t
         # would resolve to the invoking pane, not the active one)
-        out = tc.tmux("list-panes", "-F", "#{pane_id} #{pane_active}").stdout
+        out = tc.tmux("list-panes", "-t", self.window_id,
+                      "-F", "#{pane_id} #{pane_active}").stdout
         for line in out.splitlines():
             pane, active = line.split()
             if active == "1":
@@ -644,6 +718,32 @@ class LiveTmuxTests(unittest.TestCase):
                 break
             time.sleep(0.15)
         self.assertTrue(found, "instruction did not execute in the teammate pane")
+
+    def test_lead_width_pinned_and_foreign_pane_folded(self):
+        original = tc.load_config
+        tc.load_config = lambda: {"layout": {"lead_width": 40}}
+        try:
+            # a foreign (non-teamctl) pane already occupies the right side
+            tc.tmux("split-window", "-h", "-d", "-P", "-F", "#{pane_id}",
+                    "-t", self.lead_pane)
+            # the lead is never a split candidate; the foreign pane is
+            self.assertNotIn(self.lead_pane,
+                             tc._split_candidates(self.lead_pane, []))
+            self.assertEqual(
+                tc.main(["spawn", "t_alpha", "--provider", "shell"]), 0)
+            # teammate folded in beside the foreign pane, lead not re-split
+            self.assertEqual(len(tc._window_panes(self.lead_pane)), 3)
+            win_w = int(tc.tmux("display-message", "-p", "-t", self.window_id,
+                                "#{window_width}").stdout.strip())
+            lead_w, _ = tc._pane_size(self.lead_pane)
+            self.assertLessEqual(abs(lead_w - int(win_w * 0.40)), 3,
+                                 f"lead {lead_w} not ~40% of {win_w}")
+            # shutdown re-pins the lead width too
+            self.assertEqual(tc.main(["shutdown", "t_alpha"]), 0)
+            lead_w2, _ = tc._pane_size(self.lead_pane)
+            self.assertLessEqual(abs(lead_w2 - int(win_w * 0.40)), 3)
+        finally:
+            tc.load_config = original
 
     def test_dispatch_roundtrip_via_shell_provider(self):
         # a dispatched 'shell' teammate emits JSON; the lead reads it back.
