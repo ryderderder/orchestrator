@@ -1,7 +1,5 @@
 # teamctl
 
-[![ci](https://github.com/ryderderder/teamctl/actions/workflows/ci.yml/badge.svg)](https://github.com/ryderderder/teamctl/actions/workflows/ci.yml)
-
 **teamctl** turns a tmux window into an AI agent team: a *lead* agent (or you)
 in the left pane manages *teammates* — Claude Code, Codex, or Grok CLI
 sessions — as tmux panes tiled in a square grid to the right. It spawns
@@ -9,6 +7,65 @@ interactive teammates, dispatches headless tasks and reads their results back
 as JSON, routes work to whichever provider is currently available, tracks real
 usage where providers expose it, and tears teammates down cleanly
 (process-tree-verified, no orphans). Single-file Python, stdlib only.
+
+## Install
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/ryderderder/teamctl/main/install.sh | bash
+```
+
+That one line is the whole setup: the installer copies the tools to
+`~/.local/bin`, offers to install anything missing (tmux — a hard
+requirement — defaults to yes; nothing is ever installed without asking),
+then drops you into a tmux session with the onboarding wizard running.
+Opt-outs: `bash -s -- --no-init` (skip the wizard/tmux bootstrap),
+`--no-deps` (skip dependency offers). Safe to re-run. From a checkout:
+`git clone https://github.com/ryderderder/teamctl && cd teamctl && ./install.sh`.
+
+### Install via your AI agent — paste this prompt
+
+Prefer to have an agent set everything up? Paste this into any AI coding
+CLI (also in [INSTALL_PROMPT.md](INSTALL_PROMPT.md)):
+
+```text
+Install teamctl (https://github.com/ryderderder/teamctl) for me — it manages
+AI teammates (Claude Code / Codex / Grok CLIs) as tmux panes. Do all of the
+following, in order:
+
+1. Run the installer:
+     curl -fsSL https://raw.githubusercontent.com/ryderderder/teamctl/main/install.sh | bash -s -- --no-init
+   (--no-init because you are driving the setup yourself; without it the
+   installer opens an interactive tmux wizard). If it reports missing
+   dependencies (tmux, or python3 older than 3.11), install them with the
+   system package manager (ask me before anything that needs sudo). If it
+   reports no provider CLI, show me the official install one-liners it
+   prints and ask which (if any) to run. Make sure ~/.local/bin is on my
+   PATH; fix my shell profile if not.
+
+2. Configure it: run `teamctl init` interactively if you have a terminal
+   for me to answer prompts; otherwise run `teamctl init --yes` and tell me
+   I can re-run `teamctl init` or use `teamctl config --menu` later. The
+   wizard asks for MY provider routing order — never pick it for me.
+
+3. Offer me lead mode: explain that `teamctl lead on` installs a manager
+   identity into every detected agent CLI's global instructions file
+   (plus a skill and a recommended per-prompt reminder hook for Claude
+   Code — mechanisms the other CLIs don't have), all reversible with
+   `teamctl lead off`. Run it if I say yes.
+
+4. Verify your work: run `teamctl --version`, `teamctl providers`, and
+   `teamctl models`, and show me the output.
+
+5. Report what you did, what you skipped and why, and finish by telling me
+   my controls:
+     - from the shell: `teamctl config --menu` to adjust preferences,
+       `teamctl lead on|off|status` for the lead identity,
+       `./uninstall.sh` (or `teamctl lead off` first) to undo everything.
+     - from a chat: with lead mode on, I can just say "open the teamctl
+       menu" to any lead agent and it will present and apply my settings.
+```
+
+[![ci](https://github.com/ryderderder/teamctl/actions/workflows/ci.yml/badge.svg)](https://github.com/ryderderder/teamctl/actions/workflows/ci.yml)
 
 ## Requirements
 
@@ -25,77 +82,16 @@ usage where providers expose it, and tears teammates down cleanly
   (`codex`), or Grok CLI (`grok`)
 
 The installer detects missing tmux/python3 and **offers** to install them via
-your package manager (brew / apt-get / dnf / pacman) — it always asks first,
-tells you when a command will use sudo, and `--no-deps` skips the offers
-entirely. Provider CLIs are never auto-installed; their official install
-one-liners are printed instead.
-
-## Install
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/ryderderder/teamctl/main/install.sh | bash
-```
-
-Or from a checkout:
-
-```sh
-git clone https://github.com/ryderderder/teamctl && cd teamctl && ./install.sh
-```
-
-The installer copies `teamctl` and `claude-statusline` to `~/.local/bin`
-(warning you if that's not on your PATH) and offers to run the onboarding
-wizard. It is safe to re-run.
-
-Then, inside a tmux session:
-
-```sh
-teamctl init        # onboarding wizard (optional but recommended)
-```
-
-### Install via your AI agent — paste this prompt
-
-Prefer to have an agent set everything up? Paste this into Claude Code,
-Codex, or Grok (also in [INSTALL_PROMPT.md](INSTALL_PROMPT.md)):
-
-```text
-Install teamctl (https://github.com/ryderderder/teamctl) for me — it manages
-AI teammates (Claude Code / Codex / Grok CLIs) as tmux panes. Do all of the
-following, in order:
-
-1. Run the installer:
-     curl -fsSL https://raw.githubusercontent.com/ryderderder/teamctl/main/install.sh | bash
-   If it reports missing dependencies (tmux, or python3 older than 3.11),
-   install them with the system package manager (ask me before anything
-   that needs sudo). If it reports no provider CLI, show me the official
-   install one-liners it prints and ask which (if any) to run.
-   Make sure ~/.local/bin is on my PATH; fix my shell profile if not.
-
-2. Configure it: run `teamctl init` interactively if you have a terminal
-   for me to answer prompts; otherwise run `teamctl init --yes` and tell me
-   I can re-run `teamctl init` or use `teamctl config --menu` later.
-
-3. Offer me lead mode: explain that `teamctl lead on` installs a
-   lead-agent identity for Claude Code (a skill, a CLAUDE.md block, and a
-   recommended per-prompt reminder hook — all reversible with
-   `teamctl lead off`), then run it if I say yes.
-
-4. Verify your work: run `teamctl --version` and `teamctl providers`, and
-   show me the output.
-
-5. Report what you did, what you skipped and why, and finish by telling me
-   my controls:
-     - from the shell: `teamctl config --menu` to adjust preferences,
-       `teamctl lead on|off|status` for the lead identity,
-       `./uninstall.sh` (or `teamctl lead off` first) to undo everything.
-     - from a chat: with lead mode on, I can just say "open the teamctl
-       menu" to any lead agent and it will present and apply my settings.
-```
+your package manager (brew / apt-get / dnf / pacman) — it always asks first
+(tmux defaults to yes, everything else to no), tells you when a command will
+use sudo, and `--no-deps` skips the offers entirely. Provider CLIs are never
+auto-installed; their official install one-liners are printed instead.
 
 ## Quickstart
 
 ```sh
-# Interactive teammate: opens a Claude Code pane seeded with a prompt.
-teamctl spawn reviewer --provider claude --model opus \
+# Interactive teammate: opens a provider CLI pane seeded with a prompt.
+teamctl spawn reviewer --provider codex \
     --prompt "Review the diff on this branch for correctness."
 
 # See who's active.
@@ -105,7 +101,7 @@ teamctl list
 teamctl send reviewer "Focus on the error handling in server.py."
 
 # Headless task: runs in a watchable pane, result lands in a handoff dir.
-teamctl dispatch researcher --provider codex \
+teamctl dispatch researcher --provider grok \
     --task "Summarize the TODOs in this repo as JSON." --cwd ~/myproject
 
 # Read the result back (blocks until done; fails fast if the teammate dies).
@@ -114,14 +110,20 @@ teamctl result researcher --wait
 # Another turn in the same provider session.
 teamctl followup researcher --task "Now rank them by effort."
 
-# Let teamctl pick the provider: first available among claude > codex > grok,
+# No --provider? Your configured routing order decides (or the only
+# detected provider). With several providers and no configured order,
+# teamctl asks rather than silently picking one for you.
+teamctl spawn helper --prompt "Draft release notes from the last 10 commits."
+
+# Or let route pick: first *available* provider in your configured order,
 # skipping anything not installed, not logged in, or known-exhausted.
 teamctl route helper --task "Draft release notes from the last 10 commits."
 teamctl route helper --task "..." --dry-run     # preview the choice + command
 
-# Provider availability and real usage.
+# Provider availability, real usage, and current model lists.
 teamctl providers
 teamctl usage
+teamctl models
 
 # Clean teardown: kills the whole process tree, verifies it, closes the pane.
 teamctl shutdown reviewer
@@ -153,10 +155,10 @@ without reporting.
 
 ### Lead-agent playbook
 
-If your lead is itself an AI agent (Claude Code, Codex, Grok, …), give it
-these standing rules. **For Claude Code, `teamctl lead on` automates the
-paste-in** (see [Lead mode](#lead-mode) below); for other CLIs, paste them
-into the agent's instructions file (`AGENTS.md` or equivalent):
+If your lead is itself an AI agent, give it these standing rules.
+**`teamctl lead on` automates the paste-in for every detected CLI** (see
+[Lead mode](#lead-mode) below); for anything else, paste them into the
+agent's instructions file:
 
 ```
 Before spinning up a teammate, planning a multi-agent effort, or dispatching
@@ -179,36 +181,43 @@ anything large:
 
 ## Lead mode
 
-`teamctl lead on` installs a durable *manager identity* for a Claude Code
-lead agent — the standing rules from the playbook above (stay responsive,
+`teamctl lead on` installs a durable *manager identity* for your lead
+agent — the standing rules from the playbook above (stay responsive,
 delegate non-trivial work, decide capacity from `teamctl usage`/`providers`
 live data, one owner per file, zero idle teammates, the user always
-overrides) — in three tiers, from discoverable to unmissable:
+overrides) — into **every detected CLI** (or one, with
+`--cli claude|codex|grok|all`):
 
-1. **Skill** (`~/.claude/skills/teamctl-lead/SKILL.md`) — *discoverable*.
-   Claude Code loads it whenever delegation, teammates, multi-agent
-   planning, or capacity questions come up.
-2. **CLAUDE.md block** — *always on*. A compact, marker-guarded block
-   (`<!-- BEGIN teamctl-lead -->` … `<!-- END teamctl-lead -->`) appended to
-   `~/.claude/CLAUDE.md`, in context from the first prompt of every session.
+1. **Instructions block** — *always on; all three CLIs*. A compact,
+   marker-guarded block (`<!-- BEGIN teamctl-lead -->` …
+   `<!-- END teamctl-lead -->`) appended to each CLI's documented global
+   instructions file: `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`,
+   `~/.grok/AGENTS.md`. In context from the first prompt of every session;
+   re-running `lead on` refreshes a stale block in place (backup first).
+2. **Skill** (`~/.claude/skills/teamctl-lead/SKILL.md`) — *discoverable;
+   Claude Code only*. Loaded whenever delegation, teammates, multi-agent
+   planning, or capacity questions come up. It also teaches the chat-based
+   settings menu ("open the teamctl menu").
 3. **Hook** (recommended; asked as Y/n — default **yes** — or forced with
-   `teamctl lead on --hook`) — *per-prompt, the strongest tier*. A
-   `UserPromptSubmit` hook in `~/.claude/settings.json` that `echo`es a
-   one-line reminder; its stdout is injected into context on **every**
-   prompt, so it always fires and keeps working even after context
-   compaction has dropped the CLAUDE.md text from a long session. That is
-   why it's the recommended tier.
+   `teamctl lead on --hook`) — *per-prompt, the strongest tier; Claude Code
+   only*. A `UserPromptSubmit` hook in `~/.claude/settings.json` that
+   `echo`es a one-line reminder; its stdout is injected into context on
+   **every** prompt, so it always fires and keeps working even after
+   context compaction has dropped instruction-file text from a long
+   session. That is why it's the recommended tier.
 
-Every step is skipped if already present, backed up first if it changes an
-existing file, and printed with its exact revert. `teamctl lead on` refuses
-to touch a `settings.json` it cannot parse.
+Skills and hooks are Claude Code mechanisms with no Codex/Grok equivalent —
+tiers 2 and 3 being Claude-only is parity with what each CLI offers, not a
+preference. Every step is skipped if already present, backed up first if it
+changes an existing file, and printed with its exact revert. `teamctl lead
+on` refuses to touch a `settings.json` it cannot parse.
 
 **The off switch:** `teamctl lead off` removes exactly what `on` installed —
-the skill directory, the marker block (your other CLAUDE.md content is
+the skill directory, each CLI's marker block (your surrounding content is
 preserved byte-for-byte), and the teamctl-lead hook entry (other hooks and
 settings keys untouched) — each with a fresh backup, tolerating partial
 installs, and reports what it removed and what it left alone.
-`teamctl lead status` shows per-tier state at any time.
+`teamctl lead status` shows per-tier, per-CLI state at any time.
 
 ## Configuration
 
@@ -235,7 +244,18 @@ effort = "high"             # grok has no persistent effort setting of its
                             # own; teamctl passes this per invocation
 
 [routing]
-preference = ["claude", "codex", "grok"]   # order `route` prefers
+preference = ["codex", "claude"]  # YOUR order — the wizard asks for it.
+                            # `route` picks the first available entry, and
+                            # a bare spawn/dispatch (no --provider) uses the
+                            # first entry. Without a configured preference
+                            # the fallback order is alphabetical — arbitrary,
+                            # not a recommendation — and several providers
+                            # with no preference means spawn/dispatch ask
+                            # rather than silently choosing.
+
+[usage]
+probe_stale_minutes = 30    # `usage` flags probe/statusline data older
+                            # than this many minutes as stale
 
 [layout]
 lead_width = 50             # lead pane's share of the window width, in %
@@ -268,6 +288,33 @@ Or from a chat: with [lead mode](#lead-mode) on, tell your lead agent
 settings with `teamctl config`, present them as a numbered menu in chat,
 and apply your changes key by key.
 
+### Models
+
+Model ids pass through to the provider CLI **verbatim** — teamctl carries
+no model list, so new models work the day a provider ships them, with no
+teamctl update. `teamctl models [provider]` is best-effort discovery for
+convenience only: grok's documented `grok models` output is passed
+through; Codex's local models cache (`~/.codex/models_cache.json` — an
+observed file, parsed defensively) lists slugs and supported efforts; for
+Claude, which has no listing command, the documented aliases are noted.
+The wizard shows the same discovery as suggestions but accepts any id.
+
+### Fresh usage numbers: hidden probes
+
+`teamctl usage --probe [provider|all]` opens a provider's own TUI in a
+detached background tmux session (`teamctl-probe` — never a pane in your
+window), waits for it to settle, types the provider's own usage command
+(grok `/usage`, codex `/status`), scrapes the numbers, and tears the TUI
+down with the same process-tree-verified kill used for teammates. Results
+are cached with a timestamp; plain `teamctl usage` reports them alongside
+the log/statusline-derived data, labels their age, and flags anything
+older than `[usage] probe_stale_minutes` (default 30) as stale. Claude is
+not probed: its statusline cache is the documented, cheaper source.
+Probing is always explicit — teamctl never opens a provider session on its
+own. OBSERVED (not vendor-documented): the usage commands are local UI
+commands and no token spend was observed, but opening a TUI does start a
+provider session.
+
 Sets rewrite the file safely: the previous version is backed up to
 `config.toml.bak-teamctl`, all other keys are preserved, and a config that
 fails to parse is refused rather than silently replaced. You can also just
@@ -283,7 +330,7 @@ re-run `teamctl init` any time to redo the whole wizard.
   rate-limit numbers Claude Code pipes to it (documented statusLine JSON:
   `rate_limits.five_hour/seven_day` — subscribers only), which is what powers
   `teamctl usage`'s Claude column;
-- installing [lead mode](#lead-mode) for Claude Code (same as
+- installing [lead mode](#lead-mode) for your detected agent CLIs (same as
   `teamctl lead on`).
 
 ## Uninstall
@@ -332,11 +379,14 @@ anything (or anyone) able to run teamctl can steer every teammate.
   and `teamctl usage` labels the cache's age. Grok exposes nothing locally,
   and `teamctl usage` says so rather than inventing numbers.
 - **Some parsed provider formats are observed, not documented.** Grok's JSON
-  output shape (`{text, stopReason, sessionId, …}`) and the location/format
-  of Codex's session-log rate-limit events are reverse-engineered from real
-  output. teamctl parses both defensively and degrades to "usage unknown" /
-  raw text instead of failing — but re-verify after provider CLI upgrades.
-  (Claude's statusline fields and `codex exec resume` are documented.)
+  output shape (`{text, stopReason, sessionId, …}`), the location/format of
+  Codex's session-log rate-limit events, Codex's models cache, and the TUI
+  text scraped by `usage --probe` (grok `/usage`, codex `/status` — the
+  latter explicitly unstable upstream) are reverse-engineered from real
+  output. teamctl parses them all defensively and degrades to "usage
+  unknown" / "probe failed" / raw text instead of crashing — but re-verify
+  after provider CLI upgrades. (Claude's statusline fields, `codex exec
+  resume`, and `grok models` are documented.)
 - **`followup` for Codex resumes the most recent session** (`codex exec
   resume --last`): with several concurrent codex teammates the wrong session
   could be resumed. Codex documents id-addressed resume (`codex exec resume
@@ -358,6 +408,13 @@ anything (or anyone) able to run teamctl can steer every teammate.
   hasn't been separately tested.
 - Provider CLIs must already be installed and logged in; teamctl never
   handles credentials itself.
+
+## Credits
+
+teamctl was inspired by Claude Code's experimental
+[agent teams](https://code.claude.com/docs/en/agent-teams) feature — the
+lead-and-teammates shape, reimagined on plain tmux so that any provider's
+CLI can play on equal footing.
 
 ## License
 
