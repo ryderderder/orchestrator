@@ -16,6 +16,7 @@ Usage:
     teamctl route <role> --task "…" [--providers claude,codex,grok] [--dry-run]
     teamctl providers
     teamctl usage [--json] [--probe [provider|all]]
+    teamctl update [--check]
     teamctl shutdown <role>
     teamctl --version
 
