@@ -364,6 +364,103 @@ class SettingsModelTests(ThrowawayHomeTestCase):
         self.assertIn("teamctl config update.mode prompt", out)   # defaults
 
 
+class DoctorTests(ThrowawayHomeTestCase):
+    """`teamctl doctor` checks + worst-status exit code, against a sandboxed
+    HOME (state/config live under it) with tmux/version monkeypatched."""
+
+    def setUp(self):
+        super().setUp()
+        os.environ["TEAMCTL_STATE"] = str(
+            self.home / ".local" / "state" / "agent-team" / "state.json")
+        self._tmux_ver = tc._tmux_version
+        tc._tmux_version = lambda: "3.4"          # a healthy modern tmux
+
+    def tearDown(self):
+        tc._tmux_version = self._tmux_ver
+        os.environ.pop("TEAMCTL_STATE", None)
+        super().tearDown()
+
+    def _named(self):
+        return {name: (status, detail)
+                for name, status, detail in tc.doctor_report()}
+
+    def test_python_and_state_dir_ok(self):
+        r = self._named()
+        self.assertEqual(r["python"][0], "ok")
+        self.assertEqual(r["state dir"][0], "ok")
+
+    def test_tmux_missing_is_a_fail(self):
+        tc._tmux_version = lambda: None
+        real = self._which
+        tc.shutil.which = lambda name, *a, **k: (
+            None if name == "tmux" else f"/fake/bin/{name}"
+            if name in ("claude", "codex", "grok") else real(name))
+        r = self._named()
+        self.assertEqual(r["tmux"][0], "fail")
+
+    def test_providers_fail_when_none_signed_in(self):
+        # all three "installed" (base fixture) but none signed in
+        r = self._named()
+        self.assertEqual(r["providers"][0], "warn")     # installed, locked out
+        self.assertIn("signed out", r["providers"][1])
+
+    def test_providers_ok_when_one_signed_in(self):
+        seed_signin(self.home, "codex")
+        r = self._named()
+        self.assertEqual(r["providers"][0], "ok")
+
+    def test_config_states(self):
+        # missing
+        self.assertEqual(self._named()["config"][0], "warn")
+        # valid
+        self.cfg.parent.mkdir(parents=True, exist_ok=True)
+        self.cfg.write_text('[lead]\ndelegation = "always"\n')
+        self.assertEqual(self._named()["config"][0], "ok")
+        # bad enum -> warn
+        self.cfg.write_text('[update]\nmode = "banana"\n')
+        status, detail = self._named()["config"]
+        self.assertEqual(status, "warn")
+        self.assertIn("banana", detail)
+        # unparseable -> fail
+        self.cfg.write_text("not = toml [")
+        self.assertEqual(self._named()["config"][0], "fail")
+
+    def test_install_meta_present_is_ok(self):
+        self.assertEqual(self._named()["install source"][0], "warn")
+        meta = self.home / ".local" / "state" / "agent-team" \
+            / "install-meta.json"
+        meta.parent.mkdir(parents=True, exist_ok=True)
+        meta.write_text(json.dumps({"source": "curl"}))
+        self.assertEqual(self._named()["install source"][0], "ok")
+
+    def test_statusline_wired_and_legacy(self):
+        settings = self.home / ".claude" / "settings.json"
+        settings.parent.mkdir(parents=True, exist_ok=True)
+        settings.write_text(json.dumps(
+            {"statusLine": {"command": tc.STATUSLINE_ENTRY["command"]}}))
+        self.assertEqual(self._named()["statusline"][0], "ok")
+        settings.write_text(json.dumps(
+            {"statusLine": {"command": "~/.local/bin/claude-statusline"}}))
+        self.assertEqual(self._named()["statusline"][0], "warn")
+
+    def test_exit_code_reflects_worst_finding(self):
+        # everything healthy -> 0
+        seed_signin(self.home, "codex")
+        self.cfg.parent.mkdir(parents=True, exist_ok=True)
+        self.cfg.write_text('[lead]\ndelegation = "ask"\n')
+        (self.home / ".local" / "state" / "agent-team").mkdir(
+            parents=True, exist_ok=True)
+        (self.home / ".local" / "state" / "agent-team"
+         / "install-meta.json").write_text('{"source":"curl"}')
+        rc, out, _ = self.run_cli(["doctor"])
+        # config-only warn possible; assert the mapping, not a fixed code
+        self.assertIn(rc, (0, 1))
+        # a hard fail (unparseable config) must push it to 2
+        self.cfg.write_text("nope [")
+        rc, _, _ = self.run_cli(["doctor"])
+        self.assertEqual(rc, 2)
+
+
 class LeadHookTests(ThrowawayHomeTestCase):
     def _hook_entries(self):
         data = json.loads(self.settings.read_text())

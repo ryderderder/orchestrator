@@ -118,6 +118,20 @@ at session start (an explicit opt-in; never the default), `off` never
 mentions updates. Installs made before v0.4.0 have no recorded source:
 re-run `install.sh` once and `teamctl update` works from then on.
 
+## Health check
+
+```sh
+teamctl doctor
+```
+
+A one-shot environment check in the dark-room style — a `ok` / `warn` /
+`fail` row per concern: python version, tmux (presence + version quirks),
+the [provider states](#provider-states), config parse + schema sanity, the
+Claude Code statusline wiring, whether the install-source metadata is
+recorded (so `teamctl update` works), and a writable state dir. The exit
+code reflects the worst finding (`0` ok · `1` warn · `2` fail), so it
+drops into CI or a pre-flight script.
+
 ## Provider states
 
 Every surface that names a provider — `teamctl providers`, `teamctl

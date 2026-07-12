@@ -4326,6 +4326,190 @@ def cmd_launch(args: argparse.Namespace) -> int:
 
 
 # --------------------------------------------------------------------------
+# `teamctl doctor` — one-shot environment health check. Each check returns
+# ("ok" | "warn" | "fail", detail); the worst status sets the exit code
+# (ok 0, warn 1, fail 2). The check functions are pure enough to test with
+# a sandboxed HOME + monkeypatched `which`.
+# --------------------------------------------------------------------------
+
+def _tmux_version() -> str | None:
+    if shutil.which("tmux") is None:
+        return None
+    try:
+        out = subprocess.run(["tmux", "-V"], capture_output=True, text=True,
+                             timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    m = re.search(r"(\d+\.\d+[a-z]?)", out.stdout)
+    return m.group(1) if m else None
+
+
+def _check_python() -> tuple[str, str]:
+    v = sys.version_info
+    label = f"{v.major}.{v.minor}.{v.micro}"
+    if v >= (3, 11):
+        return "ok", f"{label} (tomllib present)"
+    return "fail", f"{label} — teamctl needs 3.11+ (tomllib)"
+
+
+def _check_tmux() -> tuple[str, str]:
+    ver = _tmux_version()
+    if ver is None:
+        if shutil.which("tmux") is None:
+            return "fail", "not installed — teamctl needs tmux"
+        return "warn", "installed but `tmux -V` did not report a version"
+    # known-quirk learnings encoded as advice, not failures — teamctl
+    # already works around both (per-pane @options for labels; the
+    # read-write tty fd in the installer):
+    #  - some 3.x builds don't execute #() in status formats (we use
+    #    @role/@model user options, so labels render regardless)
+    num = re.match(r"(\d+)\.(\d+)", ver)
+    if num and (int(num.group(1)), int(num.group(2))) < (2, 9):
+        return "warn", (f"{ver} — old; `resize-window` is a no-op pre-2.9, "
+                        "so test panes may be cramped")
+    return "ok", f"{ver}"
+
+
+def _check_providers() -> tuple[str, str]:
+    states = {p: provider_state(p)[0] for p in ROUTABLE}
+    usable = [p for p, s in states.items() if s in ("ready", "quiet")]
+    locked = [p for p, s in states.items() if s == "locked out"]
+    if usable:
+        parts = [f"{p} {states[p]}" for p in ROUTABLE
+                 if states[p] != "not installed"]
+        return "ok", "; ".join(parts) or ", ".join(usable)
+    if locked:
+        return "warn", (f"installed but signed out: {', '.join(locked)} — "
+                        "sign one in")
+    return "fail", "no provider installed and signed in"
+
+
+def _check_config() -> tuple[str, str]:
+    path = config_path()
+    if not path.exists():
+        return "warn", "no config yet — run `teamctl init`"
+    if tomllib is None:
+        return "warn", "cannot parse (Python < 3.11)"
+    try:
+        data = tomllib.loads(path.read_text())
+    except (OSError, ValueError) as exc:
+        return "fail", f"does not parse: {exc}"
+    # schema sanity: known enums / ranges
+    problems = []
+    checks = [
+        (("lead", "delegation"), ("ask", "always", "manual")),
+        (("output", "verbosity"), ("normal", "terse", "detailed")),
+        (("update", "mode"), ("prompt", "auto", "off")),
+    ]
+    for (sec, key), allowed in checks:
+        v = (data.get(sec) or {}).get(key)
+        if v is not None and v not in allowed:
+            problems.append(f"{sec}.{key}={v!r} not in {'/'.join(allowed)}")
+    lw = (data.get("layout") or {}).get("lead_width")
+    if isinstance(lw, int) and not (20 <= lw <= 80):
+        problems.append(f"layout.lead_width={lw} outside 20-80 (clamped)")
+    if problems:
+        return "warn", "; ".join(problems)
+    return "ok", f"parses, schema sane ({_tilde(path)})"
+
+
+def _check_statusline() -> tuple[str, str]:
+    if shutil.which("claude") is None:
+        return "ok", "n/a (Claude Code not installed)"
+    sp = Path.home() / ".claude" / "settings.json"
+    if not sp.exists():
+        return "warn", "Claude Code has no settings.json — `teamctl init` "\
+                       "wires the statusline"
+    try:
+        data = json.loads(sp.read_text())
+    except (OSError, json.JSONDecodeError):
+        return "warn", f"{_tilde(sp)} is not parseable JSON"
+    sl = data.get("statusLine")
+    cmd = sl.get("command") if isinstance(sl, dict) else None
+    if cmd == STATUSLINE_ENTRY["command"] or cmd == \
+            str(Path.home() / ".local" / "bin" / "teamctl") + " statusline":
+        return "ok", "wired to `teamctl statusline`"
+    if cmd in _legacy_statusline_commands():
+        return "warn", "wired to the pre-v0.4.0 script — `teamctl update` "\
+                       "migrates it"
+    if cmd:
+        return "ok", "a non-teamctl statusLine is set (left alone)"
+    return "warn", "not wired — `teamctl init` adds it"
+
+
+def _check_install_meta() -> tuple[str, str]:
+    if load_install_meta() is not None:
+        return "ok", "recorded — `teamctl update` knows the source"
+    return "warn", "missing — re-run install.sh so `teamctl update` works"
+
+
+def _check_state_dir() -> tuple[str, str]:
+    d = state_path().parent
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+        probe = d / ".doctor-write-probe"
+        probe.write_text("x")
+        probe.unlink()
+        return "ok", f"writable ({_tilde(d)})"
+    except OSError as exc:
+        return "fail", f"not writable: {exc}"
+
+
+_DOCTOR_CHECKS = (
+    ("python", _check_python),
+    ("tmux", _check_tmux),
+    ("providers", _check_providers),
+    ("config", _check_config),
+    ("statusline", _check_statusline),
+    ("install source", _check_install_meta),
+    ("state dir", _check_state_dir),
+)
+
+
+def doctor_report() -> list[tuple[str, str, str]]:
+    """Run every check; list of (name, status, detail). Pure enough to test
+    against a sandboxed HOME."""
+    out = []
+    for name, fn in _DOCTOR_CHECKS:
+        try:
+            status, detail = fn()
+        except Exception as exc:                   # a check must never crash
+            status, detail = "warn", f"check errored: {exc}"
+        out.append((name, status, detail))
+    return out
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    rows = doctor_report()
+    g = _out_glyphs()
+    mark = {"ok": ("ok", g["dot"]), "warn": ("warn", "!"),
+            "fail": ("bad", g["chev"])}
+    print(_fg("accent", "teamctl doctor") + _fg("dim", "  · environment "
+                                                "health"))
+    print()
+    for name, status, detail in rows:
+        role, glyph = mark.get(status, ("dim", "?"))
+        print("  " + _fg(role, f"{glyph} {status:<4}")
+              + _fg("primary", f" {name:<15}") + _fg("dim", detail))
+    worst = "ok"
+    for _n, status, _d in rows:
+        if status == "fail":
+            worst = "fail"
+            break
+        if status == "warn":
+            worst = "warn"
+    print()
+    if worst == "ok":
+        print("  " + _fg("ok", "all good."))
+        return 0
+    if worst == "warn":
+        print("  " + _fg("warn", "usable, with advisories above."))
+        return 1
+    print("  " + _fg("bad", "something is broken — see the failures above."))
+    return 2
+
+
+# --------------------------------------------------------------------------
 # `teamctl config` — show and adjust ~/.config/agent-team/config.toml
 # --------------------------------------------------------------------------
 
@@ -4960,6 +5144,13 @@ def build_parser() -> argparse.ArgumentParser:
              "same config; degrades to current values + `teamctl config` "
              "one-liners without a TTY)")
     stp.set_defaults(func=cmd_settings)
+
+    dcp = sub.add_parser(
+        "doctor",
+        help="environment health check (tmux, python, providers, config, "
+             "statusline, install source, state dir); exit 0 ok / 1 warn / "
+             "2 fail")
+    dcp.set_defaults(func=cmd_doctor)
 
     cp = sub.add_parser("config", help="show or change agent-team preferences")
     cp.add_argument("key", nargs="?", default=None,
