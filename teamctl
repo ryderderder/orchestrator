@@ -71,7 +71,7 @@ try:
 except Exception:  # pragma: no cover - platforms without curses
     curses = None
 
-VERSION = "0.5.0"
+VERSION = "0.5.1"
 
 # --------------------------------------------------------------------------
 # the provider-spec registry — every provider, built-in OR user-defined via
@@ -4613,8 +4613,9 @@ large, run `teamctl usage` and `teamctl providers`, then choose
 provider/model/effort from that live data, the user's preferences
 (~/.config/agent-team/config.toml — see `teamctl config`), and task fit.
 Use descriptive role names; never point two teammates at the same file;
-shut each teammate down (`teamctl shutdown <role>`) the moment its job is
-done — zero idle teammates. Keep the toolchain current: when teamctl or
+land a writing teammate's worktree when it finishes (`teamctl land
+<role>`); shut each teammate down (`teamctl shutdown <role>`) the moment
+its job is done — zero idle teammates. Keep the toolchain current: when teamctl or
 any provider CLI reports an available update, surface it to the user
 promptly (e.g. `teamctl update`) instead of silently ignoring it.
 Delegation posture: honor `teamctl config lead.delegation` (ask / always /
@@ -4664,8 +4665,14 @@ main chat; teammates are tmux panes tiled to your right.
    `api-researcher`), one clear deliverable each.
 4. **One owner per file.** Never point two teammates at the same file; use
    extra teammates as reviewers of a single owner's work.
-5. **Zero idle teammates.** Shut each teammate down the moment its job is
-   done (`teamctl shutdown <role>`). No lingering panes.
+5. **Zero idle teammates — and land before you leave.** A writing
+   teammate's worktree branch is merged back with `teamctl land <role>`
+   (review with `--dry-run` first); then shut each teammate down the
+   moment its job is done (`teamctl shutdown <role>`). Shutdown never
+   discards un-landed work, but landing it is your job. Check
+   `teamctl status` before assuming a silent teammate is working — a
+   `needs-input` teammate is blocked on an approval you can answer with
+   `teamctl send`.
 6. **Keep the toolchain current.** When teamctl or any provider CLI
    reports an available update, surface it to the user promptly (e.g.
    `teamctl update`) rather than silently ignoring it — and apply it only
@@ -4679,8 +4686,12 @@ main chat; teammates are tmux panes tiled to your right.
     teamctl dispatch <role> --provider P --task "…"   # headless, watchable pane
     teamctl result <role> --wait                      # read the result back
     teamctl followup <role> --task "…"                # another turn, same session
-    teamctl route <role> --task "…"                   # auto-pick best provider
+    teamctl route <role> --task "…"                   # auto-pick: most headroom wins
     teamctl send <role> "…"                           # type into a live teammate
+    teamctl status [role] [--json]                    # busy / needs-input / idle
+    teamctl land <role> [--dry-run]                   # merge a worktree branch back
+    teamctl worktree list|prune                       # audit teammate worktrees
+    teamctl resurrect [--dry-run]                     # rebuild after a crash/reboot
     teamctl list / teamctl usage / teamctl providers
     teamctl shutdown <role>                           # always, as soon as done
 
