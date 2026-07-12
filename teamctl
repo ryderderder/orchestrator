@@ -17,6 +17,8 @@ Usage:
     teamctl result <role> [--wait]
     teamctl followup <role> --task "…"
     teamctl route <role> --task "…" [--providers claude,codex,grok,gemini] [--dry-run]
+    teamctl land <role> [--checkpoint-only] [--into BRANCH] [--dry-run] [--json]
+    teamctl worktree list|prune [--json] [--dry-run]
     teamctl providers
     teamctl usage [--json] [--probe [provider|all]]
     teamctl update [--check]
@@ -1040,6 +1042,17 @@ def cmd_spawn(args: argparse.Namespace) -> int:
             )
             return 1
 
+        try:
+            wt = _maybe_alloc_worktree(args.role, cwd,
+                                       getattr(args, "worktree", None))
+        except TeamctlError as exc:
+            print(f"teamctl: {exc}", file=sys.stderr)
+            return 2
+        if wt:
+            cwd = wt["path"]
+            inner = build_launch_line(args.provider, args.prompt, cwd,
+                                      model, effort)
+
         existing = [i.get("pane_id", "") for i in state["teammates"].values()]
         pane_id = _open_pane(inner, existing)
         _set_pane_title(pane_id, args.role, model)
@@ -1054,6 +1067,8 @@ def cmd_spawn(args: argparse.Namespace) -> int:
             "mode": "interactive",
             "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         }
+        if wt:
+            state["teammates"][args.role]["worktree"] = wt
         save_state(state)
 
     print(f"spawned teammate '{args.role}' ({args.provider}"
@@ -1079,9 +1094,12 @@ def cmd_list(args: argparse.Namespace) -> int:
     for role in sorted(mates):
         i = mates[role]
         st = _mate_state(role, i, live)
+        wt = i.get("worktree") or {}
+        marker = f"  ⌂ {wt['branch']}" if wt.get("branch") else ""
         print(
             f"{role.ljust(width)}  {i['provider']:<8}  "
-            f"{i.get('pane_id') or '-':<7}  {st:<11}  {i.get('created_at', '')}"
+            f"{i.get('pane_id') or '-':<7}  {st:<11}  "
+            f"{i.get('created_at', '')}{marker}"
         )
     return 0
 
@@ -1204,6 +1222,13 @@ def cmd_shutdown(args: argparse.Namespace) -> int:
         if hd.is_dir() and hd != state_path().parent:
             shutil.rmtree(hd, ignore_errors=True)
 
+    # worktree reconciliation AFTER the process is verifiably dead (never
+    # remove a directory from under a live teammate): clean -> removed,
+    # anything un-landed -> kept and reported. Stranding is impossible.
+    wt = info.get("worktree")
+    if wt:
+        _shutdown_worktree(args.role, wt)
+
     _enforce_lead_width()
     if pane_id:
         print(f"shut down teammate '{args.role}' (pane {pane_id})")
@@ -1240,6 +1265,503 @@ def cmd_send(args: argparse.Namespace) -> int:
         tmux("send-keys", "-t", pane_id, "C-m", check=False)
 
     print(f"sent to '{args.role}' (pane {pane_id})")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# git-worktree isolation — every teammate gets its own branch in its own
+# directory (one shared object store), so parallel writers PHYSICALLY
+# cannot collide: the "never two teammates edit the same file" rule,
+# mechanically enforced. ON by default in a git repo; spawning elsewhere
+# degrades to the plain cwd with one honest note. `teamctl land <role>`
+# closes the loop (review → checkpoint → merge → cleanup), and shutdown
+# can never strand work: a worktree with anything un-landed is KEPT and
+# reported, never silently discarded — with the registry
+# (<state>/worktrees.json) as the durable record that outlives the
+# teammate's state entry.
+#
+# Git safety rule, enforced by construction and audited by tests: teamctl
+# NEVER passes -D, --force, or --hard to git. `git worktree remove` and
+# `git branch -d` refuse on anything unsaved/unmerged — git's own safety
+# is the backstop for any logic error in the checks here.
+# --------------------------------------------------------------------------
+
+def worktree_settings() -> dict:
+    """[worktree]: enabled (default TRUE — v0.5.0 turns isolation on),
+    dir ('' → <state>/worktrees), branch_prefix, cleanup (auto | keep)."""
+    raw = load_config().get("worktree") or {}
+    enabled = raw.get("enabled", True)
+    if not isinstance(enabled, bool):
+        enabled = str(enabled).strip().lower() not in ("false", "0", "no",
+                                                       "off")
+    cleanup = str(raw.get("cleanup") or "auto")
+    if cleanup not in ("auto", "keep"):
+        cleanup = "auto"
+    return {"enabled": enabled, "dir": str(raw.get("dir") or ""),
+            "branch_prefix": str(raw.get("branch_prefix") or "teamctl/"),
+            "cleanup": cleanup}
+
+
+def _git(repo: str, *args: str,
+         timeout: float = 30.0) -> subprocess.CompletedProcess | None:
+    """Run git with the same never-prompt/never-hang discipline as the
+    update fetches; None when git cannot run at all."""
+    env = dict(os.environ)
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    try:
+        return subprocess.run(["git", "-C", repo, *args],
+                              capture_output=True, text=True,
+                              timeout=timeout, env=env)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _git_ok(repo: str, *args: str) -> str | None:
+    """git stdout (stripped) on success, None on any failure."""
+    res = _git(repo, *args)
+    if res is None or res.returncode != 0:
+        return None
+    return res.stdout.strip()
+
+
+def _git_fail_tail(res: subprocess.CompletedProcess | None,
+                   fallback: str) -> str:
+    if res is None:
+        return "git not runnable"
+    tail = res.stderr.strip().splitlines()
+    return tail[-1] if tail else fallback
+
+
+def _repo_root(cwd: str) -> str | None:
+    return _git_ok(cwd, "rev-parse", "--show-toplevel")
+
+
+def worktrees_root() -> Path:
+    d = worktree_settings()["dir"]
+    if d:
+        return Path(os.path.expanduser(d))
+    return state_path().parent / "worktrees"
+
+
+def worktree_registry_path() -> Path:
+    return state_path().parent / "worktrees.json"
+
+
+def load_worktree_registry() -> dict:
+    """path -> {role, branch, repo, base_sha, created_at}. The durable
+    record of every teamctl-created worktree — it outlives the teammate's
+    state entry so `land`/`worktree list|prune` keep working after a
+    shutdown that preserved un-landed work (and after a reboot)."""
+    try:
+        p = worktree_registry_path()
+        data = json.loads(p.read_text()) if p.exists() else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_worktree_registry(reg: dict) -> None:
+    p = worktree_registry_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(reg, indent=2, sort_keys=True))
+    tmp.replace(p)
+
+
+def _alloc_worktree(role: str, cwd: str) -> dict:
+    """Create '<role>'s isolated worktree + branch off the current HEAD.
+    Refuses honestly (existing branch/path — never guesses a suffix) and
+    records the allocation in the registry. Returns
+    {path, branch, repo, base_sha}."""
+    root = _repo_root(cwd)
+    if root is None:
+        raise TeamctlError(
+            f"{cwd} is not inside a git repository — worktree isolation "
+            "needs one (use --no-worktree to opt out)")
+    branch = worktree_settings()["branch_prefix"] + role
+    if _git_ok(root, "rev-parse", "--verify", "--quiet",
+               f"refs/heads/{branch}") is not None:
+        raise TeamctlError(
+            f"branch {branch} already exists (un-landed work from a "
+            f"previous '{role}'?) — land it (`teamctl land {role}`), "
+            f"delete it yourself (`git -C {root} branch -D {branch}`), "
+            "or spawn under another role")
+    import hashlib
+    h8 = hashlib.sha256(root.encode()).hexdigest()[:8]
+    path = worktrees_root() / f"{Path(root).name}-{h8}" / role
+    if path.exists():
+        raise TeamctlError(
+            f"worktree path {path} already exists — clear it "
+            "(`teamctl worktree prune`) or spawn under another role")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    res = _git(root, "worktree", "add", "-b", branch, str(path), "HEAD")
+    if res is None or res.returncode != 0:
+        raise TeamctlError(
+            f"could not create worktree for '{role}': "
+            + _git_fail_tail(res, "git worktree add failed"))
+    base = _git_ok(root, "rev-parse", "HEAD") or ""
+    dirty = _git_ok(root, "status", "--porcelain")
+    if dirty:
+        n = len(dirty.splitlines())
+        print(f"note: {n} uncommitted change(s) in {root} are not visible "
+              f"to '{role}' — commit or stash first if it needs them.",
+              file=sys.stderr)
+    wt = {"path": str(path), "branch": branch, "repo": root,
+          "base_sha": base}
+    reg = load_worktree_registry()
+    reg[str(path)] = {**wt, "role": role,
+                      "created_at": time.strftime("%Y-%m-%dT%H:%M:%S")}
+    save_worktree_registry(reg)
+    return wt
+
+
+def _maybe_alloc_worktree(role: str, cwd: str,
+                          flag: bool | None) -> dict | None:
+    """The tri-state gate: --worktree forces (errors honestly when it
+    can't), --no-worktree skips, None follows [worktree] enabled (default
+    on — degrading to the plain cwd with one note outside a git repo, so
+    spawning in ~/notes keeps working)."""
+    enabled = worktree_settings()["enabled"] if flag is None else flag
+    if not enabled:
+        return None
+    explicit = flag is True
+    if shutil.which("git") is None:
+        if explicit:
+            raise TeamctlError("git is not installed — worktree isolation "
+                               "needs it")
+        print("note: git not found — teammate runs without worktree "
+              "isolation", file=sys.stderr)
+        return None
+    if _repo_root(cwd) is None:
+        if explicit:
+            raise TeamctlError(f"{cwd} is not inside a git repository — "
+                               "--worktree needs one")
+        print(f"note: {_tilde(cwd)} is not a git repository — '{role}' "
+              "runs without worktree isolation", file=sys.stderr)
+        return None
+    return _alloc_worktree(role, cwd)
+
+
+def _worktree_unique_work(wt: dict) -> tuple[bool, str]:
+    """(has_unique_work, detail). Dirty files or un-landed commits count
+    as unique work; a landed branch (tip reachable from the repo's HEAD)
+    or a no-new-commits branch does not. Anything UNREADABLE counts as
+    unique work — when unsure, keep; never guess toward deletion."""
+    path, repo = wt["path"], wt["repo"]
+    branch, base = wt["branch"], wt.get("base_sha") or ""
+    if not Path(path).exists():
+        return False, "path gone"
+    dirty = _git(path, "status", "--porcelain")
+    if dirty is None or dirty.returncode != 0:
+        return True, "git status unreadable — keeping"
+    if dirty.stdout.strip():
+        n = len(dirty.stdout.strip().splitlines())
+        return True, f"{n} uncommitted change(s)"
+    if base:
+        cnt = _git_ok(repo, "rev-list", "--count", f"{base}..{branch}")
+        if cnt == "0":
+            return False, "no new commits"
+        if cnt is None:
+            return True, "history unreadable — keeping"
+    merged = _git(repo, "merge-base", "--is-ancestor", branch, "HEAD")
+    if merged is not None and merged.returncode == 0:
+        return False, "landed (branch tip is in HEAD)"
+    if base:
+        cnt = _git_ok(repo, "rev-list", "--count", f"{base}..{branch}")
+        return True, f"{cnt} un-landed commit(s)"
+    return True, "unknown base — keeping"
+
+
+def _remove_worktree(wt: dict) -> tuple[bool, str]:
+    """Remove a worktree + its branch — via git's own NON-forced commands
+    only (`worktree remove`, `branch -d`): if either refuses, the caller
+    keeps everything and says so. Clears the registry entry on success."""
+    repo, path, branch = wt["repo"], wt["path"], wt["branch"]
+    if Path(path).exists():
+        res = _git(repo, "worktree", "remove", path)
+        if res is None or res.returncode != 0:
+            return False, ("git worktree remove refused: "
+                           + _git_fail_tail(res, "worktree remove failed"))
+    else:
+        _git(repo, "worktree", "prune")
+    if _git_ok(repo, "rev-parse", "--verify", "--quiet",
+               f"refs/heads/{branch}") is not None:
+        res = _git(repo, "branch", "-d", branch)
+        if res is None or res.returncode != 0:
+            return False, ("git branch -d refused: "
+                           + _git_fail_tail(res, "branch delete failed"))
+    reg = load_worktree_registry()
+    reg.pop(path, None)
+    save_worktree_registry(reg)
+    return True, "removed"
+
+
+def _shutdown_worktree(role: str, wt: dict) -> None:
+    """Shutdown's strand-proofing: remove a worktree only when it provably
+    holds nothing un-landed; otherwise KEEP it and print the way out. The
+    registry entry survives with it, so `teamctl land <role>` still works
+    after the teammate is gone."""
+    if worktree_settings()["cleanup"] == "keep":
+        print(f"kept worktree: {_tilde(wt['path'])} (branch {wt['branch']}"
+              ", [worktree] cleanup = keep)")
+        return
+    unique, detail = _worktree_unique_work(wt)
+    if not unique:
+        ok, msg = _remove_worktree(wt)
+        if ok:
+            print(f"removed clean worktree {_tilde(wt['path'])} ({detail})")
+        else:
+            print(f"kept worktree {_tilde(wt['path'])}: {msg}",
+                  file=sys.stderr)
+        return
+    print(f"kept worktree with un-landed work: {_tilde(wt['path'])} "
+          f"(branch {wt['branch']}, {detail})")
+    print(f"  land it:  teamctl land {role}    (works after shutdown too)")
+    print("  or list:  teamctl worktree list")
+
+
+def _find_worktree_for_role(role: str) -> tuple[dict | None, dict | None]:
+    """(worktree, live_state_info) for a role: the live state entry first,
+    then the registry (a shutdown that kept un-landed work, or a reboot).
+    Ambiguity (same role in several repos) is refused, never guessed."""
+    with state_lock():
+        state = reconcile(load_state())
+    info = state["teammates"].get(role)
+    if info and info.get("worktree"):
+        return dict(info["worktree"]), info
+    matches = [dict(e) for e in load_worktree_registry().values()
+               if e.get("role") == role]
+    if len(matches) > 1:
+        paths = ", ".join(m["path"] for m in matches)
+        raise TeamctlError(
+            f"'{role}' has worktrees in several repos ({paths}) — "
+            "`teamctl worktree list` and land/prune by hand")
+    return (matches[0] if matches else None), info
+
+
+def cmd_land(args: argparse.Namespace) -> int:
+    """Close the worktree loop: review the diff, checkpoint anything
+    uncommitted (with consent), merge the teammate's branch into the
+    repo's checked-out branch, then clean up. Conflicts stop-and-report
+    (merge aborted, tree left clean) — teamctl never auto-resolves."""
+    role = args.role
+    if _reject_bad_role(role):
+        return 2
+    try:
+        wt, info = _find_worktree_for_role(role)
+    except TeamctlError as exc:
+        print(f"teamctl: {exc}", file=sys.stderr)
+        return 2
+    if wt is None:
+        print(f"teamctl: no worktree recorded for '{role}' — see "
+              "`teamctl worktree list`.", file=sys.stderr)
+        return 1
+
+    # never land under a live teammate: a moving diff cannot be reviewed
+    if info is not None:
+        pane = info.get("pane_id") or ""
+        alive = bool(pane) and pane in live_pane_ids()
+        if info.get("mode") == "dispatch":
+            hd = Path(info.get("handoff") or handoff_dir(role))
+            alive = alive or (_read_status(hd)[0] == "running"
+                              and _teammate_alive(info, hd))
+        if alive:
+            print(f"teamctl: '{role}' is still active — landing under a "
+                  "live teammate risks a moving diff. Shut it down first: "
+                  f"`teamctl shutdown {role}`.", file=sys.stderr)
+            return 1
+
+    repo, path, branch = wt["repo"], wt["path"], wt["branch"]
+    base = wt.get("base_sha") or ""
+    if not Path(path).exists():
+        print(f"teamctl: worktree {path} is gone — nothing to land "
+              f"(branch {branch} may still exist in {repo}).",
+              file=sys.stderr)
+        return 1
+
+    dirty_out = _git_ok(path, "status", "--porcelain") or ""
+    dirty = len(dirty_out.splitlines()) if dirty_out else 0
+    commits = _git_ok(repo, "rev-list", "--count", f"{base}..{branch}") \
+        if base else None
+    target = _git_ok(repo, "symbolic-ref", "--short", "HEAD")
+    diffstat = (_git_ok(repo, "diff", "--stat", f"{base}..{branch}") or "") \
+        if base else ""
+
+    plan = {"role": role, "branch": branch, "path": path, "repo": repo,
+            "base_sha": base, "target": target,
+            "uncommitted_changes": dirty,
+            "unlanded_commits": int(commits) if (commits or "").isdigit()
+            else None}
+
+    if args.dry_run:
+        if args.json:
+            print(json.dumps(plan, indent=2))
+        else:
+            print(f"land plan for '{role}':")
+            print(f"  branch {branch} -> {target or '(detached HEAD)'}"
+                  f"  ({plan['unlanded_commits']} commit(s), "
+                  f"{dirty} uncommitted change(s))")
+            if diffstat:
+                print("  " + "\n  ".join(diffstat.splitlines()))
+            print(f"  full diff: git -C {repo} diff {base}..{branch}")
+        return 0
+
+    # 1. checkpoint uncommitted work (consent required; nothing is ever
+    #    landed silently)
+    if dirty:
+        if args.yes or _ask_yn(
+                f"commit {dirty} uncommitted change(s) in {_tilde(path)} "
+                f"as a checkpoint on {branch}? [Y/n] ", default=True):
+            res = _git(path, "add", "-A")
+            if res is None or res.returncode != 0:
+                print("teamctl: git add failed — nothing landed.",
+                      file=sys.stderr)
+                return 1
+            msg = f"teamctl checkpoint: {role} " \
+                  + time.strftime("%Y-%m-%d %H:%M")
+            res = _git(path, "commit", "-m", msg)
+            if res is None or res.returncode != 0:
+                print("teamctl: checkpoint commit failed: "
+                      + _git_fail_tail(res, "git commit failed"),
+                      file=sys.stderr)
+                return 1
+            print(f"checkpointed {dirty} change(s) on {branch}")
+        else:
+            print("land cancelled — uncommitted changes stay where they "
+                  "are (nothing landed).")
+            return 1
+    if args.checkpoint_only:
+        outcome = {**plan, "landed": False, "checkpointed": dirty}
+        print(json.dumps(outcome, indent=2) if args.json
+              else f"checkpoint done — land later with `teamctl land {role}`")
+        return 0
+
+    commits = _git_ok(repo, "rev-list", "--count", f"{base}..{branch}") \
+        if base else None
+    if commits == "0":
+        print(f"nothing to land: {branch} adds no commits over its base — "
+              f"`teamctl shutdown {role}` / `teamctl worktree prune` "
+              "cleans it up.")
+        return 0
+
+    # 2. integrate into the repo's checked-out branch — teamctl never
+    #    switches the user's branches
+    if not target:
+        print(f"teamctl: {repo} is on a detached HEAD — check out the "
+              "branch you want to land into, then re-run.", file=sys.stderr)
+        return 1
+    if args.into and args.into != target:
+        print(f"teamctl: {repo} has '{target}' checked out, not "
+              f"'{args.into}' — teamctl never switches your branches. "
+              f"Check out {args.into} first.", file=sys.stderr)
+        return 1
+    root_dirty = _git_ok(repo, "status", "--porcelain")
+    if root_dirty:
+        print(f"teamctl: {repo} has uncommitted changes — commit or stash "
+              "them first (landing merges into your checked-out branch).",
+              file=sys.stderr)
+        return 1
+    res = _git(repo, "merge", "--no-ff", "-m",
+               f"teamctl land: {role} ({branch})", branch)
+    if res is None or res.returncode != 0:
+        _git(repo, "merge", "--abort")
+        print("teamctl: land hit merge conflicts — merge aborted, your "
+              "tree is untouched. Resolve by hand:\n"
+              f"  git -C {repo} merge {branch}\n"
+              "then clean up with `teamctl worktree prune`.",
+              file=sys.stderr)
+        return 1
+
+    landed_msg = f"landed '{role}': {branch} -> {target} ({commits} commit(s))"
+    removed = False
+    if not args.keep:
+        unique, _detail = _worktree_unique_work(wt)
+        if not unique:
+            ok, msg = _remove_worktree(wt)
+            removed = ok
+            landed_msg += (" · worktree removed" if ok
+                           else f" · worktree kept ({msg})")
+        else:
+            landed_msg += " · worktree kept (still has unique work)"
+    # a live teammate keeps its state; a registry-only worktree that was
+    # fully landed+removed needs no further tracking
+    if args.json:
+        print(json.dumps({**plan, "landed": True, "target": target,
+                          "worktree_removed": removed}, indent=2))
+    else:
+        print(landed_msg)
+    return 0
+
+
+def cmd_worktree(args: argparse.Namespace) -> int:
+    """`teamctl worktree list|prune` — the audit/recovery surface for
+    every worktree teamctl ever created."""
+    reg = load_worktree_registry()
+    with state_lock():
+        state = reconcile(load_state())
+    owners = {}
+    for r, i in state["teammates"].items():
+        if i.get("worktree"):
+            owners[i["worktree"].get("path", "")] = r
+
+    rows = []
+    for path, entry in sorted(reg.items()):
+        wt = {"path": path, "branch": entry.get("branch", ""),
+              "repo": entry.get("repo", ""),
+              "base_sha": entry.get("base_sha", "")}
+        exists = Path(path).exists()
+        unique, detail = _worktree_unique_work(wt) if exists \
+            else (False, "path gone")
+        rows.append({"role": entry.get("role", "?"), "path": path,
+                     "branch": wt["branch"], "repo": wt["repo"],
+                     "exists": exists, "unique_work": unique,
+                     "detail": detail,
+                     "owner_alive": path in owners,
+                     "created_at": entry.get("created_at", "")})
+
+    if args.action == "list":
+        if args.json:
+            print(json.dumps(rows, indent=2))
+            return 0
+        if not rows:
+            print("no teamctl worktrees.")
+            return 0
+        for r in rows:
+            owner = "live" if r["owner_alive"] else "orphan"
+            state_txt = r["detail"] if r["exists"] else "path gone"
+            print(f"{r['role']:<16} {r['branch']:<28} {owner:<7} "
+                  f"{state_txt}")
+            print(f"{'':<16} {_tilde(r['path'])}")
+        return 0
+
+    # prune: remove only what provably holds nothing — never a live
+    # teammate's worktree, never anything with unique work
+    pruned, kept = [], []
+    for r in rows:
+        wt = {"path": r["path"], "branch": r["branch"], "repo": r["repo"],
+              "base_sha": next((e.get("base_sha", "") for p, e in
+                                reg.items() if p == r["path"]), "")}
+        if r["owner_alive"]:
+            kept.append((r, "owner is live"))
+            continue
+        if r["unique_work"]:
+            kept.append((r, r["detail"]))
+            continue
+        if args.dry_run:
+            pruned.append((r, "would remove"))
+            continue
+        ok, msg = _remove_worktree(wt)
+        if ok:
+            pruned.append((r, "removed"))
+        else:
+            kept.append((r, msg))
+    for r, msg in pruned:
+        print(f"{'(dry-run) ' if args.dry_run else ''}pruned "
+              f"{r['role']}: {_tilde(r['path'])} ({msg})")
+    for r, msg in kept:
+        print(f"kept {r['role']}: {_tilde(r['path'])} — {msg}")
+    if not rows:
+        print("no teamctl worktrees.")
     return 0
 
 
@@ -1317,7 +1839,8 @@ def _resolve_dispatch(provider: str, task: str, context_file: str, model_arg: st
 
 
 def _do_dispatch(role: str, provider: str, task: str, context_file: str,
-                 model_arg: str, effort_arg: str, cwd_arg: str) -> int:
+                 model_arg: str, effort_arg: str, cwd_arg: str,
+                 worktree_flag: bool | None = None) -> int:
     """Shared dispatch body used by `dispatch` and `route`."""
     if _reject_bad_role(role):
         return 2
@@ -1348,6 +1871,14 @@ def _do_dispatch(role: str, provider: str, task: str, context_file: str,
                       file=sys.stderr)
             return 1
 
+        try:
+            wt = _maybe_alloc_worktree(role, cwd, worktree_flag)
+        except TeamctlError as exc:
+            print(f"teamctl: {exc}", file=sys.stderr)
+            return 2
+        if wt:
+            cwd = wt["path"]
+
         hd = handoff_dir(role)
         hd.mkdir(parents=True, exist_ok=True)
         (hd / "task.md").write_text(task)
@@ -1370,6 +1901,8 @@ def _do_dispatch(role: str, provider: str, task: str, context_file: str,
             "handoff": str(hd),
             "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         }
+        if wt:
+            state["teammates"][role]["worktree"] = wt
         save_state(state)
 
     print(f"dispatched '{role}' ({provider}"
@@ -1382,7 +1915,8 @@ def cmd_dispatch(args: argparse.Namespace) -> int:
     if provider is None:
         return 2
     return _do_dispatch(args.role, provider, args.task, args.context_file,
-                        args.model, args.effort, args.cwd)
+                        args.model, args.effort, args.cwd,
+                        getattr(args, "worktree", None))
 
 
 def _read_status(hd: Path) -> tuple[str, int | None]:
@@ -2538,7 +3072,8 @@ def cmd_route(args: argparse.Namespace) -> int:
         return 0
 
     return _do_dispatch(args.role, selected, args.task, "",
-                        args.model, args.effort, args.cwd)
+                        args.model, args.effort, args.cwd,
+                        getattr(args, "worktree", None))
 
 
 # --------------------------------------------------------------------------
@@ -4942,6 +5477,7 @@ def _check_config() -> tuple[str, str]:
         (("output", "verbosity"), ("normal", "terse", "detailed")),
         (("update", "mode"), ("prompt", "auto", "off")),
         (("routing", "strategy"), ("headroom", "preference")),
+        (("worktree", "cleanup"), ("auto", "keep")),
     ]
     for (sec, key), allowed in checks:
         v = (data.get(sec) or {}).get(key)
@@ -4985,6 +5521,26 @@ def _check_install_meta() -> tuple[str, str]:
     return "warn", "missing — re-run install.sh so `teamctl update` works"
 
 
+def _check_worktrees() -> tuple[str, str]:
+    """Orphaned teamctl worktrees (owner gone, work possibly un-landed)."""
+    reg = load_worktree_registry()
+    if not reg:
+        return "ok", "none"
+    try:
+        state = load_state()
+    except Exception:
+        state = {"teammates": {}}
+    owned = {i.get("worktree", {}).get("path")
+             for i in state["teammates"].values() if i.get("worktree")}
+    orphans = [e.get("role", "?") for p, e in reg.items() if p not in owned]
+    if orphans:
+        return "warn", (f"{len(orphans)} orphaned worktree(s) "
+                        f"({', '.join(sorted(orphans)[:4])}"
+                        f"{'…' if len(orphans) > 4 else ''}) — "
+                        "`teamctl worktree list`, land or prune")
+    return "ok", f"{len(reg)} active, none orphaned"
+
+
 def _check_state_dir() -> tuple[str, str]:
     d = state_path().parent
     try:
@@ -5005,6 +5561,7 @@ _DOCTOR_CHECKS = (
     ("statusline", _check_statusline),
     ("install source", _check_install_meta),
     ("state dir", _check_state_dir),
+    ("worktrees", _check_worktrees),
 )
 
 
@@ -5193,6 +5750,7 @@ _MENU_ENUMS: dict[str, tuple[str, ...]] = {
     "output.verbosity": ("normal", "terse", "detailed"),
     "update.mode": ("prompt", "auto", "off"),
     "routing.strategy": ("headroom", "preference"),
+    "worktree.cleanup": ("auto", "keep"),
 }
 
 
@@ -5430,6 +5988,8 @@ _SETTINGS_DEFAULTS = {
     "lead.chat_model": "",
     "lead.chat_effort": "",
     "routing.strategy": "headroom",
+    "worktree.enabled": True,
+    "worktree.cleanup": "auto",
 }
 
 # (key, section, label) for the fixed settings, in display order. Per-
@@ -5442,6 +6002,8 @@ _SETTINGS_ROWS = (
     ("lead.chat_effort", "default chat", "effort"),
     ("routing.preference", "routing", "provider order"),
     ("routing.strategy", "routing", "strategy (headroom/preference)"),
+    ("worktree.enabled", "worktree", "isolate teammates in worktrees"),
+    ("worktree.cleanup", "worktree", "cleanup at shutdown"),
     ("lead.delegation", "posture", "delegation"),
     ("output.verbosity", "posture", "voice"),
     ("layout.lead_width", "layout", "lead pane width %"),
@@ -5724,6 +6286,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--model", default="", help="model for the teammate")
     sp.add_argument("--effort", default="", help="effort/reasoning level")
     sp.add_argument("--cwd", default="", help="working directory for the teammate")
+    sp.add_argument("--worktree", action=argparse.BooleanOptionalAction,
+                    default=None,
+                    help="isolate the teammate in its own git worktree "
+                         "(default: [worktree] enabled — on; "
+                         "--no-worktree opts out)")
     sp.add_argument("--dry-run", action="store_true", help="print the launch line only")
     sp.set_defaults(func=cmd_spawn)
 
@@ -5752,6 +6319,10 @@ def build_parser() -> argparse.ArgumentParser:
     dsp.add_argument("--model", default="", help="override model")
     dsp.add_argument("--effort", default="", help="override effort/reasoning level")
     dsp.add_argument("--cwd", default="", help="working directory for the teammate")
+    dsp.add_argument("--worktree", action=argparse.BooleanOptionalAction,
+                     default=None,
+                     help="isolate the teammate in its own git worktree "
+                          "(default: [worktree] enabled — on)")
     dsp.set_defaults(func=cmd_dispatch)
 
     rp = sub.add_parser("result", help="read back a dispatched teammate's result")
@@ -5765,6 +6336,41 @@ def build_parser() -> argparse.ArgumentParser:
     fp.add_argument("--task", required=True, help="the follow-up task")
     fp.set_defaults(func=cmd_followup)
 
+    ld = sub.add_parser(
+        "land",
+        help="land a teammate's worktree branch: review the diff, "
+             "checkpoint uncommitted work (with consent), merge into "
+             "your checked-out branch, clean up")
+    ld.add_argument("role", help="role whose worktree to land (works "
+                                 "after shutdown/reboot too)")
+    ld.add_argument("--into", default="",
+                    help="assert the target branch (must already be "
+                         "checked out — teamctl never switches branches)")
+    ld.add_argument("--checkpoint-only", action="store_true",
+                    dest="checkpoint_only",
+                    help="commit uncommitted work on the teammate's "
+                         "branch and stop (no merge)")
+    ld.add_argument("--keep", action="store_true",
+                    help="keep the worktree and branch after landing")
+    ld.add_argument("--yes", action="store_true",
+                    help="checkpoint without asking")
+    ld.add_argument("--dry-run", action="store_true",
+                    help="print the land plan (diffstat, counts) and exit")
+    ld.add_argument("--json", action="store_true",
+                    help="machine-readable plan/result")
+    ld.set_defaults(func=cmd_land)
+
+    wp = sub.add_parser(
+        "worktree",
+        help="list or prune teamctl-created worktrees (the audit/recovery "
+             "surface — never removes anything with un-landed work)")
+    wp.add_argument("action", choices=["list", "prune"])
+    wp.add_argument("--json", action="store_true",
+                    help="machine-readable output (list)")
+    wp.add_argument("--dry-run", action="store_true",
+                    help="prune: show what would be removed, remove nothing")
+    wp.set_defaults(func=cmd_worktree)
+
     rt = sub.add_parser("route", help="pick the best available provider and dispatch")
     rt.add_argument("role")
     rt.add_argument("--task", required=True, help="the task/instruction")
@@ -5775,6 +6381,10 @@ def build_parser() -> argparse.ArgumentParser:
     rt.add_argument("--model", default="", help="override model")
     rt.add_argument("--effort", default="", help="override effort/reasoning level")
     rt.add_argument("--cwd", default="", help="working directory for the teammate")
+    rt.add_argument("--worktree", action=argparse.BooleanOptionalAction,
+                    default=None,
+                    help="isolate the teammate in its own git worktree "
+                         "(default: [worktree] enabled — on)")
     rt.add_argument("--dry-run", action="store_true",
                     help="print selection + launch line without opening a pane")
     rt.set_defaults(func=cmd_route)

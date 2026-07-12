@@ -2234,6 +2234,16 @@ class LiveTmuxTests(unittest.TestCase):
         self.statedir = tempfile.TemporaryDirectory(prefix="teamctl-live-")
         self.tmp = Path(self.statedir.name) / "state.json"
         os.environ["TEAMCTL_STATE"] = str(self.tmp)
+        # worktree isolation is default-ON in v0.5.0, but these tests
+        # exercise the tmux mechanics from the teamctl checkout itself —
+        # branching the REAL repo per test role would collide across
+        # concurrent suite runs (the same class of bug the per-test temp
+        # state fixed). Worktree behavior has its own suite over scratch
+        # repos: tests/test_worktree.py.
+        self._wt_settings = tc.worktree_settings
+        tc.worktree_settings = lambda: {"enabled": False, "dir": "",
+                                        "branch_prefix": "teamctl/",
+                                        "cleanup": "auto"}
         out = tc.tmux("new-window", "-d", "-n", f"teamctl-tests-{os.getpid()}",
                       "-P", "-F", "#{window_id} #{pane_id}").stdout.split()
         self.window_id, self.lead_pane = out[0], out[1]
@@ -2249,6 +2259,7 @@ class LiveTmuxTests(unittest.TestCase):
         for role in list(tc.load_state()["teammates"]):
             tc.main(["shutdown", role])
         tc.tmux("kill-window", "-t", self.window_id, check=False)
+        tc.worktree_settings = self._wt_settings
         if self._tmux_pane is None:
             os.environ.pop("TMUX_PANE", None)
         else:
