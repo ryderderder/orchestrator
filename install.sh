@@ -343,11 +343,35 @@ if [ ${#MISSING_PROVIDERS[@]} -gt 0 ]; then
   echo "  then sign the CLI in once, and re-run \`teamctl init\`."
 fi
 
+# ---- PATH check (A3) --------------------------------------------------------
+# A bare warning here is WIPED by the tmux takeover below (exec clears the
+# screen). So: offer to append the export to the user's shell profile, and
+# if they decline, hand the note to `teamctl init` (TEAMCTL_PATH_NOTE) so it
+# re-prints DURABLY inside the post-setup frame the user actually ends on.
+PATH_NOTE=""
 case ":$PATH:" in
   *":$BIN_DIR:"*) ;;
   *)
-    echo "warning: $BIN_DIR is not on your PATH. Add it, e.g.:" >&2
-    echo "  export PATH=\"$BIN_DIR:\$PATH\"" >&2
+    PATH_NOTE="$BIN_DIR"
+    profile=""
+    case "${SHELL:-}" in
+      *zsh) profile="$HOME/.zshrc" ;;
+      *bash) profile="$HOME/.bashrc" ;;
+      *) profile="$HOME/.profile" ;;
+    esac
+    echo "note: $BIN_DIR is not on your PATH." >&2
+    if [ -n "$profile" ] &&
+      ask_yn "Append the PATH line to $profile? [y/N] "; then
+      {
+        echo ""
+        echo "# Added by teamctl installer"
+        echo "export PATH=\"$BIN_DIR:\$PATH\""
+      } >> "$profile"
+      echo "appended to $profile — run 'source $profile' or open a new shell." >&2
+      PATH_NOTE=""   # handled: no need to re-surface it in the frame
+    else
+      echo "  add it yourself: export PATH=\"$BIN_DIR:\$PATH\"" >&2
+    fi
     ;;
 esac
 
@@ -357,8 +381,16 @@ esac
 # session and run it inside — express asks ZERO questions and prints what it
 # chose (`--custom-init` swaps in the rich wizard). `< "$TTY_IN"` matters:
 # under curl|bash stdin is the pipe, and tmux needs the real terminal.
+#
+# TEAMCTL_FIRST_RUN=1 turns on init's installer orientation tail (A2: the
+# curl|bash user lands in tmux with no idea what to do — the frame shows the
+# spawn + lead-on moves). TEAMCTL_PATH_NOTE re-surfaces the PATH note (A3).
 TEAMCTL_Q="$(printf "%q" "$BIN_DIR/teamctl")"
-BOOTSTRAP_CMD="$TEAMCTL_Q init$INIT_ARGS; exec \${SHELL:-/bin/sh}"
+BOOTSTRAP_ENV="TEAMCTL_FIRST_RUN=1"
+[ -n "$PATH_NOTE" ] && BOOTSTRAP_ENV="$BOOTSTRAP_ENV TEAMCTL_PATH_NOTE=$(printf "%q" "$PATH_NOTE")"
+BOOTSTRAP_CMD="$BOOTSTRAP_ENV $TEAMCTL_Q init$INIT_ARGS; exec \${SHELL:-/bin/sh}"
+export TEAMCTL_FIRST_RUN=1
+[ -n "$PATH_NOTE" ] && export TEAMCTL_PATH_NOTE="$PATH_NOTE"
 if [ "$RUN_INIT" = "no" ]; then
   echo "done. Run '$BIN_DIR/teamctl init' any time to configure defaults."
 elif [ -n "${TMUX:-}" ]; then

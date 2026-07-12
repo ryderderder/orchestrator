@@ -209,6 +209,30 @@ class InstallShTestCase(unittest.TestCase):
         self.assertEqual(r.returncode, 2)
         self.assertIn("unknown option", r.stderr)
 
+    # ---- PATH note (A3) -----------------------------------------------------
+
+    def test_path_append_offered_and_applied_on_yes(self):
+        # $BIN_DIR is never on the sandbox PATH -> the note fires; accepting
+        # appends the export to the shell profile (A3: bare warning would be
+        # wiped by the tmux takeover)
+        self.fake_uname("Darwin")
+        r = self.run_install("--no-init", answers="y\n",
+                             env_extra={"SHELL": "/bin/zsh"})
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("not on your PATH", r.stderr)
+        self.assertIn("Append the PATH line", r.stderr)
+        zshrc = self.home / ".zshrc"
+        self.assertTrue(zshrc.exists())
+        self.assertIn(f'export PATH="{self.bin}:$PATH"', zshrc.read_text())
+
+    def test_path_declined_leaves_profile_untouched(self):
+        self.fake_uname("Darwin")
+        r = self.run_install("--no-init", answers="n\n",
+                             env_extra={"SHELL": "/bin/zsh"})
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("add it yourself", r.stderr)
+        self.assertFalse((self.home / ".zshrc").exists())
+
     # ---- install-source metadata for `teamctl update` -----------------------
 
     def _meta(self):

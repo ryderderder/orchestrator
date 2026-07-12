@@ -473,6 +473,25 @@ class RoleNameValidationTests(unittest.TestCase):
         # the traversal target must not have been created
         self.assertFalse((self.tmp.parent / "evil").exists())
 
+    def test_all_role_taking_commands_reject_injection(self):
+        # the reviewer's repro shape: a quote/; role that would break out of
+        # the dispatch wrapper's shell script must be refused everywhere a
+        # role is accepted — not just spawn/dispatch/route.
+        evil = "rev'; touch /tmp/PROOF #"
+        cmds = [
+            ["spawn", evil, "--provider", "shell", "--dry-run"],
+            ["dispatch", evil, "--provider", "shell", "--task", "t"],
+            ["route", evil, "--task", "t", "--dry-run"],
+            ["send", evil, "hi"],
+            ["shutdown", evil],
+            ["result", evil],
+            ["followup", evil, "--task", "t"],
+        ]
+        for argv in cmds:
+            rc, _, err = self._run(*argv)
+            self.assertEqual(rc, 2, argv[0])
+            self.assertIn("role names", err, argv[0])
+
 
 class LayoutTests(unittest.TestCase):
     """lead_width_percent clamping, split-candidate selection, and the
@@ -1498,6 +1517,10 @@ class InitTests(_AuthSandbox, unittest.TestCase):
         os.environ["HOME"] = str(self.home)
         os.environ["TEAMCTL_STATE"] = str(self.home / "state.json")
         self._isolate_auth()
+        # the installer-only orientation env must not leak into standalone
+        # frame tests (they assert the tight spec-§7 line budget)
+        self._first_run = os.environ.pop("TEAMCTL_FIRST_RUN", None)
+        self._path_note = os.environ.pop("TEAMCTL_PATH_NOTE", None)
 
         self._which = tc.shutil.which
         self._input = tc._input
@@ -1512,6 +1535,11 @@ class InitTests(_AuthSandbox, unittest.TestCase):
         tc.shutil.which = self._which
         tc._input = self._input
         self._restore_auth()
+        for var, val in (("TEAMCTL_FIRST_RUN", self._first_run),
+                         ("TEAMCTL_PATH_NOTE", self._path_note)):
+            os.environ.pop(var, None)
+            if val is not None:
+                os.environ[var] = val
         os.environ.pop("TEAMCTL_STATE", None)
         if self._home_env is not None:
             os.environ["HOME"] = self._home_env
@@ -1547,6 +1575,32 @@ class InitTests(_AuthSandbox, unittest.TestCase):
         self.assertFalse((self.home / ".claude" / "settings.json").exists())
         self.assertIn("wrote", out)
         self.assertNotIn("t e a m c t l", out)          # --yes = no chrome
+
+    def test_installer_first_run_adds_orientation_and_path_note(self):
+        # A2/A3: the curl|bash first run (TEAMCTL_FIRST_RUN=1) lands the
+        # user in tmux — the frame gains the spawn + lead-on moves and,
+        # when the installer flags it, a DURABLE PATH note (the bare
+        # installer warning is wiped by the tmux takeover).
+        os.environ["TEAMCTL_FIRST_RUN"] = "1"
+        os.environ["TEAMCTL_PATH_NOTE"] = "/home/u/.local/bin"
+        try:
+            rc, out = self._run_init(None)
+        finally:
+            os.environ.pop("TEAMCTL_FIRST_RUN")
+            os.environ.pop("TEAMCTL_PATH_NOTE")
+        self.assertEqual(rc, 0)
+        self.assertIn("you're in tmux", out)
+        self.assertIn("teamctl spawn reviewer --provider claude", out)
+        self.assertIn("teamctl lead on", out)
+        self.assertIn("/home/u/.local/bin is not on your PATH", out)
+
+    def test_standalone_frame_has_no_installer_orientation(self):
+        # without the installer env, the frame stays tight (no tmux/PATH
+        # orientation, spec §7 budget)
+        rc, out = self._run_init(None)
+        self.assertEqual(rc, 0)
+        self.assertNotIn("you're in tmux", out)
+        self.assertNotIn("not on your PATH", out)
 
     def test_express_asks_no_questions_and_prints_the_frame(self):
         # any prompt during express is a regression

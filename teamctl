@@ -814,6 +814,8 @@ def _close_pane(pane_id: str) -> bool:
 
 
 def cmd_shutdown(args: argparse.Namespace) -> int:
+    if _reject_bad_role(args.role):
+        return 2
     with state_lock():
         state = reconcile(load_state())
         info = state["teammates"].get(args.role)
@@ -846,6 +848,8 @@ def cmd_shutdown(args: argparse.Namespace) -> int:
 
 
 def cmd_send(args: argparse.Namespace) -> int:
+    if _reject_bad_role(args.role):
+        return 2
     with state_lock():
         state = reconcile(load_state())
         info = state["teammates"].get(args.role)
@@ -1147,6 +1151,8 @@ def _teammate_alive(info: dict, hd: Path) -> bool:
 
 
 def cmd_result(args: argparse.Namespace) -> int:
+    if _reject_bad_role(args.role):
+        return 2
     with state_lock():
         state = reconcile(load_state())
         info = state["teammates"].get(args.role)
@@ -1232,6 +1238,8 @@ def cmd_result(args: argparse.Namespace) -> int:
 
 
 def cmd_followup(args: argparse.Namespace) -> int:
+    if _reject_bad_role(args.role):
+        return 2
     with state_lock():
         state = reconcile(load_state())
         info = state["teammates"].get(args.role)
@@ -2006,6 +2014,8 @@ def route_select(requested: list[str] | None = None
 
 
 def cmd_route(args: argparse.Namespace) -> int:
+    if _reject_bad_role(args.role):
+        return 2
     requested = [p.strip() for p in args.providers.split(",") if p.strip()] \
         if args.providers else None
     selected, preference, exclusions = route_select(requested)
@@ -2891,8 +2901,42 @@ def _init_express(args: argparse.Namespace) -> int:
                + _fg("soft", "teamctl init --custom"))
     if upd_line:
         out.append("  " + _fg("dim", f"{g['dot']} {upd_line}"))
+    # installer first-run orientation (A2): the curl|bash path lands the
+    # user inside tmux with a fresh config but no idea what to do next —
+    # give the headline moves. Gated to the installer (TEAMCTL_FIRST_RUN),
+    # so a standalone `teamctl init` keeps its tight spec-§7 frame.
+    if os.environ.get("TEAMCTL_FIRST_RUN") == "1":
+        out.extend(_first_run_orientation(preference, g))
+    # A3: the installer's "$BIN_DIR not on PATH" warning is wiped by the
+    # tmux takeover — re-print it durably inside the frame when the
+    # installer flags it (TEAMCTL_PATH_NOTE=<dir>).
+    path_note = os.environ.get("TEAMCTL_PATH_NOTE", "")
+    if path_note:
+        out.append("")
+        out.append("  " + _fg("warn", f"{path_note} is not on your PATH"))
+        out.append("    " + _fg("dim", 'add it: export PATH="'
+                                + path_note + ':$PATH"'))
     print("\n".join(out))
     return 0
+
+
+def _first_run_orientation(preference: list[str], g: dict) -> list[str]:
+    """The 'you're in tmux — here's your first move' block for the curl|bash
+    first run (A2). Provider-agnostic: the spawn example uses the user's
+    top routed provider, or a placeholder when none is ready yet."""
+    prov = preference[0] if preference else "<provider>"
+    lines = ["", "  " + _fg("soft", "you're in tmux — teammates open as panes "
+                            "to the right")]
+    if preference:
+        lines.append("    " + _fg("dim", "spawn one  ")
+                     + _fg("primary", f"teamctl spawn reviewer --provider {prov}"))
+    else:
+        lines.append("    " + _fg("dim", "sign a provider in, then  ")
+                     + _fg("primary", "teamctl spawn reviewer"))
+    lines.append("    " + _fg("dim", "lead mode  ")
+                 + _fg("primary", "teamctl lead on")
+                 + _fg("dim", "  (make this chat the manager)"))
+    return lines
 
 
 def _init_custom(args: argparse.Namespace) -> int:
