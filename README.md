@@ -403,26 +403,31 @@ in `~/.local/state/agent-team/state.json` (override with `$TEAMCTL_STATE`).
 
 ### Adjusting preferences
 
-You never need to edit the TOML by hand:
+**`teamctl settings`** is the human face: a re-runnable dark-room cockpit
+(the same aesthetic as `init --custom`) over the whole config, grouped
+into sections — default chat, routing order, posture, layout, updates, and
+per-provider model/effort. ↑/↓ move, Space or ←/→ cycle a choice
+(delegation, update mode, effort, booleans…), Enter free-edits anything,
+`s` saves (atomic, with a backup), `q` quits with a dirty-state confirm.
+Without a TTY it degrades to printing the current values plus the matching
+`teamctl config` one-liner for each — the scriptable path spelled out.
+
+For scripting or one-off tweaks, `teamctl config` is the direct path (and
+never needs the TOML edited by hand):
 
 ```sh
 teamctl config                                  # show current settings as dotted keys
 teamctl config providers.claude.model           # show one value
 teamctl config providers.claude.model sonnet    # set one key (others preserved)
 teamctl config routing.preference "codex,claude"  # comma-separated -> list
-teamctl config --menu                           # arrow-key settings editor
+teamctl settings                                # the full cockpit (or config --menu)
 ```
-
-`config --menu` uses the same rich curses UI as the custom wizard —
-arrow keys move, Left/Right cycles known values (delegation, verbosity,
-routing order), Enter edits anything as text, `s` saves (with a backup).
-On a terminal that can't run it, the numbered pick-a-setting menu appears
-instead.
 
 Or from a chat: with [lead mode](#lead-mode) on, tell your lead agent
 *"open the teamctl menu"* — the teamctl-lead skill teaches it to read your
 settings with `teamctl config`, present them as a numbered menu in chat,
-and apply your changes key by key.
+and apply your changes key by key (and to point you at `teamctl settings`
+for the full cockpit).
 
 ### Models
 

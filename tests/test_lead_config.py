@@ -299,6 +299,71 @@ class UninstallTests(ThrowawayHomeTestCase):
         self.assertTrue((bin_dir / "teamctl").exists())
 
 
+class SettingsModelTests(ThrowawayHomeTestCase):
+    """The `teamctl settings` MODEL layer (catalog / cycle / plain degrade)
+    is pure and headless — the curses view is tested live elsewhere."""
+
+    def _write_cfg(self, text):
+        self.cfg.parent.mkdir(parents=True, exist_ok=True)
+        self.cfg.write_text(text)
+
+    def test_catalog_shows_effective_defaults_when_unset(self):
+        # empty config -> every fixed key present at its documented default
+        cat = {r["key"]: r for r in tc.settings_catalog({})}
+        self.assertEqual(cat["update.mode"]["value"], "prompt")
+        self.assertEqual(cat["update.check"]["value"], True)
+        self.assertEqual(cat["lead.delegation"]["value"], "ask")
+        self.assertEqual(cat["layout.lead_width"]["value"], 50)
+        self.assertEqual(cat["output.verbosity"]["value"], "normal")
+
+    def test_catalog_reflects_configured_values_and_providers(self):
+        data = {"update": {"mode": "auto"},
+                "providers": {"codex": {"model": "gpt-5.6", "effort": "xhigh"},
+                              "claude": {"effort": "high"}}}
+        cat = {r["key"]: r for r in tc.settings_catalog(data)}
+        self.assertEqual(cat["update.mode"]["value"], "auto")
+        self.assertEqual(cat["providers.codex.model"]["value"], "gpt-5.6")
+        self.assertEqual(cat["providers.codex.effort"]["value"], "xhigh")
+        # a provider with no model key defaults to '' (the CLI's own default)
+        self.assertEqual(cat["providers.claude.model"]["value"], "")
+
+    def test_enum_and_bool_rows_are_cycleable_free_rows_are_not(self):
+        cat = {r["key"]: r for r in tc.settings_catalog({})}
+        self.assertEqual(cat["update.mode"]["choices"],
+                         ["prompt", "auto", "off"])
+        self.assertEqual(cat["update.check"]["choices"], [True, False])
+        self.assertIsNone(cat["lead.chat_model"]["choices"])   # free text
+
+    def test_cycle_wraps_and_respects_direction(self):
+        row = {"value": "prompt", "choices": ["prompt", "auto", "off"]}
+        self.assertEqual(tc._settings_cycle(row, 1), "auto")
+        row["value"] = "off"
+        self.assertEqual(tc._settings_cycle(row, 1), "prompt")   # wraps
+        self.assertEqual(tc._settings_cycle(row, -1), "auto")
+        # an unknown current value lands on a valid choice, never raises
+        self.assertIn(tc._settings_cycle(
+            {"value": "weird", "choices": ["a", "b"]}, 1), ["a", "b"])
+
+    def test_plain_degrade_prints_values_and_config_oneliners(self):
+        self._write_cfg('[update]\nmode = "auto"\n')
+        rc, out, _ = self.run_cli(["settings"])       # no TTY -> plain path
+        self.assertEqual(rc, 0)
+        self.assertIn("current settings", out)
+        self.assertIn("update mode", out)
+        self.assertIn("teamctl config update.mode auto", out)
+        # bools render as lowercase true/false in the one-liner
+        self.assertIn("teamctl config update.check true", out)
+        # sections present
+        self.assertIn("[default chat]", out)
+        self.assertIn("[updates]", out)
+
+    def test_settings_without_config_still_works(self):
+        rc, out, _ = self.run_cli(["settings"])
+        self.assertEqual(rc, 0)
+        self.assertIn("no config yet", out)
+        self.assertIn("teamctl config update.mode prompt", out)   # defaults
+
+
 class LeadHookTests(ThrowawayHomeTestCase):
     def _hook_entries(self):
         data = json.loads(self.settings.read_text())

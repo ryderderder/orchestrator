@@ -2442,6 +2442,29 @@ class CursesLiveTests(unittest.TestCase):
         cap = self._wait_for("plain path")
         self.assertIn("model per provider", cap)
 
+    def test_settings_cockpit_renders_cycles_and_saves(self):
+        # the `teamctl settings` cockpit rendered for real in tmux, driven
+        # with send-keys — proves the dark-room curses view works and that
+        # a cycled choice lands in config.toml
+        cfg = self.home / ".config" / "agent-team" / "config.toml"
+        cfg.parent.mkdir(parents=True)
+        cfg.write_text('[output]\nverbosity = "normal"\n\n'
+                       '[update]\ncheck = true\nmode = "prompt"\n')
+        self._start("settings")
+        cap = self._wait_for("settings")
+        self.assertIn("default chat", cap)              # section headers
+        self.assertIn("updates", cap)
+        self.assertIn("update mode", cap)
+        # jump to the last row (update mode) and cycle it prompt -> auto
+        for _ in range(14):
+            self._tmux("send-keys", "Down")
+        self._tmux("send-keys", "Right")
+        self._wait_for('"auto"')
+        self._tmux("send-keys", "s")                    # save
+        self._wait_for("wrote")
+        self.assertIn('mode = "auto"', cfg.read_text())
+        self.assertIn('verbosity = "normal"', cfg.read_text())
+
     def test_config_menu_curses_cycles_and_saves(self):
         cfg = self.home / ".config" / "agent-team" / "config.toml"
         cfg.parent.mkdir(parents=True)

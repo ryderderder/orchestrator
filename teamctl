@@ -2750,7 +2750,7 @@ def _apply_cockpit(state: dict, ready: list[str]) -> int:
     spawn_prov = state["route"][0] if state["route"] else "claude"
     for cmd_line in ("teamctl providers",
                      f"teamctl spawn reviewer --provider {spawn_prov}",
-                     "teamctl config --menu"):
+                     "teamctl settings"):
         print("    " + _fg("primary", cmd_line))
     installed = [("tmux block", "source: tmux source-file ~/.tmux.conf")
                  if ex["tmux"] else None,
@@ -3209,6 +3209,13 @@ When the user asks for the teamctl menu, settings, or preferences:
    (comma-separated values become lists), then re-run `teamctl config`
    and confirm the new value back to the user before moving on.
 
+There is also a full interactive cockpit the user can run directly in a
+terminal: **`teamctl settings`** — an arrow-key dark-room editor over the
+same config (space/←/→ cycle choices, enter to edit, save with backup).
+Point the user at it when they'd rather drive the settings themselves;
+without a TTY it prints the current values plus the matching `teamctl
+config` one-liners.
+
 ## Lead mode tiers
 
 This identity is installed by `teamctl lead on` in three tiers: this skill
@@ -3248,7 +3255,7 @@ def _print_controls() -> None:
     """The 'how do I drive this later' footer shown after init / lead on /
     lead status — from the shell or from a chat with a lead agent."""
     print("\nControls — adjust teamctl any time:")
-    print("  from your shell:  teamctl config --menu      (preferences menu)")
+    print("  from your shell:  teamctl settings           (preferences cockpit)")
     print("                    teamctl lead on|off|status  (manager identity)")
     print('  from a chat:      tell your lead agent "open the teamctl menu" —')
     print("                    with lead mode on it presents your settings and")
@@ -4301,7 +4308,9 @@ def _load_config_strict(path: Path) -> dict:
 
 def _write_config_file(data: dict) -> Path | None:
     """Rewrite config.toml from `data`, backing up any existing file first.
-    Returns the backup path, or None if there was nothing to back up."""
+    Returns the backup path, or None if there was nothing to back up. The
+    write is atomic (tmp + replace) so a crash mid-write can never leave a
+    truncated config."""
     path = config_path()
     bak = None
     if path.exists():
@@ -4309,7 +4318,9 @@ def _write_config_file(data: dict) -> Path | None:
         shutil.copy2(path, bak)
     path.parent.mkdir(parents=True, exist_ok=True)
     body = "\n".join(CONFIG_HEADER + _dump_toml(data)).rstrip("\n") + "\n"
-    path.write_text(body)
+    tmp = path.with_suffix(".toml.tmp")
+    tmp.write_text(body)
+    tmp.replace(path)   # atomic: readers/crashes never see a partial file
     return bak
 
 
@@ -4530,6 +4541,242 @@ def cmd_config(args: argparse.Namespace) -> int:
     return 0
 
 
+# --------------------------------------------------------------------------
+# `teamctl settings` — the re-runnable settings cockpit: a curated,
+# section-grouped editor over the SAME config.toml `teamctl config` writes.
+# init is the first-run wizard; settings is its human face for later edits.
+#
+# The MODEL layer (settings_catalog / _settings_cycle / _settings_plain) is
+# pure and headless-testable; the curses VIEW reuses the cockpit palette and
+# glyphs. No TTY / no curses → the plain degrade prints current values plus
+# the matching `teamctl config <key> <value>` one-liners (same philosophy as
+# the installer's plain path).
+# --------------------------------------------------------------------------
+
+# The default a key falls back to when absent from config — mirrors the
+# code's own defaults so the cockpit shows the effective value, not a blank.
+_SETTINGS_DEFAULTS = {
+    "output.verbosity": "normal",
+    "lead.delegation": "ask",
+    "update.check": True,
+    "update.mode": "prompt",
+    "layout.lead_width": 50,
+    "layout.keep_finished": True,
+    "usage.probe_stale_minutes": 30,
+    "lead.chat_provider": "",
+    "lead.chat_model": "",
+    "lead.chat_effort": "",
+}
+
+# (key, section, label) for the fixed settings, in display order. Per-
+# provider model/effort rows are appended dynamically. `kind`/`choices`
+# come from _menu_choices (shared with `config --menu`) so the two editors
+# never disagree about what a key accepts.
+_SETTINGS_ROWS = (
+    ("lead.chat_provider", "default chat", "provider (bare `teamctl`)"),
+    ("lead.chat_model", "default chat", "model"),
+    ("lead.chat_effort", "default chat", "effort"),
+    ("routing.preference", "routing", "provider order"),
+    ("lead.delegation", "posture", "delegation"),
+    ("output.verbosity", "posture", "voice"),
+    ("layout.lead_width", "layout", "lead pane width %"),
+    ("layout.keep_finished", "layout", "keep finished panes"),
+    ("usage.probe_stale_minutes", "usage", "probe staleness (min)"),
+    ("update.check", "updates", "daily update check"),
+    ("update.mode", "updates", "update mode"),
+)
+
+
+def _settings_value(data: dict, key: str):
+    """Effective value for a key: the configured value, else its default.
+    Per-provider model/effort default to '' (the CLI's own default)."""
+    v = _get_dotted(data, key)
+    if v is not _MISSING:
+        return v
+    if key in _SETTINGS_DEFAULTS:
+        return _SETTINGS_DEFAULTS[key]
+    return ""   # per-provider model/effort: unset means the CLI's default
+
+
+def settings_catalog(data: dict) -> list[dict]:
+    """The full settings model: one row per user-facing key, each with its
+    section, label, effective value, and cycle choices (None = free text).
+    Pure — drives both the curses view and the plain degrade."""
+    rows: list[dict] = []
+    for key, section, label in _SETTINGS_ROWS:
+        val = _settings_value(data, key)
+        rows.append({"key": key, "section": section, "label": label,
+                     "value": val, "choices": _menu_choices(key, val)})
+    # per-provider model + effort, only for providers the user actually has
+    # configured (init writes a [providers.<p>] block per ready provider)
+    for prov in sorted((data.get("providers") or {})):
+        for leaf, lbl in (("model", "model"), ("effort", "effort")):
+            key = f"providers.{prov}.{leaf}"
+            val = _settings_value(data, key)
+            rows.append({"key": key, "section": f"{prov}", "label": lbl,
+                         "value": val, "choices": _menu_choices(key, val)})
+    return rows
+
+
+def _settings_cycle(row: dict, delta: int):
+    """Next/previous value for a cycleable row; unchanged if not cycleable."""
+    choices = row["choices"]
+    if not choices:
+        return row["value"]
+    try:
+        cur = choices.index(row["value"])
+    except ValueError:
+        cur = -delta
+    return choices[(cur + delta) % len(choices)]
+
+
+def _settings_plain(data: dict) -> list[str]:
+    """No-TTY degrade: current values + the `teamctl config` one-liner that
+    changes each — the scriptable path spelled out."""
+    lines = [f"# {config_path()}",
+             "# current settings — change any with the command shown:"]
+    section = None
+    for row in settings_catalog(data):
+        if row["section"] != section:
+            section = row["section"]
+            lines.append(f"\n[{section}]")
+        val = _toml_value(row["value"])
+        v = row["value"]
+        if isinstance(v, list):
+            example = ",".join(str(x) for x in v)
+        elif isinstance(v, bool):
+            example = "true" if v else "false"
+        else:
+            example = v
+        lines.append(f"  {row['label']:<26} {val}")
+        lines.append(f"    teamctl config {row['key']} "
+                     f"{shlex.quote(str(example))}")
+    return lines
+
+
+def _settings_curses(data: dict) -> int | None:
+    """Arrow-key settings cockpit. Returns an exit code, or None when curses
+    could not run (caller falls back to the plain degrade)."""
+    dirty = [False]
+
+    def run(stdscr):
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
+        _curses_colors()
+        g = _ui_glyphs()
+        sel = 0
+        while True:
+            catalog = settings_catalog(data)
+            sel = max(0, min(sel, len(catalog) - 1))
+            # a flat list of (kind, payload) render rows: section headers +
+            # items, so the focusable index maps back to catalog entries
+            render: list[tuple] = []
+            last_section = None
+            for i, row in enumerate(catalog):
+                if row["section"] != last_section:
+                    last_section = row["section"]
+                    render.append(("header", row["section"]))
+                render.append(("item", i, row))
+            h, w = stdscr.getmaxyx()
+            if h < len(render) + 5 or w < 64:
+                raise _RichUnusable("terminal too small for settings")
+            stdscr.erase()
+            _addstr(stdscr, 0, 1, "teamctl", _cattr("primary") | curses.A_BOLD)
+            _addstr(stdscr, 0, 9, f"{g['dot']}  settings", _cattr("accent"))
+            _addstr(stdscr, 1, 1, str(config_path()), _cattr("dim"))
+            y = 3
+            bar_w = min(w - 4, 84)
+            for r in render:
+                if r[0] == "header":
+                    _addstr(stdscr, y, 1, r[1], _cattr("soft") | curses.A_BOLD)
+                    y += 1
+                    continue
+                _idx, row = r[1], r[2]
+                focused = (_idx == sel)
+                val = _toml_value(row["value"])
+                label = f"  {row['label']:<26} {val}"
+                if focused:
+                    _addstr(stdscr, y, 2, (g["sel"] + label).ljust(bar_w),
+                            _cattr("select"))
+                else:
+                    _addstr(stdscr, y, 2, "  " + row["label"].ljust(26),
+                            _cattr("primary"))
+                    _addstr(stdscr, y, 30, val, _cattr("ok"))
+                y += 1
+            cyc = catalog[sel]["choices"] is not None
+            foot = ("↑↓ move   "
+                    + ("←/→ or space cycle   " if cyc else "space toggle   ")
+                    + "enter edit   s save   q quit"
+                    + ("   (unsaved)" if dirty[0] else ""))
+            _addstr(stdscr, h - 1, 1, foot, _cattr("dim"))
+            stdscr.refresh()
+
+            ch = stdscr.getch()
+            row = catalog[sel]
+            if ch in (curses.KEY_UP, ord("k")):
+                sel -= 1
+            elif ch in (curses.KEY_DOWN, ord("j"), 9):
+                sel += 1
+            elif ch in (curses.KEY_LEFT, curses.KEY_RIGHT, ord("h"),
+                        ord("l"), ord(" ")):
+                if row["choices"]:
+                    delta = -1 if ch in (curses.KEY_LEFT, ord("h")) else 1
+                    _set_dotted(data, row["key"], _settings_cycle(row, delta))
+                    dirty[0] = True
+            elif ch in (10, 13, curses.KEY_ENTER, ord("e")):
+                txt = _curses_prompt(stdscr, f"{row['key']} =")
+                if txt:
+                    _set_dotted(data, row["key"],
+                                _parse_config_value(row["key"], txt))
+                    dirty[0] = True
+            elif ch == ord("s"):
+                return "save"
+            elif ch in (27, ord("q")):
+                if not dirty[0]:
+                    return "quit"
+                ans = _curses_prompt(stdscr, "quit without saving? [y/N]")
+                if ans.lower().startswith("y"):
+                    return "quit"
+
+    try:
+        import locale
+        locale.setlocale(locale.LC_ALL, "")
+    except Exception:
+        pass
+    try:
+        outcome = curses.wrapper(run)
+    except (_RichUnusable, curses.error):
+        return None
+    except Exception:
+        return None
+    if outcome == "save" and dirty[0]:
+        bak = _write_config_file(data)
+        print(f"wrote {config_path()}" + (f" (backup: {bak})" if bak else ""))
+    else:
+        print("nothing changed")
+    return 0
+
+
+def cmd_settings(args: argparse.Namespace) -> int:
+    """Open the settings cockpit (or its plain degrade). Works even with no
+    config yet — it edits the effective defaults and writes them on save."""
+    path = config_path()
+    data = _load_config_strict(path) if path.exists() else {}
+    if _use_rich_ui():
+        rc = _settings_curses(data)
+        if rc is not None:
+            return rc
+        print("(rich UI unavailable — showing current settings)\n")
+    for line in _settings_plain(data):
+        print(line)
+    if not path.exists():
+        print("\n(no config yet — run `teamctl init`, or set any key above "
+              "to create one)")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="teamctl", description=__doc__)
     p.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
@@ -4561,6 +4808,13 @@ def build_parser() -> argparse.ArgumentParser:
                      help="with 'on': install the per-prompt reminder hook "
                           "(Claude Code) without asking")
     lp2.set_defaults(func=cmd_lead)
+
+    stp = sub.add_parser(
+        "settings",
+        help="interactive settings cockpit (dark-room curses UI over the "
+             "same config; degrades to current values + `teamctl config` "
+             "one-liners without a TTY)")
+    stp.set_defaults(func=cmd_settings)
 
     cp = sub.add_parser("config", help="show or change agent-team preferences")
     cp.add_argument("key", nargs="?", default=None,
