@@ -460,37 +460,15 @@ v0.5.0 additions a lead should fold into the same discipline: check
 teammate finishes (review `--dry-run` first); `teamctl resurrect
 --dry-run` after any crash/reboot before assuming the roster is gone.
 
-## 10. Agent-driven install (THE canonical flow)
+## 10. Agent-driven install
 
-The paste prompt ([INSTALL_PROMPT.md](INSTALL_PROMPT.md)) is deliberately
-a bare pointer — **this section is the install contract** an agent is
-expected to execute autonomously after reading it:
-
-1. Read README.md, this guide, and llms.txt first (you have, if you're
-   here).
-2. Install with the setup bootstrap DISABLED — you drive setup yourself:
-
-       curl -fsSL https://raw.githubusercontent.com/ryderderder/teamctl/main/install.sh | bash -s -- --no-init
-
-   `--no-init` matters: without it the installer enters a tmux session
-   and runs the express setup itself, taking over the terminal you are
-   operating in. Rules while installing: ask the user before anything
-   that needs sudo; never auto-install a provider CLI (the installer
-   prints each one's official one-liner — show them and ask); make sure
-   `~/.local/bin` is on the user's PATH (fix their shell profile only
-   with consent, and say exactly what you changed).
-3. `teamctl init` (express: zero questions) — show the user the summary
-   frame. Never pick a routing order for them; if they want one,
-   `teamctl config routing.preference "a,b,c"` on their instruction.
-4. Offer lead mode (`teamctl lead on` — reversible with `teamctl lead
-   off`); install it only on a yes.
-5. Verify with `teamctl doctor` (exit 0 ok / 1 warn / 2 fail) and show
-   the output; `teamctl providers` shows what's signed in.
-6. Report what you did, what you skipped and why, and the user's
-   controls: `teamctl settings` (preferences cockpit), `teamctl lead
-   on|off|status` (manager identity), `teamctl uninstall` (run
-   `teamctl lead off` first — the uninstaller removes the binary that
-   reverses lead mode).
+The canonical install flow lives at [/INSTALL.md](../INSTALL.md) — the
+README's paste line fetches exactly that file. Follow it as written:
+install with `--no-init` (the installer otherwise enters tmux and takes
+over your terminal), ask before sudo, never auto-install provider CLIs,
+fix PATH only with consent, `teamctl init`, offer lead mode, verify with
+`teamctl doctor`, report the user's controls. This guide is the
+POST-install operating contract.
 
 ## 11. Safety posture (for agents, briefly)
 

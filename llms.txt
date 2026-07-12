@@ -10,7 +10,7 @@
 > busy/needs-input/idle detection, verified teardown, and a roster that
 > survives reboots (`resurrect`). Single-file Python, stdlib only;
 > macOS/Linux (WSL runs as Linux); requires tmux and at least one
-> signed-in provider CLI. Current release: v0.5.0.
+> signed-in provider CLI. Current release: v0.5.3.
 
 Key facts: commands exit 0 (success), 1 (operational failure), 2
 (precondition error, e.g. not inside tmux), 3 (internal refusal with a
@@ -27,8 +27,9 @@ logins.
 ## Docs
 
 - [Agent operating guide](docs/AGENT_GUIDE.md): canonical machine-oriented reference — exact command syntax, exit codes, state vocabulary, handoff protocol, worktree/land lifecycle, deterministic recovery recipes, custom-provider schema, the lead-agent operating rules verbatim
-- [Agent-driven install prompt](docs/INSTALL_PROMPT.md): the short paste-into-your-agent install flow (verify with `teamctl doctor`)
-- [README](README.md): human-oriented overview, use cases, security posture, honest limitations
+- [Install instructions for agents](INSTALL.md): the canonical fetch-and-follow install flow (verify with `teamctl doctor`)
+- [Complete guide](docs/GUIDE.md): every feature in depth, full configuration reference, security posture, FAQ, honest limitations
+- [README](README.md): the short human-oriented overview + install
 - [Use-case recipes](docs/use-cases.md): worked workflows with exact commands and expected on-screen output
 
 ## Optional

@@ -51,19 +51,15 @@ Ranked by value ÷ effort. All competitor claims verified against live repos/doc
   (not `~/.claude.json` presence, which exists pre-login).
 
 ## Go-public checklist (do BEFORE flipping the repo public)
-- **Ask GitHub Support to purge unreachable pre-scrub objects.** The 2026-07-12
-  history rewrite (AI-attribution trailers + root-commit author normalization)
-  cleaned every clonable ref, but GitHub still holds `refs/pull/1/*` server-side,
-  pinning the pre-scrub commits — closing or deleting the PR does NOT remove it;
-  only GitHub's own GC/Support purge can. Verify afterwards with an explicit
-  `git fetch origin '+refs/pull/*:refs/remotes/pr/*'` + trailer/identity grep.
+- ~~Ask GitHub Support to purge unreachable pre-scrub objects~~ **OBSOLETE**:
+  the 2026-07-12 repo delete+recreate removed every pre-scrub object
+  (`refs/pull/*` verified EMPTY on the fresh repo). At flip time just
+  re-verify: `git fetch origin '+refs/pull/*:refs/remotes/pr/*'` returns
+  nothing, plus the fresh-clone trailer/identity grep below.
 - Re-run the fresh-clone verification one last time at flip time: trailer grep 0
   across --all, identities only `ryderderder <ryder.wolf@pm.me>`, contributors
   API only ryderderder, CI green.
-- Drop the "(private for now — if that 404s, ask me for access, then
-  clone the repo and run: bash install.sh --no-init)" lines from the
-  paste block in README.md AND docs/INSTALL_PROMPT.md (keep them
-  byte-identical) — the 404 fallback is only true while the repo is
-  private.
-- Render + embed the launch GIFs (demo-v2, install-v2) and set the social-preview
-  still per the gif-placement plan.
+- Set the social-preview still per the gif-placement plan. (Hero demo
+  GIF embedded 2026-07-12 — recorder take 7 at docs/assets/demo.gif; the
+  simplified README has no install-GIF slot, install-v2.tape remains in
+  docs/recordings/ if a docs page ever wants it.)
