@@ -183,20 +183,26 @@ def headless_argv(provider: str, task: str, model: str, effort: str) -> list[str
     raise TeamctlError(f"no headless adapter for provider '{provider}'")
 
 
-def resume_argv(provider: str, task: str, model: str, effort: str) -> list[str]:
-    """Continue the provider's most recent session (best-effort per provider)."""
+def resume_argv(provider: str, task: str, model: str, effort: str,
+                session_id: str) -> list[str]:
+    """Continue a SPECIFIC provider session. Exact-session only — resuming
+    'the most recent session' is banned (wrong session under concurrency).
+    Flags verified against each CLI's own help: claude `--resume <id>`,
+    grok `-r <id>`, codex `exec resume <SESSION_ID> <prompt>`."""
     if provider == "claude":
-        a = ["claude", "-p", task, "--output-format", "json", "-c"]
+        a = ["claude", "-p", task, "--output-format", "json",
+             "--resume", session_id]
         if model:
             a += ["--model", model]
         return a
     if provider == "grok":
-        a = ["grok", "--single", task, "--output-format", "json", "-c"]
+        a = ["grok", "--single", task, "--output-format", "json",
+             "-r", session_id]
         if model:
             a += ["-m", model]
         return a
     if provider == "codex":
-        return ["codex", "exec", "resume", "--last", task]
+        return ["codex", "exec", "resume", session_id, task]
     if provider == "shell":
         return [os.environ.get("SHELL", "/bin/bash"), "-c", task]
     raise TeamctlError(f"no resume adapter for provider '{provider}'")
@@ -763,6 +769,85 @@ def _wrapper_pid(hd: Path) -> int | None:
         return None
 
 
+_UUID_RE = re.compile(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+    r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+
+
+def _extract_session_id(provider: str, hd: Path,
+                        since: float | None = None) -> str | None:
+    """Best-effort provider session id from a dispatch's artifacts, for
+    exact-session follow-ups.
+
+    codex: `codex exec` prints `session id: <uuid>` on stderr (OBSERVED
+    banner; live-verified — the same uuid appears in the rollout log
+    filename, which is the fallback: newest rollout created after the
+    dispatch started whose name ends in a uuid). claude: the documented
+    session_id field of the --output-format json result. grok: the
+    sessionId field of its json result (observed; parsed defensively)."""
+    def _read(name: str) -> str:
+        f = hd / name
+        try:
+            return f.read_text() if f.exists() else ""
+        except OSError:
+            return ""
+
+    if provider == "codex":
+        m = re.search(r"session id:\s*(\S+)", _read("error.log"))
+        if m and _UUID_RE.fullmatch(m.group(1)):
+            return m.group(1)
+        base = Path.home() / ".codex" / "sessions"
+        if base.exists():
+            logs = sorted(base.glob("*/*/*/rollout-*.jsonl"),
+                          key=lambda p: p.stat().st_mtime, reverse=True)
+            for log in logs[:8]:
+                if since is not None and log.stat().st_mtime < since:
+                    continue
+                tail = log.stem[-36:]
+                if _UUID_RE.fullmatch(tail):
+                    return tail
+        return None
+
+    key = {"claude": "session_id", "grok": "sessionId"}.get(provider)
+    if key is None:
+        return None
+    try:
+        data = json.loads(_read("result.json"))
+    except (json.JSONDecodeError, ValueError):
+        return None
+    sid = _find_key(data, key)
+    return str(sid) if sid else None
+
+
+def _dispatch_started_at(info: dict) -> float | None:
+    try:
+        return time.mktime(time.strptime(info.get("created_at", ""),
+                                         "%Y-%m-%dT%H:%M:%S"))
+    except (ValueError, OverflowError):
+        return None
+
+
+def _capture_session_id(info: dict, hd: Path) -> str | None:
+    """Parse and persist the teammate's session id (hd/session). Refreshed
+    whenever newer artifacts yield one — a resumed run can mint a new id.
+    Returns the current best id, falling back to the persisted one."""
+    sid = _extract_session_id(info.get("provider", ""), hd,
+                              _dispatch_started_at(info))
+    sf = hd / "session"
+    if sid:
+        try:
+            sf.write_text(sid + "\n")
+        except OSError:
+            pass
+        return sid
+    try:
+        if sf.exists():
+            return sf.read_text().strip() or None
+    except OSError:
+        pass
+    return None
+
+
 def _teammate_alive(info: dict, hd: Path) -> bool:
     """True if the teammate pane still exists and/or the wrapper pid is live.
 
@@ -807,6 +892,9 @@ def cmd_result(args: argparse.Namespace) -> int:
                 return 1
             time.sleep(0.3)
             waited += 0.3
+
+    # keep the exact-session id current whenever artifacts allow it
+    _capture_session_id(info, hd)
 
     if status == "running":
         print(f"{args.role}: running")
@@ -853,9 +941,21 @@ def cmd_followup(args: argparse.Namespace) -> int:
     cwd = info.get("cwd") or os.getcwd()
     model = info.get("model") or ""
     effort = info.get("effort") or ""
-    argv = resume_argv(provider, args.task, model, effort)
     hd = Path(info.get("handoff") or handoff_dir(args.role))
     hd.mkdir(parents=True, exist_ok=True)
+
+    # exact-session only: capture the id from the previous turn's artifacts
+    # BEFORE they are cleared. Without one, refuse — never resume "the most
+    # recent session", which grabs the wrong one under concurrency.
+    session_id = ""
+    if provider != "shell":
+        session_id = _capture_session_id(info, hd) or ""
+        if not session_id:
+            print(f"teamctl: no session id captured for '{args.role}' — "
+                  "cannot resume its exact session (teamctl never guesses "
+                  "'most recent'). Re-dispatch instead.", file=sys.stderr)
+            return 1
+    argv = resume_argv(provider, args.task, model, effort, session_id)
     for stale in ("status", "result.json", "error.log", "pid"):
         (hd / stale).unlink(missing_ok=True)
 
@@ -1559,13 +1659,18 @@ def _detect_providers() -> list[tuple[str, bool, bool]]:
 
 
 def _render_config(providers_cfg: dict[str, dict[str, str]], verbosity: str,
-                   preference: list[str] | None = None) -> str:
+                   preference: list[str] | None = None,
+                   delegation: str = "ask") -> str:
     lines = [
         "# agent-team configuration (written by `teamctl init`)",
         "# Delete this file to fall back to each provider CLI's own defaults.",
         "",
         "[output]",
         f'verbosity = "{_toml_escape(verbosity)}"',
+        "",
+        "[lead]",
+        "# how a lead agent decides to delegate: ask | always | manual",
+        f'delegation = "{_toml_escape(delegation)}"',
     ]
     if preference:
         lines += [
@@ -1656,13 +1761,27 @@ def cmd_init(args: argparse.Namespace) -> int:
         else:
             print(f"  unrecognized verbosity '{v}'; using 'normal'")
 
+    delegation = "ask"
+    if not args.yes:
+        print("Delegation posture — when should a lead agent hand work to")
+        print("teamctl teammates? ask = it checks with you once per session;")
+        print("always = it delegates non-trivial work by default;")
+        print("manual = single-agent unless you explicitly ask.")
+        d = _ask("Default delegation posture — ask / always / manual [ask]: ",
+                 "ask").lower()
+        if d in ("ask", "always", "manual"):
+            delegation = d
+        else:
+            print(f"  unrecognized posture '{d}'; using 'ask'")
+
     cfg_path = home / ".config" / "agent-team" / "config.toml"
     backed_up = False
     if cfg_path.exists():
         shutil.copy2(cfg_path, cfg_path.with_name("config.toml.bak-teamctl"))
         backed_up = True
     cfg_path.parent.mkdir(parents=True, exist_ok=True)
-    cfg_path.write_text(_render_config(providers_cfg, verbosity, preference))
+    cfg_path.write_text(
+        _render_config(providers_cfg, verbosity, preference, delegation))
     print(f"\nwrote {cfg_path}"
           + (" (previous file backed up to config.toml.bak-teamctl)" if backed_up else ""))
     changes.append((
@@ -1805,8 +1924,18 @@ provider/model/effort from that live data, the user's preferences
 (~/.config/agent-team/config.toml — see `teamctl config`), and task fit.
 Use descriptive role names; never point two teammates at the same file;
 shut each teammate down (`teamctl shutdown <role>`) the moment its job is
-done — zero idle teammates. The user's explicit instructions always
-override these rules.
+done — zero idle teammates.
+Delegation posture: honor `teamctl config lead.delegation` (ask / always /
+manual; missing = ask). ask = the FIRST time non-trivial work comes up in
+a session, ask once whether to use teamctl agent teams (parallel
+teammates; taps the user's other AI subscriptions and uses more, and
+different, resources) or stay single-agent; offer to remember the answer
+("always" / "never" -> `teamctl config lead.delegation always|manual`)
+and do not re-ask that session. manual = single-agent unless the user
+asks. Whatever the posture, a genuinely large task (multi-file,
+parallelizable, long-running) earns ONE offer per session to spin up a
+team — never nag; a no is final for the session. The user's explicit
+instructions always override these rules.
 """ + LEAD_MD_END + "\n"
 
 LEAD_SKILL_MD = """\
@@ -1859,6 +1988,30 @@ main chat; teammates are tmux panes tiled to your right.
     teamctl list / teamctl usage / teamctl providers
     teamctl shutdown <role>                           # always, as soon as done
 
+## Delegation posture
+
+Read the user's posture from `teamctl config lead.delegation`
+(ask / always / manual; missing or unreadable = ask). The per-prompt hook
+also echoes the live value as `delegation=<value>`.
+
+- **always** — delegate non-trivial work to teamctl teammates by default.
+- **manual** — work single-agent; use teamctl only when the user asks.
+- **ask** — the FIRST time non-trivial or code-executing work comes up in
+  a session, ask once, plainly: "Want me to use teamctl agent teams for
+  work like this (parallel teammates, can tap your other AI
+  subscriptions — uses more, and different, resources), or stick to
+  regular single-agent work?" Then offer to make it permanent: "I can
+  remember this — say 'always', 'never' (manual), or I'll ask again next
+  session." Persist an answer with
+  `teamctl config lead.delegation always|manual` and confirm it back.
+  One and done — never re-ask in the same session.
+
+**Escalation valve (all postures, including manual):** when a task is
+genuinely large — multi-file, parallelizable, long-running, or one that
+would block this chat for a long time — you may suggest ONCE per session:
+"This is big — want me to spin up a teamctl team for it?" Never nag; a no
+is final for that session.
+
 ## Chat-based settings menu
 
 When the user asks for the teamctl menu, settings, or preferences:
@@ -1879,11 +2032,23 @@ text). `teamctl lead status` shows the tiers; `teamctl lead off` removes
 all three.
 """
 
+# The hook reads the LIVE delegation posture at fire time (cheap direct
+# grep of config.toml; missing config -> "ask"), so the lead knows the
+# current mode even after context compaction has dropped everything else.
 LEAD_HOOK_COMMAND = (
-    "echo '[teamctl-lead] Standing rule: delegate all non-trivial work to "
-    "teamctl teammates - check teamctl usage and teamctl providers before "
-    "spawning, and shut each teammate down the moment it is done.'"
+    "d=$(sed -n 's/^delegation *= *\"\\(.*\\)\"/\\1/p' "
+    "~/.config/agent-team/config.toml 2>/dev/null | head -1); "
+    "echo \"[teamctl-lead] delegation=${d:-ask} | Standing rule: delegate "
+    "non-trivial work to teamctl teammates per the posture - check teamctl "
+    "usage and teamctl providers before spawning, and shut each teammate "
+    "down the moment it is done.\""
 )
+
+
+def delegation_posture() -> str:
+    """[lead] delegation: ask | always | manual (anything else -> ask)."""
+    raw = (load_config().get("lead") or {}).get("delegation", "ask")
+    return raw if raw in ("ask", "always", "manual") else "ask"
 
 
 def _lead_hook_entry() -> dict:
@@ -2189,6 +2354,8 @@ def cmd_lead(args: argparse.Namespace) -> int:
                   f"marker block in {_lead_block_path(cli)}")
         print(f"  hook          {st['hook']:<14}  UserPromptSubmit in "
               f"{p['settings']} (Claude Code mechanism)")
+        print(f"\n  delegation posture: {delegation_posture()}   (change: "
+              "teamctl config lead.delegation ask|always|manual)")
         _print_controls()
         return 0
 

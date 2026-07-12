@@ -331,14 +331,14 @@ class InitLeadOfferTests(ThrowawayHomeTestCase):
 
     def test_init_default_answer_skips_lead_mode(self):
         # model, effort, verbosity, tmux n, statusline n, lead <default>
-        rc, _, _ = self.run_cli(["init"], answers=["", "", "", "n", "n"])
+        rc, _, _ = self.run_cli(["init"], answers=["", "", "", "", "n", "n"])
         self.assertEqual(rc, 0)
         self.assertFalse(self.skill_md.exists())
 
     def test_init_yes_answer_installs_lead_mode(self):
         # ... lead y, hook n
         rc, out, _ = self.run_cli(
-            ["init"], answers=["", "", "", "n", "n", "y", "n"])
+            ["init"], answers=["", "", "", "", "n", "n", "y", "n"])
         self.assertEqual(rc, 0)
         self.assertTrue(self.skill_md.exists())
         self.assertIn(tc.LEAD_MD_BEGIN, self.claude_md.read_text())
@@ -469,21 +469,21 @@ class InitRoutingOrderTests(ThrowawayHomeTestCase):
         # claude model/effort, codex model/effort, ROUTING ORDER, verbosity,
         # tmux n, statusline n, lead default-no (answers exhausted)
         rc, _, _ = self.run_cli(
-            ["init"], answers=["", "", "", "", "codex, claude", "", "n", "n"])
+            ["init"], answers=["", "", "", "", "codex, claude", "", "", "n", "n"])
         self.assertEqual(rc, 0)
         self.assertEqual(self._config()["routing"]["preference"],
                          ["codex", "claude"])
 
     def test_wizard_drops_unknown_entries(self):
         rc, out, _ = self.run_cli(
-            ["init"], answers=["", "", "", "", "gpt, codex", "", "n", "n"])
+            ["init"], answers=["", "", "", "", "gpt, codex", "", "", "n", "n"])
         self.assertEqual(rc, 0)
         self.assertEqual(self._config()["routing"]["preference"], ["codex"])
         self.assertIn("ignoring unknown", out)
 
     def test_blank_order_falls_back_to_documented_alphabetical(self):
         rc, out, _ = self.run_cli(
-            ["init"], answers=["", "", "", "", "", "", "n", "n"])
+            ["init"], answers=["", "", "", "", "", "", "", "n", "n"])
         self.assertEqual(rc, 0)
         self.assertEqual(self._config()["routing"]["preference"],
                          ["claude", "codex"])
@@ -660,6 +660,86 @@ class ConfigShowSetTests(ThrowawayHomeTestCase):
         finally:
             tc.shutil.which = _which
             tc.AUTH_PATHS = _auth
+
+
+class DelegationPostureTests(ThrowawayHomeTestCase):
+    """[lead] delegation: config round-trip, wizard, hook echo, texts."""
+
+    def test_posture_helper_defaults_and_sanitizes(self):
+        self.assertEqual(tc.delegation_posture(), "ask")     # no config
+        self.cfg.parent.mkdir(parents=True)
+        self.cfg.write_text('[lead]\ndelegation = "always"\n')
+        self.assertEqual(tc.delegation_posture(), "always")
+        self.cfg.write_text('[lead]\ndelegation = "yolo"\n')
+        self.assertEqual(tc.delegation_posture(), "ask")     # sanitized
+
+    def test_config_round_trip(self):
+        rc, _, _ = self.run_cli(["config", "lead.delegation", "manual"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(tc.delegation_posture(), "manual")
+        rc, out, _ = self.run_cli(["config", "lead.delegation"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.strip(), '"manual"')
+
+    def test_wizard_asks_and_persists_posture(self):
+        _which, _auth = tc.shutil.which, tc.AUTH_PATHS
+        tc.shutil.which = lambda name, *a, **k: (
+            "/fake/bin/claude" if name == "claude" else None)
+        auth = self.home / "auth-claude"
+        auth.write_text("x")
+        tc.AUTH_PATHS = {"claude": auth,
+                         "codex": self.home / "no",
+                         "grok": self.home / "no2"}
+        try:
+            # model, effort, verbosity, DELEGATION=always, tmux n, statusline n
+            rc, out, _ = self.run_cli(
+                ["init"], answers=["", "", "", "always", "n", "n"])
+            self.assertEqual(rc, 0)
+            self.assertIn("Delegation posture", out)
+            self.assertEqual(
+                tomllib.loads(self.cfg.read_text())["lead"]["delegation"],
+                "always")
+            # --yes writes the default posture
+            rc, _, _ = self.run_cli(["init", "--yes"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(
+                tomllib.loads(self.cfg.read_text())["lead"]["delegation"],
+                "ask")
+        finally:
+            tc.shutil.which = _which
+            tc.AUTH_PATHS = _auth
+
+    def test_hook_echo_reports_live_posture(self):
+        import subprocess
+        env = dict(os.environ)
+        env["HOME"] = str(self.home)
+        r = subprocess.run(["sh", "-c", tc.LEAD_HOOK_COMMAND],
+                           capture_output=True, text=True, env=env, timeout=15)
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("delegation=ask", r.stdout)            # missing config
+        self.cfg.parent.mkdir(parents=True)
+        self.cfg.write_text('[lead]\ndelegation = "manual"\n')
+        r = subprocess.run(["sh", "-c", tc.LEAD_HOOK_COMMAND],
+                           capture_output=True, text=True, env=env, timeout=15)
+        self.assertIn("delegation=manual", r.stdout)
+        self.assertIn("teamctl-lead", r.stdout)              # detection marker
+
+    def test_behavioral_texts_contain_ask_once_and_escalation(self):
+        for text in (tc.LEAD_SKILL_MD, tc.LEAD_CLAUDE_BLOCK):
+            self.assertIn("lead.delegation", text)
+            self.assertIn("ONE", text.upper())               # once-per-session
+            self.assertIn("never nag", text.lower())
+        flat = " ".join(tc.LEAD_SKILL_MD.split())            # unwrap lines
+        self.assertIn("Want me to use teamctl agent teams", flat)
+        self.assertIn("I can remember this", flat)
+        self.assertIn("want me to spin up a teamctl team", flat)
+
+    def test_lead_status_shows_posture(self):
+        self.cfg.parent.mkdir(parents=True)
+        self.cfg.write_text('[lead]\ndelegation = "always"\n')
+        rc, out, _ = self.run_cli(["lead", "status"])
+        self.assertEqual(rc, 0)
+        self.assertIn("delegation posture: always", out)
 
 
 class ConfigMenuTests(ThrowawayHomeTestCase):

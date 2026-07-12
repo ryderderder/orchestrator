@@ -271,6 +271,160 @@ class LayoutTests(unittest.TestCase):
                          [("resize-pane", "-t", "%5", "-x", "33%")])
 
 
+class SessionCaptureTests(unittest.TestCase):
+    """Exact-session id capture from dispatch artifacts (item: follow-ups
+    must never resume 'the most recent session')."""
+
+    UUID = "019f5468-ea9d-7562-a465-6d69cdd961fa"
+
+    def setUp(self):
+        import tempfile
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmpdir.name)
+        os.environ["TEAMCTL_STATE"] = str(self.dir / "state.json")
+        self._home = os.environ.get("HOME")
+        os.environ["HOME"] = str(self.dir)      # isolates ~/.codex fallback
+        self.hd = self.dir / "mate"
+        self.hd.mkdir()
+
+    def tearDown(self):
+        if self._home is not None:
+            os.environ["HOME"] = self._home
+        os.environ.pop("TEAMCTL_STATE", None)
+        self.tmpdir.cleanup()
+
+    def test_codex_banner_capture(self):
+        # live-verified stderr banner shape from a real dispatch error.log
+        (self.hd / "error.log").write_text(
+            f"[2026-07-11] OpenAI Codex v0.144\nsession id: {self.UUID}\n")
+        self.assertEqual(tc._extract_session_id("codex", self.hd), self.UUID)
+
+    def test_codex_malformed_banner_falls_back_to_rollout_filename(self):
+        (self.hd / "error.log").write_text("no banner here\n")
+        day = self.dir / ".codex" / "sessions" / "2026" / "07" / "11"
+        day.mkdir(parents=True)
+        (day / f"rollout-2026-07-11T20-39-49-{self.UUID}.jsonl").write_text("x")
+        (day / "rollout-not-a-uuid.jsonl").write_text("x")
+        self.assertEqual(tc._extract_session_id("codex", self.hd), self.UUID)
+
+    def test_codex_fallback_respects_dispatch_start_time(self):
+        import time as _t
+        (self.hd / "error.log").write_text("no banner\n")
+        day = self.dir / ".codex" / "sessions" / "2026" / "07" / "11"
+        day.mkdir(parents=True)
+        old = day / f"rollout-old-{self.UUID}.jsonl"
+        old.write_text("x")
+        past = _t.time() - 3600
+        os.utime(old, (past, past))
+        # the only rollout predates the dispatch -> not this dispatch's
+        self.assertIsNone(
+            tc._extract_session_id("codex", self.hd, since=_t.time() - 60))
+
+    def test_claude_and_grok_ids_from_result_json(self):
+        (self.hd / "result.json").write_text(
+            json.dumps({"type": "result", "session_id": "abc-123"}))
+        self.assertEqual(tc._extract_session_id("claude", self.hd), "abc-123")
+        (self.hd / "result.json").write_text(
+            json.dumps({"text": "hi", "sessionId": "xyz-9"}))
+        self.assertEqual(tc._extract_session_id("grok", self.hd), "xyz-9")
+        (self.hd / "result.json").write_text("{broken")
+        self.assertIsNone(tc._extract_session_id("grok", self.hd))
+
+    def test_capture_persists_and_survives_artifact_loss(self):
+        info = {"provider": "grok", "created_at": "2026-01-01T00:00:00"}
+        (self.hd / "result.json").write_text(json.dumps({"sessionId": "s1"}))
+        self.assertEqual(tc._capture_session_id(info, self.hd), "s1")
+        self.assertEqual((self.hd / "session").read_text().strip(), "s1")
+        # a later turn mints a new id -> refreshed
+        (self.hd / "result.json").write_text(json.dumps({"sessionId": "s2"}))
+        self.assertEqual(tc._capture_session_id(info, self.hd), "s2")
+        # artifacts cleared -> the persisted id still wins
+        (self.hd / "result.json").unlink()
+        self.assertEqual(tc._capture_session_id(info, self.hd), "s2")
+
+
+class FollowupExactSessionTests(unittest.TestCase):
+    """followup resumes the EXACT captured session, or refuses."""
+
+    def setUp(self):
+        import tempfile
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmpdir.name)
+        os.environ["TEAMCTL_STATE"] = str(self.dir / "state.json")
+        self._tmux_env = os.environ.get("TMUX")
+        os.environ["TMUX"] = "/fake/sock,1,0"
+        self._reconcile = tc.reconcile
+        self._dispatch = tc._dispatch_pane
+        self._title = tc._set_pane_title
+        tc.reconcile = lambda state: state
+        self.argv_seen = []
+        tc._dispatch_pane = (lambda role, hd, argv, cwd, provider, model:
+                             self.argv_seen.append(argv) or "%fake")
+        tc._set_pane_title = lambda *a, **k: None
+
+    def tearDown(self):
+        tc.reconcile = self._reconcile
+        tc._dispatch_pane = self._dispatch
+        tc._set_pane_title = self._title
+        if self._tmux_env is None:
+            os.environ.pop("TMUX", None)
+        else:
+            os.environ["TMUX"] = self._tmux_env
+        os.environ.pop("TEAMCTL_STATE", None)
+        self.tmpdir.cleanup()
+
+    def _seed(self, provider="grok", session=None):
+        hd = self.dir / "mate"
+        hd.mkdir(exist_ok=True)
+        if session:
+            (hd / "session").write_text(session + "\n")
+        tc.save_state({"teammates": {"mate": {
+            "provider": provider, "pane_id": "%1", "cwd": str(self.dir),
+            "model": "", "effort": "", "mode": "dispatch",
+            "handoff": str(hd), "created_at": "2026-01-01T00:00:00"}}})
+        return hd
+
+    def _followup(self):
+        import contextlib
+        import io
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = tc.main(["followup", "mate", "--task", "next step"])
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_followup_uses_captured_session_id(self):
+        self._seed(provider="grok", session="sess-42")
+        rc, _, _ = self._followup()
+        self.assertEqual(rc, 0)
+        argv = self.argv_seen[0]
+        self.assertEqual(argv[argv.index("-r") + 1], "sess-42")
+        self.assertNotIn("-c", argv)                    # no "most recent"
+
+    def test_followup_refuses_without_session_id(self):
+        self._seed(provider="codex", session=None)
+        # isolate the ~/.codex rollout fallback from the real machine
+        home = os.environ.get("HOME")
+        os.environ["HOME"] = str(self.dir)
+        try:
+            rc, _, err = self._followup()
+        finally:
+            os.environ["HOME"] = home
+        self.assertEqual(rc, 1)
+        self.assertIn("no session id captured", err)
+        self.assertEqual(self.argv_seen, [])            # nothing launched
+
+    def test_resume_argv_is_exact_session_for_all_providers(self):
+        c = tc.resume_argv("codex", "task", "", "", "SID")
+        self.assertEqual(c, ["codex", "exec", "resume", "SID", "task"])
+        self.assertNotIn("--last", c)
+        a = tc.resume_argv("claude", "task", "opus", "", "SID")
+        self.assertEqual(a[a.index("--resume") + 1], "SID")
+        self.assertNotIn("-c", a)
+        g = tc.resume_argv("grok", "task", "", "", "SID")
+        self.assertEqual(g[g.index("-r") + 1], "SID")
+        self.assertNotIn("-c", g)
+
+
 class ParseProbeTests(unittest.TestCase):
     """Defensive scraping of observed-only TUI usage text."""
 
@@ -595,7 +749,7 @@ class InitTests(unittest.TestCase):
 
     def test_scripted_answers_reach_config(self):
         # answers: claude model, claude effort, verbosity, tmux y/n, statusline y/n
-        rc, out = self._run_init(["opus", "high", "terse", "n", "n"])
+        rc, out = self._run_init(["opus", "high", "terse", "", "n", "n"])
         self.assertEqual(rc, 0)
         cfg = self._config()
         self.assertEqual(cfg["providers"]["claude"]["model"], "opus")
@@ -604,9 +758,9 @@ class InitTests(unittest.TestCase):
         self.assertIn("revert", out)
 
     def test_rerun_backs_up_previous_config(self):
-        rc, _ = self._run_init(["opus", "high", "normal", "n", "n"])
+        rc, _ = self._run_init(["opus", "high", "normal", "", "n", "n"])
         self.assertEqual(rc, 0)
-        rc, _ = self._run_init(["sonnet", "", "normal", "n", "n"])
+        rc, _ = self._run_init(["sonnet", "", "normal", "", "n", "n"])
         self.assertEqual(rc, 0)
         self.assertEqual(self._config()["providers"]["claude"]["model"], "sonnet")
         bak = self.home / ".config" / "agent-team" / "config.toml.bak-teamctl"
@@ -616,7 +770,7 @@ class InitTests(unittest.TestCase):
     def test_tmux_block_appended_once_and_backed_up(self):
         conf = self.home / ".tmux.conf"
         conf.write_text("set -g mouse on\n")
-        rc, _ = self._run_init(["", "", "", "y", "n"])
+        rc, _ = self._run_init(["", "", "", "", "y", "n"])
         self.assertEqual(rc, 0)
         text = conf.read_text()
         self.assertEqual(text.count(tc.TMUX_MARKER_BEGIN), 1)
@@ -625,7 +779,7 @@ class InitTests(unittest.TestCase):
         self.assertIn("pane-border-format", text)
         self.assertTrue((self.home / ".tmux.conf.bak-teamctl").exists())
         # second accept must not duplicate the block
-        rc, out = self._run_init(["", "", "", "y", "n"])
+        rc, out = self._run_init(["", "", "", "", "y", "n"])
         self.assertEqual(rc, 0)
         self.assertEqual(conf.read_text().count(tc.TMUX_MARKER_BEGIN), 1)
         self.assertIn("skipping", out)
@@ -634,7 +788,7 @@ class InitTests(unittest.TestCase):
         settings = self.home / ".claude" / "settings.json"
         settings.parent.mkdir(parents=True)
         settings.write_text(json.dumps({"model": "opus"}, indent=2))
-        rc, _ = self._run_init(["", "", "", "n", "y"])
+        rc, _ = self._run_init(["", "", "", "", "n", "y"])
         self.assertEqual(rc, 0)
         data = json.loads(settings.read_text())
         self.assertEqual(data["model"], "opus")          # existing keys untouched
@@ -645,13 +799,13 @@ class InitTests(unittest.TestCase):
         self.assertTrue(Path(str(settings) + ".bak-teamctl").exists())
         # second run: key already present -> settings must be left alone
         before = settings.read_text()
-        rc, out = self._run_init(["", "", "", "n", "y"])
+        rc, out = self._run_init(["", "", "", "", "n", "y"])
         self.assertEqual(rc, 0)
         self.assertEqual(settings.read_text(), before)
         self.assertIn("already has a statusLine key", out)
 
     def test_statusline_creates_settings_when_absent(self):
-        rc, _ = self._run_init(["", "", "", "n", "y"])
+        rc, _ = self._run_init(["", "", "", "", "n", "y"])
         self.assertEqual(rc, 0)
         settings = self.home / ".claude" / "settings.json"
         data = json.loads(settings.read_text())
