@@ -27,12 +27,17 @@ bootstrap), `--no-deps` (skip dependency offers). Safe to re-run. From a
 checkout:
 `git clone https://github.com/ryderderder/teamctl && cd teamctl && ./install.sh`.
 
-![Install: the one-liner installs teamctl, detects dependencies and provider CLIs, then drops you into a tmux session with the setup wizard running](docs/assets/install.gif)
+<!-- install.gif lands with the v0.3.0 install-flow re-record (see docs/recordings/README.md):
+![Install: the one-liner installs teamctl, detects dependencies and provider CLIs, then drops you into a tmux session with the express setup already done](docs/assets/install.gif)
+-->
 
-And here is the lead-and-teammates workflow itself — check real usage, route a
-task, spawn teammates as labeled tmux panes, and tear them down cleanly:
+Here is the lead-and-teammates workflow — check real usage, see `route` pick a
+provider, spawn and dispatch teammates as labeled tmux panes, read a result
+back, and tear everything down cleanly (recorded with the token-free `shell`
+provider and neutral model labels; the mechanics are identical for real
+providers):
 
-![Demo: a lead pane runs teamctl usage and route --dry-run, spawns a code-reviewer and a researcher as tmux panes with role and model labels on their borders, lists them, then shuts both down](docs/assets/demo.gif)
+![Demo: a lead tmux pane runs teamctl usage and route --dry-run, spawns code-reviewer and researcher panes and dispatches an analyst task, each pane labeled with its role and model, then reads the analyst's JSON result back with result --wait and shuts all three down, ending with an empty teammate list](docs/assets/demo.gif)
 
 ### Install via your AI agent — paste this prompt
 
