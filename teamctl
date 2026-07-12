@@ -1232,8 +1232,8 @@ def cmd_init(args: argparse.Namespace) -> int:
         _lead_install_claude_md(changes)
         if _lead_status()["hook"] == "installed":
             print("settings.json already has a teamctl-lead hook — skipping.")
-        elif _ask_yn("Also install the per-prompt reminder hook "
-                     "(strongest tier — survives context compaction)? [y/N] "):
+        elif _ask_yn("Also install the per-prompt reminder hook (recommended "
+                     "— survives context compaction)? [Y/n] ", default=True):
             _lead_install_hook(changes)
 
     print("\nSummary of changes:")
@@ -1242,6 +1242,7 @@ def cmd_init(args: argparse.Namespace) -> int:
         print(f"    revert: {revert}")
     if not changes:
         print("  nothing was changed")
+    _print_controls()
     return 0
 
 
@@ -1322,6 +1323,25 @@ main chat; teammates are tmux panes tiled to your right.
     teamctl send <role> "…"                           # type into a live teammate
     teamctl list / teamctl usage / teamctl providers
     teamctl shutdown <role>                           # always, as soon as done
+
+## Chat-based settings menu
+
+When the user asks for the teamctl menu, settings, or preferences:
+
+1. Run `teamctl config` and read the current dotted keys.
+2. Present them to the user as a numbered menu in chat.
+3. Apply each change with `teamctl config <dotted.key> <value>`
+   (comma-separated values become lists), then re-run `teamctl config`
+   and confirm the new value back to the user before moving on.
+
+## Lead mode tiers
+
+This identity is installed by `teamctl lead on` in three tiers: this skill
+(discoverable), a marker-guarded CLAUDE.md block (always in context), and a
+UserPromptSubmit hook (recommended — it re-injects the standing rule on
+every prompt, so it keeps firing even after context compaction drops older
+text). `teamctl lead status` shows the tiers; `teamctl lead off` removes
+all three.
 """
 
 LEAD_HOOK_COMMAND = (
@@ -1335,6 +1355,17 @@ def _lead_hook_entry() -> dict:
     """A fresh UserPromptSubmit hook entry (nested shape per the hooks docs;
     UserPromptSubmit takes no matcher). Its stdout is added to context."""
     return {"hooks": [{"type": "command", "command": LEAD_HOOK_COMMAND}]}
+
+
+def _print_controls() -> None:
+    """The 'how do I drive this later' footer shown after init / lead on /
+    lead status — from the shell or from a chat with a lead agent."""
+    print("\nControls — adjust teamctl any time:")
+    print("  from your shell:  teamctl config --menu      (preferences menu)")
+    print("                    teamctl lead on|off|status  (manager identity)")
+    print('  from a chat:      tell your lead agent "open the teamctl menu" —')
+    print("                    with lead mode on it presents your settings and")
+    print("                    applies changes via `teamctl config`.")
 
 
 def _lead_paths() -> dict[str, Path]:
@@ -1560,6 +1591,7 @@ def cmd_lead(args: argparse.Namespace) -> int:
         print(f"  skill      {st['skill']:<14}  {p['skill_md']}")
         print(f"  CLAUDE.md  {st['claude_md']:<14}  marker block in {p['claude_md']}")
         print(f"  hook       {st['hook']:<14}  UserPromptSubmit in {p['settings']}")
+        _print_controls()
         return 0
 
     if args.action == "on":
@@ -1573,11 +1605,12 @@ def cmd_lead(args: argparse.Namespace) -> int:
         elif args.hook:
             want_hook = True
         else:
-            print("\nOptional: a UserPromptSubmit hook echoes a one-line reminder")
+            print("\nRecommended: a UserPromptSubmit hook echoes a one-line reminder")
             print("into context on every prompt. It is the strongest tier because")
             print("it survives context compaction (compaction can drop CLAUDE.md")
             print("text from a long session; the hook re-injects the rule each turn).")
-            want_hook = _ask_yn("Install the per-prompt reminder hook? [y/N] ")
+            want_hook = _ask_yn("Install the per-prompt reminder hook? [Y/n] ",
+                                default=True)
         if want_hook:
             _lead_install_hook(changes)
 
@@ -1588,6 +1621,7 @@ def cmd_lead(args: argparse.Namespace) -> int:
         if not changes:
             print("  nothing was changed (already installed)")
         print("undo everything any time with: teamctl lead off")
+        _print_controls()
         return 0
 
     # off: remove exactly what `on` installed, tolerating partial installs.

@@ -71,7 +71,7 @@ class ThrowawayHomeTestCase(unittest.TestCase):
 
 class LeadOnTests(ThrowawayHomeTestCase):
     def test_on_installs_skill_and_claude_md_block(self):
-        rc, out, _ = self.run_cli(["lead", "on"])   # hook question -> default N
+        rc, out, _ = self.run_cli(["lead", "on"], answers=["n"])  # decline hook
         self.assertEqual(rc, 0)
         text = self.skill_md.read_text()
         self.assertTrue(text.startswith("---\nname: teamctl-lead\n"))
@@ -81,9 +81,10 @@ class LeadOnTests(ThrowawayHomeTestCase):
         self.assertEqual(cm.count(tc.LEAD_MD_BEGIN), 1)
         self.assertEqual(cm.count(tc.LEAD_MD_END), 1)
         self.assertIn("teamctl usage", cm)
-        # hook declined by default: settings.json must not even be created
+        # hook declined: settings.json must not even be created
         self.assertFalse(self.settings.exists())
         self.assertIn("Summary of changes", out)
+        self.assertIn("Controls", out)                      # discoverability footer
 
     def test_on_twice_appends_block_once(self):
         self.assertEqual(self.run_cli(["lead", "on"])[0], 0)
@@ -223,16 +224,17 @@ class LeadHookTests(ThrowawayHomeTestCase):
         self.assertEqual(self.settings.read_text(), "{this is not json")
         self.assertIn("left untouched", out)
 
-    def test_hook_prompt_defaults_to_no(self):
-        # unanswered prompt (EOF) must NOT install the hook
-        rc, _, _ = self.run_cli(["lead", "on"])
+    def test_hook_prompt_defaults_to_yes(self):
+        # an explicit "n" declines the recommended hook…
+        rc, _, _ = self.run_cli(["lead", "on"], answers=["n"])
         self.assertEqual(rc, 0)
         self.assertFalse(self.settings.exists())
-        # but an explicit yes does
-        rc, _, _ = self.run_cli(["lead", "on"], answers=["y"])
+        # …but the default (unanswered prompt / EOF) installs it
+        rc, _, _ = self.run_cli(["lead", "on"])
         self.assertEqual(rc, 0)
         _, ups = self._hook_entries()
         self.assertEqual(len(ups), 1)
+        self.assertIn("teamctl-lead", ups[0]["hooks"][0]["command"])
 
 
 class LeadStatusTests(ThrowawayHomeTestCase):
@@ -240,8 +242,9 @@ class LeadStatusTests(ThrowawayHomeTestCase):
         rc, out, _ = self.run_cli(["lead", "status"])
         self.assertEqual(rc, 0)
         self.assertEqual(out.count("not installed"), 3)
+        self.assertIn("Controls", out)                      # discoverability footer
 
-        self.assertEqual(self.run_cli(["lead", "on"])[0], 0)
+        self.assertEqual(self.run_cli(["lead", "on"], answers=["n"])[0], 0)
         rc, out, _ = self.run_cli(["lead", "status"])
         self.assertEqual(rc, 0)
         st = tc._lead_status()
