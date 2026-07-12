@@ -435,6 +435,17 @@ def _split_candidates(lead: str | None, existing: list[str]) -> list[str]:
     return [p for p in existing if p in live]
 
 
+def keep_finished_panes() -> bool:
+    """[layout] keep_finished (default true): a finished dispatch teammate's
+    pane stays open — visibly done — until `teamctl shutdown <role>`. Set
+    false for the old ephemeral behavior (pane self-closes ~2s after the
+    task completes; the teammate stays tracked either way)."""
+    raw = (load_config().get("layout") or {}).get("keep_finished", True)
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() not in ("false", "0", "no", "off")
+
+
 def lead_width_percent() -> int:
     """Configured lead-pane width share ([layout] lead_width, % of the
     window), clamped to 20–80. Default 50."""
@@ -762,7 +773,13 @@ def _dispatch_pane(role: str, hd: Path, argv: list[str], cwd: str,
 
     The status file records the exit code AND, for rc > 128, the signal name
     (e.g. `DONE 137 SIGKILL`) so a killed provider is distinguishable from a
-    failed one. The wrapper's PID is recorded for teardown."""
+    failed one. The wrapper's PID is recorded for teardown.
+
+    With [layout] keep_finished (the default), the pane does NOT self-close
+    on completion: the wrapper prints a completion banner and blocks until
+    `teamctl shutdown <role>` tears it down — finished work stays VISIBLE in
+    the window, not just tracked in state. keep_finished=false restores the
+    ephemeral behavior (pane closes ~2s after the task ends)."""
     hcmd = " ".join(shlex.quote(a) for a in argv)
     q = shlex.quote
     pid_f = q(str(hd / "pid"))
@@ -770,6 +787,20 @@ def _dispatch_pane(role: str, hd: Path, argv: list[str], cwd: str,
     err_f = q(str(hd / "error.log"))
     sta_f = q(str(hd / "status"))
     banner = f"[teamctl] {provider} {model or ''} :: {role} — working…"
+    if keep_finished_panes():
+        # `tail -f /dev/null` blocks portably (macOS sleep has no infinity);
+        # shutdown's process-tree kill (or the pane's C-c) ends it.
+        ending = (
+            f"printf '\\n[teamctl] {role} — DONE rc=%s%s · result captured · "
+            f"closes on: teamctl shutdown {role}\\n' "
+            "\"$rc\" \"${cause:+ (SIG$cause)}\"; "
+            "tail -f /dev/null"
+        )
+    else:
+        ending = (
+            f"echo \"[teamctl] {role} finished rc=$rc${{cause:+ (SIG$cause)}}\"; "
+            "sleep 2; kill $tailpid 2>/dev/null"
+        )
     script = (
         f"echo $$ > {pid_f}; "
         f"cd {q(cwd)} || exit 97; "
@@ -781,8 +812,7 @@ def _dispatch_pane(role: str, hd: Path, argv: list[str], cwd: str,
         "if [ \"$rc\" -gt 128 ]; then "
         "cause=$(kill -l $((rc-128)) 2>/dev/null); fi; "
         f"printf 'DONE %s%s\\n' \"$rc\" \"${{cause:+ SIG$cause}}\" > {sta_f}; "
-        f"echo \"[teamctl] {role} finished rc=$rc${{cause:+ (SIG$cause)}}\"; "
-        "sleep 2; kill $tailpid 2>/dev/null"
+        + ending
     )
     outer = "bash -c " + shlex.quote(script)
     existing = [i.get("pane_id", "") for i in load_state()["teammates"].values()]
@@ -817,8 +847,12 @@ def _do_dispatch(role: str, provider: str, task: str, context_file: str,
         state = reconcile(load_state())
         existing_info = state["teammates"].get(role)
         if existing_info:
-            if (existing_info.get("mode") == "dispatch"
-                    and not existing_info.get("pane_id")):
+            finished = False
+            if existing_info.get("mode") == "dispatch":
+                hd0 = Path(existing_info.get("handoff") or handoff_dir(role))
+                finished = (_read_status(hd0)[0] == "done"
+                            or not existing_info.get("pane_id"))
+            if finished:
                 print(f"teamctl: finished teammate '{role}' still holds this "
                       f"role — read it with `teamctl result {role}`, continue "
                       f"it with `teamctl followup {role}`, or clear it with "
@@ -1105,6 +1139,13 @@ def cmd_followup(args: argparse.Namespace) -> int:
         print(f"teamctl: '{args.role}' is still running — wait for "
               f"`teamctl result {args.role} --wait` first.", file=sys.stderr)
         return 1
+
+    # a finished teammate may still hold its pane open (keep_finished):
+    # close it before opening the follow-up pane so the role never shows
+    # two panes at once.
+    old_pane = info.get("pane_id") or ""
+    if old_pane and old_pane in live_pane_ids():
+        _close_pane(old_pane)
 
     # exact-session only: capture the id from the previous turn's artifacts
     # BEFORE they are cleared. Without one, refuse — never resume "the most

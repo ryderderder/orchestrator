@@ -7,6 +7,7 @@ real tmux panes runs only when executed inside a tmux session.
 Run with:  python3 -m unittest discover -s tests
 """
 
+import contextlib as contextlib_module
 import importlib.util
 import json
 import os
@@ -1324,104 +1325,179 @@ class LiveTmuxTests(unittest.TestCase):
             _t.sleep(0.25)
         return False
 
+    def _wait_status(self, hd: Path, timeout: float = 20.0) -> bool:
+        import time as _t
+        deadline = _t.monotonic() + timeout
+        while _t.monotonic() < deadline:
+            if (hd / "status").exists():
+                return True
+            _t.sleep(0.2)
+        return False
+
+    @contextlib_module.contextmanager
+    def _keep_finished(self, value: bool):
+        """Pin [layout] keep_finished for a test, ignoring the real config."""
+        original = tc.load_config
+        tc.load_config = lambda: {"layout": {"keep_finished": value}}
+        try:
+            yield
+        finally:
+            tc.load_config = original
+
+    def test_finished_pane_stays_visible_until_shutdown(self):
+        # keep_finished (the DEFAULT): a finished dispatch pane must NOT
+        # self-close — it shows a completion banner until shutdown clears it.
+        import time as _t
+        with self._keep_finished(True):
+            self.assertEqual(
+                tc.main(["dispatch", "d_mate", "--provider", "shell",
+                         "--task", 'printf %s \'{"kept": true}\'']), 0)
+            info = tc.load_state()["teammates"]["d_mate"]
+            pane, hd = info["pane_id"], Path(info["handoff"])
+            self.assertTrue(self._wait_status(hd), "status never written")
+            _t.sleep(2.5)                       # the old self-close window
+            self.assertIn(pane, tc.live_pane_ids(),
+                          "finished pane self-closed despite keep_finished")
+            cap = tc.tmux("capture-pane", "-p", "-t", pane).stdout
+            self.assertIn("DONE rc=0", cap)
+            self.assertIn("teamctl shutdown d_mate", cap)
+            # result reads fine while the pane sits there, visibly finished
+            self.assertEqual(tc.main(["result", "d_mate"]), 0)
+            # shutdown ends the blocking wrapper, closes the pane, clears all
+            self.assertEqual(tc.main(["shutdown", "d_mate"]), 0)
+            self.assertTrue(self._wait_pane_gone(pane, 10))
+            self.assertNotIn("d_mate", tc.load_state()["teammates"])
+            self.assertFalse(hd.exists())
+
+    def test_followup_replaces_still_open_finished_pane(self):
+        import contextlib
+        import io
+        with self._keep_finished(True):
+            self.assertEqual(
+                tc.main(["dispatch", "d_mate", "--provider", "shell",
+                         "--task", 'printf %s \'{"turn": 1}\'']), 0)
+            info = tc.load_state()["teammates"]["d_mate"]
+            pane1, hd = info["pane_id"], Path(info["handoff"])
+            self.assertTrue(self._wait_status(hd))
+            self.assertEqual(
+                tc.main(["followup", "d_mate", "--task",
+                         'printf %s \'{"turn": 2}\'']), 0)
+            pane2 = tc.load_state()["teammates"]["d_mate"]["pane_id"]
+            self.assertNotEqual(pane1, pane2)
+            self.assertTrue(self._wait_pane_gone(pane1, 10),
+                            "old finished pane was left open")
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(
+                    tc.main(["result", "d_mate", "--wait", "--timeout", "30"]),
+                    0)
+            self.assertIn('"turn": 2', out.getvalue())
+            tc.main(["shutdown", "d_mate"])
+
     def test_dispatch_lifecycle_survives_pane_selfclose(self):
-        # THE v0.2.0 regression: the wrapper exits when the task finishes,
-        # the pane self-closes, and reconcile used to drop the teammate —
+        # THE v0.2.0 regression, on the ephemeral (keep_finished=false)
+        # path: the wrapper exits when the task finishes, the pane
+        # self-closes, and reconcile used to drop the teammate —
         # result/followup then failed even though the answer sat on disk.
         import contextlib
         import io
         import json as _json
 
-        task = 'printf %s \'{"phase": 1}\''
-        self.assertEqual(
-            tc.main(["dispatch", "d_mate", "--provider", "shell",
-                     "--task", task]), 0)
-        pane = tc.load_state()["teammates"]["d_mate"]["pane_id"]
+        with self._keep_finished(False):
+            task = 'printf %s \'{"phase": 1}\''
+            self.assertEqual(
+                tc.main(["dispatch", "d_mate", "--provider", "shell",
+                         "--task", task]), 0)
+            pane = tc.load_state()["teammates"]["d_mate"]["pane_id"]
 
-        # WAIT for the wrapper to finish and its pane to SELF-close
-        # (the wrapper lingers ~2s after writing status).
-        self.assertTrue(self._wait_pane_gone(pane),
-                        "dispatch pane never self-closed")
+            # WAIT for the wrapper to finish and its pane to SELF-close
+            # (the ephemeral wrapper lingers ~2s after writing status).
+            self.assertTrue(self._wait_pane_gone(pane),
+                            "dispatch pane never self-closed")
 
-        # the teammate must still be tracked, as finished
-        out = io.StringIO()
-        with contextlib.redirect_stdout(out):
-            self.assertEqual(tc.main(["list"]), 0)
-        listing = out.getvalue()
-        self.assertIn("d_mate", listing)
-        self.assertIn("done", listing)
-
-        # `result` works — and keeps working (indefinitely, not just once)
-        for _ in range(2):
+            # the teammate must still be tracked, as finished
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
-                self.assertEqual(tc.main(["result", "d_mate"]), 0)
-            self.assertIn('"phase": 1', out.getvalue())
+                self.assertEqual(tc.main(["list"]), 0)
+            listing = out.getvalue()
+            self.assertIn("d_mate", listing)
+            self.assertIn("done", listing)
 
-        # `followup` opens a fresh pane and completes a second turn
-        self.assertEqual(
-            tc.main(["followup", "d_mate", "--task",
-                     'printf %s \'{"phase": 2}\'']), 0)
-        out = io.StringIO()
-        with contextlib.redirect_stdout(out):
+            # `result` works — and keeps working (indefinitely, not just once)
+            for _ in range(2):
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    self.assertEqual(tc.main(["result", "d_mate"]), 0)
+                self.assertIn('"phase": 1', out.getvalue())
+
+            # `followup` opens a fresh pane and completes a second turn
             self.assertEqual(
-                tc.main(["result", "d_mate", "--wait", "--timeout", "30"]), 0)
-        self.assertEqual(
-            _json.loads((tc.handoff_dir("d_mate") / "result.json").read_text()),
-            {"phase": 2})
+                tc.main(["followup", "d_mate", "--task",
+                         'printf %s \'{"phase": 2}\'']), 0)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(
+                    tc.main(["result", "d_mate", "--wait", "--timeout", "30"]),
+                    0)
+            self.assertEqual(
+                _json.loads(
+                    (tc.handoff_dir("d_mate") / "result.json").read_text()),
+                {"phase": 2})
 
-        # explicit shutdown clears the state AND the handoff artifacts
-        hd = tc.handoff_dir("d_mate")
-        self.assertTrue(hd.exists())
-        self.assertEqual(tc.main(["shutdown", "d_mate"]), 0)
-        self.assertNotIn("d_mate", tc.load_state()["teammates"])
-        self.assertFalse(hd.exists(), "handoff dir survived shutdown")
+            # explicit shutdown clears the state AND the handoff artifacts
+            hd = tc.handoff_dir("d_mate")
+            self.assertTrue(hd.exists())
+            self.assertEqual(tc.main(["shutdown", "d_mate"]), 0)
+            self.assertNotIn("d_mate", tc.load_state()["teammates"])
+            self.assertFalse(hd.exists(), "handoff dir survived shutdown")
 
     def test_dispatch_sigkill_records_cause_and_hints(self):
         import contextlib
         import io
 
-        self.assertEqual(
-            tc.main(["dispatch", "sig_mate", "--provider", "shell",
-                     "--task", "kill -9 $$"]), 0)
-        pane = tc.load_state()["teammates"]["sig_mate"]["pane_id"]
-        self.assertTrue(self._wait_pane_gone(pane))
+        with self._keep_finished(False):
+            self.assertEqual(
+                tc.main(["dispatch", "sig_mate", "--provider", "shell",
+                         "--task", "kill -9 $$"]), 0)
+            pane = tc.load_state()["teammates"]["sig_mate"]["pane_id"]
+            self.assertTrue(self._wait_pane_gone(pane))
 
-        hd = tc.handoff_dir("sig_mate")
-        self.assertEqual((hd / "status").read_text().strip(),
-                         "DONE 137 SIGKILL")
-        err = io.StringIO()
-        with contextlib.redirect_stdout(io.StringIO()), \
-                contextlib.redirect_stderr(err):
-            rc = tc.main(["result", "sig_mate"])
-        self.assertEqual(rc, 1)
-        self.assertIn("SIGKILL", err.getvalue())
-        self.assertIn("no output captured", err.getvalue())
+            hd = tc.handoff_dir("sig_mate")
+            self.assertEqual((hd / "status").read_text().strip(),
+                             "DONE 137 SIGKILL")
+            err = io.StringIO()
+            with contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(err):
+                rc = tc.main(["result", "sig_mate"])
+            self.assertEqual(rc, 1)
+            self.assertIn("SIGKILL", err.getvalue())
+            self.assertIn("no output captured", err.getvalue())
 
     def test_dispatch_stderr_durable_after_pane_close(self):
         # the old `2> >(tee …)` procsub LOST stderr written after the pane
         # closed (tmux HUPs the tee); plain `2>file` must keep it.
         import time as _t
 
-        task = ("echo EARLY-MARKER >&2; "
-                "( trap '' HUP; sleep 4; echo LATE-MARKER >&2 ) & "
-                "printf %s '{}'")
-        self.assertEqual(
-            tc.main(["dispatch", "late_mate", "--provider", "shell",
-                     "--task", task]), 0)
-        pane = tc.load_state()["teammates"]["late_mate"]["pane_id"]
-        self.assertTrue(self._wait_pane_gone(pane))
+        with self._keep_finished(False):
+            task = ("echo EARLY-MARKER >&2; "
+                    "( trap '' HUP; sleep 4; echo LATE-MARKER >&2 ) & "
+                    "printf %s '{}'")
+            self.assertEqual(
+                tc.main(["dispatch", "late_mate", "--provider", "shell",
+                         "--task", task]), 0)
+            pane = tc.load_state()["teammates"]["late_mate"]["pane_id"]
+            self.assertTrue(self._wait_pane_gone(pane))
 
-        err_f = tc.handoff_dir("late_mate") / "error.log"
-        self.assertIn("EARLY-MARKER", err_f.read_text())
-        # the HUP-immune child writes ~4s in — after the pane is long gone
-        deadline = _t.monotonic() + 15
-        while _t.monotonic() < deadline:
-            if "LATE-MARKER" in err_f.read_text():
-                break
-            _t.sleep(0.5)
-        self.assertIn("LATE-MARKER", err_f.read_text(),
-                      "stderr written after pane close was lost")
+            err_f = tc.handoff_dir("late_mate") / "error.log"
+            self.assertIn("EARLY-MARKER", err_f.read_text())
+            # the HUP-immune child writes ~4s in — after the pane is gone
+            deadline = _t.monotonic() + 15
+            while _t.monotonic() < deadline:
+                if "LATE-MARKER" in err_f.read_text():
+                    break
+                _t.sleep(0.5)
+            self.assertIn("LATE-MARKER", err_f.read_text(),
+                          "stderr written after pane close was lost")
 
     def test_result_wait_fails_when_pane_killed_before_status(self):
         # Kill the dispatch pane mid-run: --wait must fail fast, not hang.

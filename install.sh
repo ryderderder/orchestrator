@@ -276,7 +276,11 @@ elif command -v tmux >/dev/null 2>&1 && [ "$HAVE_TTY" = 1 ]; then
   fi
   if [ -n "$TTYDEV" ] && [ -e "$TTYDEV" ]; then
     echo "entering tmux (session 'teamctl') and running the express setup…"
-    exec tmux new-session -A -s teamctl "$BOOTSTRAP_CMD" < "$TTYDEV"
+    # 0<> (read-write) is load-bearing: `<` opens the tty O_RDONLY, and the
+    # tmux client then writes its whole UI through that same fd — on a
+    # faithful pty that meant a BLACK SCREEN for the real first-run user
+    # (46 bytes drawn vs ~2k fixed; found and verified by the demo-recorder).
+    exec tmux new-session -A -s teamctl "$BOOTSTRAP_CMD" 0<> "$TTYDEV"
   else
     echo "could not find your terminal device; finish setup with:"
     echo "  tmux new-session -A -s teamctl '$BIN_DIR/teamctl init$INIT_ARGS; exec \$SHELL'"

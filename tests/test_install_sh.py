@@ -257,34 +257,48 @@ class InstallShTestCase(unittest.TestCase):
 class TmuxHandoffTests(unittest.TestCase):
     """Prove the installer's exec form works in the curl|bash shape: stdin is
     a PIPE, only the controlling terminal (/dev/tty) is real, and
-    `tmux new-session -A ... < /dev/tty` must still attach and run."""
+    `tmux new-session -A ... 0<> /dev/tty` must attach AND DRAW.
 
-    def test_piped_stdin_attach_via_dev_tty(self):
+    The fd mode is load-bearing: `< "$TTYDEV"` opens the tty O_RDONLY and
+    the tmux client writes its whole UI through that same fd — on a faithful
+    pty the session ran but the user saw a BLACK SCREEN (~46 bytes drawn vs
+    ~2k with the read-write fix). Found and verified by the demo-recorder
+    teammate; the byte counts below discriminate the two shapes."""
+
+    def _attach_and_measure(self, redir: str) -> tuple[int, bool, int]:
+        """Run the installer's bootstrap shape through a faithful pty
+        (stdin = pipe, controlling tty = pty). Returns (rc, marker_ran,
+        bytes_drawn_on_tty)."""
         import fcntl
         import pty
         import shlex
-        import termios
         import threading
+        import time
 
         real_tmux = shutil.which("tmux")
-        sock = f"tchandoff{os.getpid()}"
+        sock = f"tchandoff{os.getpid()}{'rw' if '<>' in redir else 'ro'}"
         with tempfile.TemporaryDirectory() as td:
             marker = Path(td) / "attached-ok"
+            # sleep keeps the session alive long enough for the client to
+            # draw a full screen; the session then ends naturally so the
+            # client exits on its own (rc 0).
+            inner = f"touch {shlex.quote(str(marker))}; sleep 2"
             # the exact shape install.sh uses: resolve the device from fd 2
             # (tmux refuses a literal /dev/tty as its client terminal)
             script = ('TTYDEV="$(tty 0<&2 2>/dev/null)" || TTYDEV=""; '
                       f"exec {shlex.quote(real_tmux)} -L {sock} "
-                      f"new-session -A -s teamctl "
-                      f"{shlex.quote('touch ' + shlex.quote(str(marker)))} "
-                      '< "$TTYDEV"')
+                      f"new-session -A -s teamctl {shlex.quote(inner)} "
+                      f'{redir} "$TTYDEV"')
             master, slave = pty.openpty()
 
             def preexec():
                 os.setsid()
+                import termios
                 fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
 
             env = {"PATH": os.environ.get("PATH", ""), "HOME": td,
                    "TERM": "xterm-256color"}   # no TMUX: outside-tmux shape
+            drawn = [0]
             try:
                 p = subprocess.Popen(
                     ["bash", "-c", script], stdin=subprocess.PIPE,
@@ -292,28 +306,55 @@ class TmuxHandoffTests(unittest.TestCase):
                     preexec_fn=preexec, pass_fds=(slave,), close_fds=True)
                 os.close(slave)
 
-                def drain():   # keep the pty from blocking the tmux client
+                def drain():   # count what the user would actually SEE
                     try:
-                        while os.read(master, 4096):
-                            pass
+                        while True:
+                            chunk = os.read(master, 4096)
+                            if not chunk:
+                                break
+                            drawn[0] += len(chunk)
                     except OSError:
                         pass
                 t = threading.Thread(target=drain, daemon=True)
                 t.start()
                 p.stdin.close()
-                rc = p.wait(timeout=30)
-                deadline = 20
-                while not marker.exists() and deadline > 0:
-                    import time
+                deadline = time.monotonic() + 20
+                while not marker.exists() and time.monotonic() < deadline:
                     time.sleep(0.25)
-                    deadline -= 1
-                self.assertEqual(rc, 0)
-                self.assertTrue(marker.exists(),
-                                "tmux session command never ran")
+                ran = marker.exists()
+                rc = p.wait(timeout=30)        # session ends on its own
+                t.join(timeout=5)
+                return rc, ran, drawn[0]
             finally:
-                os.close(master)
+                try:
+                    os.close(master)
+                except OSError:
+                    pass
                 subprocess.run([real_tmux, "-L", sock, "kill-server"],
                                capture_output=True)
+
+    def test_install_sh_uses_read_write_tty_redirection(self):
+        # static regression guard: the fix must not silently revert
+        text = INSTALL_SH.read_text()
+        self.assertIn('0<> "$TTYDEV"', text)
+        self.assertNotIn('"$BOOTSTRAP_CMD" < "$TTYDEV"', text)
+
+    def test_piped_stdin_attach_draws_ui_with_read_write_tty(self):
+        rc, ran, drawn = self._attach_and_measure("0<>")
+        self.assertTrue(ran, "tmux session command never ran")
+        self.assertEqual(rc, 0)
+        self.assertGreater(
+            drawn, 500,
+            f"tmux client drew only {drawn} bytes — black-screen regression")
+
+    def test_readonly_tty_shape_is_the_black_screen(self):
+        # the OLD shape: session runs, but the user sees (almost) nothing —
+        # keep this to prove the byte-count assertion above discriminates.
+        rc, ran, drawn = self._attach_and_measure("<")
+        self.assertTrue(ran, "session should still run (that was the trap)")
+        self.assertLess(drawn, 500,
+                        "read-only tty unexpectedly drew a full UI; "
+                        "re-check the fix's premise")
 
 
 if __name__ == "__main__":
