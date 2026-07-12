@@ -60,9 +60,10 @@ Ranked by value ÷ effort. All competitor claims verified against live repos/doc
 - Re-run the fresh-clone verification one last time at flip time: trailer grep 0
   across --all, identities only `ryderderder <ryder.wolf@pm.me>`, contributors
   API only ryderderder, CI green.
-- Drop the "(private for now — ask me for auth, don't guess
-  credentials)" line from the paste block in README.md AND
-  docs/INSTALL_PROMPT.md (keep them byte-identical) — it is only
-  true while the repo is private.
+- Drop the "(private for now — if that 404s, ask me for access, then
+  clone the repo and run: bash install.sh --no-init)" lines from the
+  paste block in README.md AND docs/INSTALL_PROMPT.md (keep them
+  byte-identical) — the 404 fallback is only true while the repo is
+  private.
 - Render + embed the launch GIFs (demo-v2, install-v2) and set the social-preview
   still per the gif-placement plan.

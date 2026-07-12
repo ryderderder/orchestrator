@@ -2,13 +2,14 @@
 
 > **Your AI subscriptions, working as one team.**
 
-You're paying for Claude Code. Maybe Codex. Maybe Grok, maybe Gemini. Each
-one sits in its own terminal, each with its own usage meter, and *you* are
-the integration layer. **teamctl** fixes that: it turns a tmux window into
-an AI agent team — a *lead* (you, or a lead agent) in the left pane, and
-*teammates* — Claude Code, Codex, Grok, or Gemini CLI sessions, or any CLI
-you teach it — tiled as labeled panes to the right — **and routes the
-team's work to whichever subscription has budget right now.** That
+You're paying for Claude Code. Maybe Codex. Maybe Grok, Gemini, or
+Antigravity. Each one sits in its own terminal, each with its own usage
+meter, and *you* are the integration layer. **teamctl** fixes that: it
+turns a tmux window into an AI agent team — a *lead* (you, or a lead
+agent) in the left pane, and *teammates* — Claude Code, Codex, Grok, or
+Gemini CLI sessions, or any CLI you teach it (Google's Antigravity `agy`
+is the worked example) — tiled as labeled panes to the right — **and
+routes the team's work to whichever subscription has budget right now.** That
 combination is the point: plenty of tools scrape a quota or tile agents in
 tmux; as far as we can tell teamctl is the first **quota-aware router for
 subscription-CLI agent teams** — orchestration that reads your real usage
@@ -274,13 +275,15 @@ after one.
 (also in [docs/INSTALL_PROMPT.md](docs/INSTALL_PROMPT.md)):
 
 ```text
-Install teamctl for me from this repo:
-https://github.com/ryderderder/teamctl
-(private for now — ask me for auth, don't guess credentials)
-Read README.md, docs/AGENT_GUIDE.md, and llms.txt from
-the repo, then install and verify it yourself (use
-install.sh; check with teamctl doctor).
-Ask me before anything that needs sudo.
+Install teamctl for me — https://github.com/ryderderder/teamctl
+(runs Claude Code / Codex / Grok / Gemini / Antigravity agy
+ as tmux panes)
+Get it and install (--no-init skips the tmux takeover):
+  curl -fsSL https://raw.githubusercontent.com/ryderderder/teamctl/main/install.sh | bash -s -- --no-init
+(private for now — if that 404s, ask me for access, then
+ clone the repo and run: bash install.sh --no-init)
+Then read README.md, docs/AGENT_GUIDE.md, and llms.txt to
+drive it; verify with teamctl doctor. Ask before anything sudo.
 ```
 
 Or run the one-liner yourself:
