@@ -39,30 +39,34 @@ detected, sane defaults written, done in seconds.
 [![release](https://img.shields.io/github/v/release/ryderderder/teamctl)](https://github.com/ryderderder/teamctl/releases)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-## Sixty seconds to a working teammate
+## Installed — here's the shape of it
 
-Copy-paste, top to bottom. Ends with a real agent visibly working in a
-pane beside you:
+The installer leaves you inside tmux with the express setup done. The
+mental model is one sentence: **teammates are roles in panes; you (or a
+lead agent) drive them with commands.** The verbs:
 
 ```sh
-# 1. install — the one-liner above; it lands you inside tmux, configured (~20s)
-
-# 2. your first teammate: a real provider session opens in a labeled pane,
-#    seeded with your prompt (uses your configured/first-detected provider)
-teamctl spawn scout --prompt "Read this directory and tell me what it does."
-
-# 3. it's a real pane — watch it, steer it
-teamctl list
-teamctl send scout "Summarize your findings in 3 bullets."
-
-# 4. clean teardown: process tree killed, verified, pane closed
-teamctl shutdown scout
+teamctl spawn <role> --prompt "…"   # interactive teammate in a labeled pane
+teamctl dispatch <role> --task "…"  # headless task → JSON result in a handoff dir
+teamctl result <role> --wait        # collect it (fails fast if the teammate dies)
+teamctl followup <role> --task "…"  # another turn, exact same provider session
+teamctl route <role> --task "…"     # auto-pick the provider: most quota headroom wins
+teamctl list                        # who exists, lifecycle states
+teamctl status                      # who's busy / blocked on an approval / idle
+teamctl send <role> "…"             # type into a live teammate's pane
+teamctl land <role>                 # merge a writing teammate's worktree branch back
+teamctl shutdown <role>             # verified teardown — nothing stranded
 ```
 
-That's the whole mental model: roles in panes, commands from the lead.
-Everything else (headless dispatch, JSON results, routing, worktrees) is
-the same shape with more leverage — see the [use cases](#use-cases) below
-and the [recipes page](docs/use-cases.md).
+Where to go next — real work, not demos:
+
+- **[docs/use-cases.md](docs/use-cases.md)** — workflows written to be
+  typed: parallel research, builder/reviewer, usage-aware batch ops,
+  worktree landing, the self-driving lead.
+- **[docs/AGENT_GUIDE.md](docs/AGENT_GUIDE.md)** — the machine-oriented
+  contract, if your lead is an agent: exact syntax, exit codes, the state
+  vocabulary, every `--json` surface, recovery recipes.
+- `teamctl doctor` whenever something looks off.
 
 ---
 
