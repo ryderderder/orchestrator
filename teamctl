@@ -89,6 +89,27 @@ def handoff_dir(role: str) -> Path:
     return state_path().parent / role
 
 
+# Role names become filesystem paths (the handoff dir) and are embedded in
+# the dispatch wrapper's shell script and pane titles — so they are locked
+# to a safe shape at every creation point. Rejects path traversal ("../x"),
+# shell metacharacters, and anything starting with "." or "-".
+ROLE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+
+def _role_ok(role: str) -> bool:
+    return bool(ROLE_RE.fullmatch(role)) and ".." not in role
+
+
+def _reject_bad_role(role: str) -> bool:
+    """True (and an explanation on stderr) when a role name is unusable."""
+    if _role_ok(role):
+        return False
+    print("teamctl: role names must start with a letter or digit and use "
+          "only letters, digits, '.', '_', '-' (max 64 chars, no '..') — "
+          f"got {role!r}.", file=sys.stderr)
+    return True
+
+
 # --------------------------------------------------------------------------
 # signed-in detection — reading each CLI's own login artifacts (teamctl
 # never touches credentials). Every artifact below was VERIFIED against a
@@ -620,6 +641,8 @@ def _set_pane_title(pane_id: str, role: str, model: str = "") -> None:
 
 
 def cmd_spawn(args: argparse.Namespace) -> int:
+    if _reject_bad_role(args.role):
+        return 2
     provider = _provider_or_fail(args.provider)
     if provider is None:
         return 2
@@ -926,6 +949,8 @@ def _resolve_dispatch(provider: str, task: str, context_file: str, model_arg: st
 def _do_dispatch(role: str, provider: str, task: str, context_file: str,
                  model_arg: str, effort_arg: str, cwd_arg: str) -> int:
     """Shared dispatch body used by `dispatch` and `route`."""
+    if _reject_bad_role(role):
+        return 2
     if not in_tmux():
         print("teamctl: not inside a tmux session; start one first.", file=sys.stderr)
         return 2

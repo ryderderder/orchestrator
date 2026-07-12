@@ -428,6 +428,52 @@ class CliTests(unittest.TestCase):
                 os.environ["TMUX"] = saved
 
 
+class RoleNameValidationTests(unittest.TestCase):
+    """Role names become filesystem paths (the handoff dir) and text
+    embedded in the dispatch wrapper's shell script — they are locked to a
+    safe shape at every creation point (spawn / dispatch / route)."""
+
+    def setUp(self):
+        self.tmp = HERE / ".test-role-state.json"
+        os.environ["TEAMCTL_STATE"] = str(self.tmp)
+
+    def tearDown(self):
+        self.tmp.unlink(missing_ok=True)
+        os.environ.pop("TEAMCTL_STATE", None)
+
+    def _run(self, *argv):
+        import contextlib
+        import io
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = tc.main(list(argv))
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_role_shape_rules(self):
+        for role in ("code-reviewer", "api_researcher", "v2.reviewer", "A1"):
+            self.assertTrue(tc._role_ok(role), role)
+        for role in ("../evil", "a/b", "a;b", "a b", "-flag", ".hidden",
+                     "a..b", "", "x" * 65, "rôle", "a$(rm)b", "a'b"):
+            self.assertFalse(tc._role_ok(role), role)
+
+    def test_spawn_rejects_bad_role_before_anything_else(self):
+        rc, _, err = self._run("spawn", "../evil", "--provider", "shell",
+                               "--dry-run")
+        self.assertEqual(rc, 2)
+        self.assertIn("role names", err)
+        rc, _, _ = self._run("spawn", "fine-role", "--provider", "shell",
+                             "--dry-run")
+        self.assertEqual(rc, 0)
+
+    def test_dispatch_rejects_bad_role_before_any_write(self):
+        rc, _, err = self._run("dispatch", "../evil", "--provider", "shell",
+                               "--task", "t")
+        self.assertEqual(rc, 2)
+        self.assertIn("role names", err)
+        # the traversal target must not have been created
+        self.assertFalse((self.tmp.parent / "evil").exists())
+
+
 class LayoutTests(unittest.TestCase):
     """lead_width_percent clamping, split-candidate selection, and the
     resize call — all with tmux interactions monkeypatched."""
