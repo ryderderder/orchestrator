@@ -47,6 +47,13 @@ def seed_signin(home: Path, *providers: str) -> None:
             (home / ".grok" / "auth.json").write_text(json.dumps(
                 {"https://auth.x.ai::u1": {"key": "k",
                                            "refresh_token": "r"}}))
+        elif p == "gemini":
+            # the documented OAuth token cache (official auth docs); shape
+            # per issue #5474 — access + refresh tokens
+            (home / ".gemini").mkdir(exist_ok=True)
+            (home / ".gemini" / "oauth_creds.json").write_text(json.dumps(
+                {"access_token": "t", "refresh_token": "r",
+                 "token_type": "Bearer", "expiry_date": 1}))
 
 
 class _AuthSandbox:
@@ -57,7 +64,9 @@ class _AuthSandbox:
     def _isolate_auth(self):
         os.environ["TEAMCTL_NO_KEYCHAIN"] = "1"
         self._saved_env = {}
-        for var in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "XAI_API_KEY"):
+        for var in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "XAI_API_KEY",
+                    "GEMINI_API_KEY", "GOOGLE_API_KEY",
+                    "GOOGLE_APPLICATION_CREDENTIALS"):
             self._saved_env[var] = os.environ.pop(var, None)
 
     def _restore_auth(self):
@@ -365,7 +374,7 @@ class VersionTests(unittest.TestCase):
             tc.main(["--version"])
         self.assertEqual(cm.exception.code, 0)
         self.assertIn(tc.VERSION, buf.getvalue())
-        self.assertEqual(tc.VERSION, "0.4.0")
+        self.assertTrue(tc.VERSION.startswith("0.5.0"), tc.VERSION)
 
 
 class CliTests(unittest.TestCase):
@@ -737,15 +746,16 @@ class ProbeRunTests(unittest.TestCase):
         self.tmpdir = tempfile.TemporaryDirectory()
         self.dir = Path(self.tmpdir.name)
         os.environ["TEAMCTL_STATE"] = str(self.dir / "state.json")
-        self._probes = tc.PROBES
+        self._probes = tc.probe_specs
         self._probe = tc.probe_provider
         self._which = tc.shutil.which
-        tc.PROBES = {"fakeprov": {"argv": ["fakeprov"], "command": "/usage"}}
+        tc.probe_specs = lambda: {"fakeprov": {"argv": ["fakeprov"],
+                                               "command": "/usage"}}
         tc.shutil.which = lambda name, *a, **k: (
             "/fake/bin/fakeprov" if name == "fakeprov" else None)
 
     def tearDown(self):
-        tc.PROBES = self._probes
+        tc.probe_specs = self._probes
         tc.probe_provider = self._probe
         tc.shutil.which = self._which
         os.environ.pop("TEAMCTL_STATE", None)
@@ -1750,9 +1760,12 @@ class InitTests(_AuthSandbox, unittest.TestCase):
         self.assertIn("defaults locked", out)
         self.assertIn("customize", out)
         self.assertIn("teamctl init --custom", out)
-        # spec §7: final output 12–18 lines
+        # spec §7: final output 12–18 lines (+1 per provider beyond the
+        # original three — the frame gained a gemini row in v0.5.0)
         lines = out.rstrip("\n").split("\n")
-        self.assertTrue(12 <= len(lines) <= 18, f"{len(lines)} lines")
+        extra = len(tc.routable_providers()) - 3
+        self.assertTrue(12 <= len(lines) <= 18 + extra,
+                        f"{len(lines)} lines")
 
     def test_express_frame_locked_out_provider(self):
         # installed but signed out -> "locked out", never offered a route

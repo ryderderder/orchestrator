@@ -291,12 +291,16 @@ install_hint() {
       echo "    Grok CLI:     curl -fsSL https://x.ai/cli/install.sh | bash"
       echo "                  (docs: https://docs.x.ai)"
       ;;
+    gemini)
+      echo "    Gemini CLI:   npm install -g @google/gemini-cli   (or: brew install gemini-cli)"
+      echo "                  (docs: https://geminicli.com)"
+      ;;
   esac
 }
 
 HAVE_PROVIDER=0
 MISSING_PROVIDERS=()
-for p in claude codex grok; do
+for p in claude codex grok gemini; do
   if command -v "$p" >/dev/null 2>&1; then
     HAVE_PROVIDER=1
   else
@@ -305,7 +309,7 @@ for p in claude codex grok; do
 done
 
 provider_found_lines() { # PATH-only fallback when teamctl cannot run yet
-  for p in claude codex grok; do
+  for p in claude codex grok gemini; do
     if command -v "$p" >/dev/null 2>&1; then
       echo "  $p    found"
     else
@@ -331,7 +335,7 @@ fi
 if [ ${#MISSING_PROVIDERS[@]} -gt 0 ]; then
   if [ "$HAVE_PROVIDER" = 0 ]; then
     echo
-    echo "no provider CLI found (claude / codex / grok). teamctl needs at least one."
+    echo "no provider CLI found (claude / codex / grok / gemini). teamctl needs at least one."
     echo "Their installers change, so install from the official sources yourself:"
   else
     echo

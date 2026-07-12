@@ -7,16 +7,16 @@ Usage:
     teamctl init [--custom] [--yes]
     teamctl settings
     teamctl doctor
-    teamctl lead on|off|status [--hook] [--cli claude|codex|grok|all]
+    teamctl lead on|off|status [--hook] [--cli claude|codex|grok|gemini|all]
     teamctl config [<dotted.key> [<value>]] [--menu]
     teamctl models [provider]
-    teamctl spawn <role> [--provider claude|codex|grok|shell] [--prompt TEXT] [--cwd DIR]
+    teamctl spawn <role> [--provider claude|codex|grok|gemini|shell] [--prompt TEXT] [--cwd DIR]
     teamctl list
     teamctl send <role> "<instruction>" [--no-enter]
     teamctl dispatch <role> --provider P --task "…" [--context-file F] [--model M] [--effort E]
     teamctl result <role> [--wait]
     teamctl followup <role> --task "…"
-    teamctl route <role> --task "…" [--providers claude,codex,grok] [--dry-run]
+    teamctl route <role> --task "…" [--providers claude,codex,grok,gemini] [--dry-run]
     teamctl providers
     teamctl usage [--json] [--probe [provider|all]]
     teamctl update [--check]
@@ -28,8 +28,10 @@ Every teammate is a tmux pane running a provider CLI. The lead (this process)
 never edits a teammate's work; it only spawns, lists, and cleanly shuts down.
 
 Providers share one launch shape -- `<cmd> [flags] "<prompt>"` starts an
-interactive session seeded with the prompt -- so Claude Code, Codex, and Grok
-all get the same tmux + teammate capability.
+interactive session seeded with the prompt -- so Claude Code, Codex, Grok,
+and Gemini CLI all get the same tmux + teammate capability, and a
+[providers.custom.*] config block teaches teamctl any other CLI that
+speaks the same shape (no code change needed).
 
 State lives in a small JSON file (default ~/.local/state/agent-team/state.json,
 override with $TEAMCTL_STATE). Access is serialized with an flock so concurrent
@@ -67,16 +69,337 @@ except Exception:  # pragma: no cover - platforms without curses
 
 VERSION = "0.5.0-dev"
 
-# provider -> launch command (as an argv prefix). A positional prompt is
-# appended when supplied. `shell` is a real provider used for verification:
-# it just holds an interactive shell in the pane, proving the tmux mechanics
-# without launching an AI agent.
-PROVIDERS: dict[str, list[str]] = {
-    "claude": ["claude"],
-    "codex": ["codex"],
-    "grok": ["grok"],
-    "shell": [os.environ.get("SHELL", "/bin/bash")],
+# --------------------------------------------------------------------------
+# the provider-spec registry — every provider, built-in OR user-defined via
+# a [providers.custom.*] block in config.toml, is DATA in one schema; the
+# adapter functions (headless_argv / resume_argv / interactive_flags /
+# _extract_session_id / provider_auth_state) are thin template expanders
+# over it. Adding a provider means adding a spec, not editing seven
+# if-chains.
+#
+# argv templates: "{task}", "{model}", "{effort}", "{session_id}" are
+# substituted INSIDE argv tokens. Values only ever land in argv slots (and
+# are shlex-quoted wholesale when a pane command line is built) — no shell
+# ever interpolates them.
+#
+# Spec fields:
+#   argv               interactive launch prefix (a positional prompt may
+#                      be appended by build_launch_line)
+#   headless           one-shot dispatch argv; absent -> dispatch/route
+#                      refuse (a spawn-only provider)
+#   resume             exact-session follow-up argv; absent -> followup
+#                      refuses (teamctl never guesses "most recent")
+#   model_args         appended when a model is set
+#   effort_args        appended when an effort is set; None/missing means
+#                      the CLI has no effort control — teamctl DROPS the
+#                      effort with a one-line stderr note, never silently
+#   resume_takes_model whether resume re-sends the model flags (codex: no;
+#                      effort is never re-sent on resume — v0.4.0 behavior)
+#   session_source     where the exact session id comes from:
+#                        {"type": "result-json", "key": K}  recursive key
+#                           lookup over the result/error JSON artifacts
+#                        {"type": "stderr-regex", "pattern": P, ...}
+#                           group 1 of P over error.log ("uuid": True
+#                           validates the match; "fallback" names a
+#                           built-in fallback strategy)
+#                      None -> no capture (followup refuses; the shell
+#                      test provider is the deliberate sessionless case)
+#   auth_env /         signed-in detection: exported key(s) count as
+#   auth_env_extra /   signed in; auth_files are login artifacts (parse-
+#   auth_files         able non-empty JSON -> signed in, unreadable ->
+#                      "unknown", never guessed)
+#   login_hint /       the lattice's advice strings for locked-out /
+#   wake_hint          quiet providers
+#   probe              hidden TUI usage probe ({"argv", "command",
+#                      "extra_enters"}); absent -> `usage --probe` refuses
+#   routable           participates in route/usage/providers tables
+#   quiet_flags        (shell only) silently ignore model/effort — it is
+#                      the tmux-mechanics test provider, not an AI CLI
+# --------------------------------------------------------------------------
+
+_SHELL = os.environ.get("SHELL", "/bin/bash")
+
+PROVIDER_SPECS: dict[str, dict] = {
+    "claude": {
+        "argv": ["claude"],
+        "headless": ["claude", "-p", "{task}", "--output-format", "json"],
+        "resume": ["claude", "-p", "{task}", "--output-format", "json",
+                   "--resume", "{session_id}"],
+        "model_args": ["--model", "{model}"],
+        "effort_args": ["--effort", "{effort}"],
+        "resume_takes_model": True,
+        # documented session_id field of the --output-format json result
+        "session_source": {"type": "result-json", "key": "session_id"},
+        "auth_env": "ANTHROPIC_API_KEY",
+        "login_hint": "claude auth login",
+        "wake_hint": "run one Claude Code turn with the teamctl statusline "
+                     "installed (`teamctl init`)",
+        "routable": True,
+    },
+    "codex": {
+        "argv": ["codex"],
+        "headless": ["codex", "exec", "{task}"],
+        "resume": ["codex", "exec", "resume", "{session_id}", "{task}"],
+        "model_args": ["-m", "{model}"],
+        "effort_args": ["-c", 'model_reasoning_effort="{effort}"'],
+        "resume_takes_model": False,   # `codex exec resume` takes no flags
+        # `codex exec` prints `session id: <uuid>` on stderr (OBSERVED
+        # banner, live-verified); the rollout-log filename glob is the
+        # built-in fallback (same uuid ends the rollout filename)
+        "session_source": {"type": "stderr-regex",
+                           "pattern": r"session id:\s*(\S+)",
+                           "uuid": True, "fallback": "codex-rollout-glob"},
+        "auth_env": "OPENAI_API_KEY",
+        "login_hint": "codex login",
+        "wake_hint": "usage appears after the first codex turn, or probe: "
+                     "`teamctl usage --probe codex`",
+        "probe": {"argv": ["codex"], "command": "/status", "extra_enters": 1},
+        "routable": True,
+    },
+    "grok": {
+        "argv": ["grok"],
+        "headless": ["grok", "--single", "{task}", "--output-format", "json"],
+        "resume": ["grok", "--single", "{task}", "--output-format", "json",
+                   "-r", "{session_id}"],
+        "model_args": ["-m", "{model}"],
+        "effort_args": ["--effort", "{effort}"],
+        "resume_takes_model": True,
+        # sessionId field of its json result (observed; parsed defensively)
+        "session_source": {"type": "result-json", "key": "sessionId"},
+        "auth_env": "XAI_API_KEY",
+        "login_hint": "grok login",
+        "wake_hint": "probe it: `teamctl usage --probe grok`",
+        "probe": {"argv": ["grok"], "command": "/usage", "extra_enters": 1},
+        "routable": True,
+    },
+    "gemini": {
+        # Every flag below was VERIFIED against a live gemini-cli 0.46.0
+        # install (2026-07-12) plus the official docs: `-p` is headless
+        # mode; `--output-format json` emits one JSON object whose
+        # `session_id` field is present on success AND error output (the
+        # error JSON lands on stderr — _extract_session_id reads both
+        # artifacts); `--resume` accepts "latest", a FULL UUID, or an
+        # index — teamctl uses the captured UUID ONLY (exact-session
+        # rule), and the prompt must ride `-p` when resuming (issue
+        # #14180). Sessions are PROJECT-SCOPED (keyed to the cwd), so
+        # follow-ups must run from the dispatch cwd — cmd_followup
+        # already reuses info["cwd"]. Known caveat: issue #24808 reports
+        # intermittent "Invalid session identifier" on resume; failures
+        # surface verbatim in error.log/status and are re-triable.
+        "argv": ["gemini"],
+        "headless": ["gemini", "-p", "{task}", "--output-format", "json"],
+        "resume": ["gemini", "--resume", "{session_id}", "-p", "{task}",
+                   "--output-format", "json"],
+        "model_args": ["-m", "{model}"],
+        # VERIFIED (0.46.0 --help): no per-invocation effort/thinking flag
+        # exists — thinking control lives in settings.json, which teamctl
+        # never mutates. --effort is dropped with a stderr note.
+        "effort_args": None,
+        "resume_takes_model": True,
+        "session_source": {"type": "result-json", "key": "session_id"},
+        "auth_env": "GEMINI_API_KEY",
+        "auth_env_extra": ["GOOGLE_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS"],
+        "auth_files": ["~/.gemini/oauth_creds.json"],
+        # no standalone login subcommand exists; /auth is the in-TUI flow
+        "login_hint": "run `gemini`, then /auth (Login with Google)",
+        # honesty over cheer: gemini exposes NO local usage feed (no
+        # statusline pipe, no session-log rate_limits, and current builds
+        # removed the /stats used-% display) — it stays 'quiet' for good
+        "wake_hint": "gemini exposes no local usage feed — it stays quiet",
+        "routable": True,
+    },
+    "shell": {
+        "argv": [_SHELL],
+        "headless": [_SHELL, "-c", "{task}"],
+        "resume": [_SHELL, "-c", "{task}"],  # sessionless: a fresh shell
+        "session_source": None,
+        "quiet_flags": True,
+        "routable": False,
+    },
 }
+
+# provider -> interactive launch argv prefix. A thin BUILT-INS view of the
+# registry kept for readers/tests; live lookups (which must also see
+# custom providers) go through provider_spec().
+PROVIDERS: dict[str, list[str]] = {
+    name: list(spec["argv"]) for name, spec in PROVIDER_SPECS.items()
+}
+
+# names a [providers.custom.*] block may never claim: the built-ins, plus
+# words with fixed meanings in teamctl's own surfaces
+_RESERVED_PROVIDER_NAMES = frozenset(PROVIDER_SPECS) | {"all", "probes",
+                                                        "states", "custom"}
+
+_warned_custom_blocks: set[str] = set()
+
+
+def _warn_custom_once(name: str, why: str) -> None:
+    """One stderr line per (block, reason) per process — a malformed custom
+    block must be loud but must never spam or take down built-ins."""
+    key = f"{name}: {why}"
+    if key in _warned_custom_blocks:
+        return
+    _warned_custom_blocks.add(key)
+    print(f"teamctl: ignoring [providers.custom.{name}]: {why}",
+          file=sys.stderr)
+
+
+def _str_list(v) -> list[str] | None:
+    if isinstance(v, list) and all(isinstance(x, str) for x in v):
+        return list(v)
+    return None
+
+
+def custom_provider_specs() -> dict[str, dict]:
+    """User-defined providers from [providers.custom.*] blocks, validated
+    into the same spec schema the built-ins use. Invalid blocks are skipped
+    with one honest stderr warning; built-ins are never affected."""
+    raw = (load_config().get("providers") or {}).get("custom")
+    if not isinstance(raw, dict):
+        return {}
+    specs: dict[str, dict] = {}
+    for name, block in raw.items():
+        if not isinstance(block, dict):
+            _warn_custom_once(str(name), "not a table")
+            continue
+        if name in _RESERVED_PROVIDER_NAMES:
+            _warn_custom_once(name, "the name shadows a built-in provider "
+                                    "(or a reserved word) — pick another")
+            continue
+        if not _role_ok(name) or "." in name:
+            _warn_custom_once(name, "provider names use letters, digits, "
+                                    "'_', '-' (start alphanumeric, no dots)")
+            continue
+        command = block.get("command")
+        if not isinstance(command, str) or not command.strip():
+            _warn_custom_once(name, "`command` (the CLI to run) is required")
+            continue
+        command = command.strip()
+
+        headless_args = _str_list(block.get("headless_args", []))
+        interactive_args = _str_list(block.get("interactive_args", []))
+        resume_args = _str_list(block.get("resume_args", []))
+        model_args = _str_list(block.get("model_args", []))
+        effort_args = _str_list(block.get("effort_args", []))
+        auth_files = _str_list(block.get("auth_files", []))
+        if None in (headless_args, interactive_args, resume_args,
+                    model_args, effort_args, auth_files):
+            _warn_custom_once(name, "*_args and auth_files must be lists "
+                                    "of strings")
+            continue
+        if headless_args and not any("{task}" in t for t in headless_args):
+            _warn_custom_once(name, "headless_args must carry a {task} "
+                                    "placeholder")
+            continue
+        if model_args and not any("{model}" in t for t in model_args):
+            _warn_custom_once(name, "model_args must carry a {model} "
+                                    "placeholder")
+            continue
+        if effort_args and not any("{effort}" in t for t in effort_args):
+            _warn_custom_once(name, "effort_args must carry an {effort} "
+                                    "placeholder")
+            continue
+
+        # exact-session follow-ups need BOTH a resume shape and a session
+        # source; anything less degrades to "no follow-ups", stated once
+        sid_key = str(block.get("session_id_key") or "")
+        sid_regex = str(block.get("session_id_regex") or "")
+        session_source = None
+        if sid_key:
+            session_source = {"type": "result-json", "key": sid_key}
+        elif sid_regex:
+            try:
+                re.compile(sid_regex)
+            except re.error as exc:
+                _warn_custom_once(name, f"session_id_regex does not "
+                                        f"compile ({exc}) — follow-ups "
+                                        "disabled")
+                sid_regex = ""
+            if sid_regex:
+                session_source = {"type": "stderr-regex",
+                                  "pattern": sid_regex}
+        resume = None
+        if resume_args:
+            if not any("{session_id}" in t for t in resume_args):
+                _warn_custom_once(name, "resume_args must carry a "
+                                        "{session_id} placeholder — "
+                                        "follow-ups disabled")
+            elif session_source is None:
+                _warn_custom_once(name, "resume_args set but no "
+                                        "session_id_key/session_id_regex — "
+                                        "follow-ups disabled")
+            else:
+                resume = [command] + resume_args
+
+        probe_command = str(block.get("probe_command") or "")
+        routable = block.get("routable", True)
+        if not isinstance(routable, bool):
+            routable = str(routable).strip().lower() not in ("false", "0",
+                                                             "no", "off")
+        specs[name] = {
+            "argv": [command] + interactive_args,
+            "headless": ([command] + headless_args) if headless_args
+            else None,
+            "resume": resume,
+            "model_args": model_args or None,
+            "effort_args": effort_args or None,
+            "resume_takes_model": True,
+            "session_source": session_source if resume else None,
+            "auth_env": str(block.get("auth_env") or "") or None,
+            "auth_files": auth_files,
+            "login_hint": str(block.get("login_hint") or ""),
+            "wake_hint": "",
+            "probe": ({"argv": [command], "command": probe_command,
+                       "extra_enters": 1} if probe_command else None),
+            "routable": routable,
+            "custom": True,
+        }
+    return specs
+
+
+def provider_spec(name: str) -> dict | None:
+    """The resolved spec for one provider: built-ins, then custom blocks."""
+    if name in PROVIDER_SPECS:
+        return PROVIDER_SPECS[name]
+    return custom_provider_specs().get(name)
+
+
+def known_provider_names() -> list[str]:
+    """Every spawnable provider name, built-ins first."""
+    return list(PROVIDER_SPECS) + sorted(custom_provider_specs())
+
+
+def routable_providers() -> tuple[str, ...]:
+    """Providers that participate in route/usage/providers tables: the
+    routable built-ins plus routable custom providers."""
+    names = [n for n, s in PROVIDER_SPECS.items() if s.get("routable")]
+    names += sorted(n for n, s in custom_provider_specs().items()
+                    if s.get("routable"))
+    return tuple(names)
+
+
+def provider_installed(name: str) -> bool:
+    """Is the provider's actual CLI binary on PATH? (A custom provider's
+    name and its `command` can differ — the command is what must exist.)"""
+    spec = provider_spec(name)
+    if not spec:
+        return False
+    return shutil.which(spec["argv"][0]) is not None
+
+
+def wake_hint(provider: str) -> str:
+    """How a quiet provider produces its first usage numbers."""
+    return (provider_spec(provider) or {}).get("wake_hint") or "use it once"
+
+
+def login_hint(provider: str) -> str:
+    """The provider CLI's own sign-in command/flow."""
+    return ((provider_spec(provider) or {}).get("login_hint")
+            or f"{provider} login")
+
+
+def provider_supports_effort(name: str) -> bool:
+    return bool((provider_spec(name) or {}).get("effort_args"))
 
 
 class TeamctlError(Exception):
@@ -136,16 +459,18 @@ def _reject_bad_role(role: str) -> bool:
 #           Cross-checked against `codex login status` (rc 0 / 1).
 #   grok    ~/.grok/auth.json holding at least one credential entry
 #           (issuer-keyed dicts with refresh_token/key were observed).
+#   gemini  ~/.gemini/oauth_creds.json (OAuth token cache — official auth
+#           docs); the login flow is in-TUI (/auth), there is no
+#           standalone login subcommand.
 #
-# An exported provider API key (ANTHROPIC_API_KEY / OPENAI_API_KEY /
-# XAI_API_KEY) also counts as signed in: the CLI works with it even when
-# no login artifact exists.
+# An exported provider API key (each spec's auth_env/auth_env_extra) also
+# counts as signed in: the CLI works with it even when no login artifact
+# exists. Custom providers with neither auth_env nor auth_files configured
+# are 'unprobed' — teamctl states that it cannot know, instead of guessing
+# either way.
 # --------------------------------------------------------------------------
 
 _CORRUPT = object()  # a JSON artifact that exists but cannot be read/parsed
-
-_AUTH_ENV_KEYS = {"claude": "ANTHROPIC_API_KEY", "codex": "OPENAI_API_KEY",
-                  "grok": "XAI_API_KEY"}
 
 # Signs of real grok CLI use, for the last-resort auth fallback. Bare
 # ~/.grok existence is NOT a login signal any more: `teamctl lead on`
@@ -198,12 +523,17 @@ def _grok_auth_fallback(auth_path: Path) -> bool:
 
 
 def provider_auth_state(provider: str) -> tuple[str, str]:
-    """('signed-in' | 'signed-out' | 'unknown', note) for one provider.
+    """('signed-in' | 'signed-out' | 'unknown' | 'unprobed', note).
 
     'unknown' means an auth artifact exists but could not be read — the
-    honest answer, reported instead of guessing either way."""
+    honest answer, reported instead of guessing either way. 'unprobed'
+    means teamctl has nothing to consult (a custom provider with no
+    auth_env/auth_files configured) — stated, never guessed."""
     home = Path.home()
-    if os.environ.get(_AUTH_ENV_KEYS.get(provider, ""), ""):
+    spec = provider_spec(provider) or {}
+    env_keys = [k for k in [spec.get("auth_env"),
+                            *(spec.get("auth_env_extra") or [])] if k]
+    if any(os.environ.get(k, "") for k in env_keys):
         return "signed-in", "via exported API key"
 
     if provider == "claude":
@@ -239,11 +569,38 @@ def provider_auth_state(provider: str) -> tuple[str, str]:
             return "unknown", "auth artifacts exist but are unreadable"
         return "signed-out", ""
 
-    return "unknown", ""
+    # generic artifact probe (gemini and custom providers) — the same
+    # discipline as the built-in branches above: a parseable, non-empty
+    # JSON artifact means signed in; exists-but-unreadable means 'unknown';
+    # nothing found means signed out. A provider that gave teamctl nothing
+    # to consult is 'unprobed' — the honest non-answer.
+    files = [Path(os.path.expanduser(p))
+             for p in (spec.get("auth_files") or [])]
+    if not files:
+        if env_keys:
+            return "signed-out", ""   # its key exists as a signal; unset
+        note = "auth not probed"
+        if spec.get("custom"):
+            note += (" (custom provider — set auth_files/auth_env to "
+                     "enable detection)")
+        return "unprobed", note
+    corrupt = False
+    for f in files:
+        data = _read_json_artifact(f)
+        if isinstance(data, dict) and any(bool(v) for v in data.values()):
+            return "signed-in", ""
+        if data is _CORRUPT:
+            corrupt = True
+    if corrupt:
+        return "unknown", "auth artifacts exist but are unreadable"
+    return "signed-out", ""
 
 
 def provider_authed(provider: str) -> bool:
-    return provider_auth_state(provider)[0] == "signed-in"
+    """Usable-for-work: signed in, or explicitly configured with nothing
+    to probe (an 'unprobed' custom provider is routable by the user's own
+    choice — refusing would break the escape hatch)."""
+    return provider_auth_state(provider)[0] in ("signed-in", "unprobed")
 
 
 def config_path() -> Path:
@@ -267,9 +624,9 @@ def provider_defaults(provider: str) -> tuple[str | None, str | None]:
 
 
 def available_providers() -> list[str]:
-    """Installed AND logged-in providers, in (arbitrary) alphabetical order."""
-    return [p for p in ROUTABLE
-            if shutil.which(p) is not None and provider_authed(p)]
+    """Installed AND logged-in routable providers, in registry order."""
+    return [p for p in routable_providers()
+            if provider_installed(p) and provider_authed(p)]
 
 
 def default_provider() -> str | None:
@@ -290,13 +647,14 @@ def _provider_or_fail(requested: str) -> str | None:
     """--provider value -> provider, or None after printing why (exit 2).
     Never silently picks among several providers: that choice is the user's."""
     if requested:
-        if requested not in PROVIDERS:
-            print(f"teamctl: unknown provider '{requested}'.", file=sys.stderr)
+        if provider_spec(requested) is None:
+            print(f"teamctl: unknown provider '{requested}' (known: "
+                  f"{', '.join(known_provider_names())}).", file=sys.stderr)
             return None
         return requested
     prov = default_provider()
     if prov is not None:
-        if prov not in PROVIDERS:
+        if provider_spec(prov) is None:
             print(f"teamctl: routing.preference starts with unknown provider "
                   f"'{prov}' — fix it with `teamctl config routing.preference "
                   "...`.", file=sys.stderr)
@@ -311,32 +669,46 @@ def _provider_or_fail(requested: str) -> str | None:
     return None
 
 
+def _expand_tokens(tokens: list[str], task: str = "", model: str = "",
+                   effort: str = "", session_id: str = "") -> list[str]:
+    """Substitute {task}/{model}/{effort}/{session_id} INSIDE argv tokens.
+    Values only ever land in argv slots (shlex-quoted wholesale wherever a
+    shell line is built) — no shell interpolation can ever see them."""
+    vals = {"{task}": task, "{model}": model, "{effort}": effort,
+            "{session_id}": session_id}
+    out: list[str] = []
+    for tok in tokens:
+        for ph, val in vals.items():
+            if ph in tok:
+                tok = tok.replace(ph, val)
+        out.append(tok)
+    return out
+
+
+def _model_effort_args(spec: dict, provider: str, model: str,
+                       effort: str) -> list[str]:
+    """The optional model/effort flags for one launch. An effort requested
+    from a provider with no effort control is DROPPED with a one-line
+    stderr note — never silently, never guessed into some other flag."""
+    a: list[str] = []
+    if model and spec.get("model_args"):
+        a += _expand_tokens(spec["model_args"], model=model)
+    if effort:
+        if spec.get("effort_args"):
+            a += _expand_tokens(spec["effort_args"], effort=effort)
+        elif not spec.get("quiet_flags"):
+            print(f"teamctl: note: {provider} has no effort flag — "
+                  "--effort ignored", file=sys.stderr)
+    return a
+
+
 def headless_argv(provider: str, task: str, model: str, effort: str) -> list[str]:
-    """Headless (non-interactive) launch argv for each provider."""
-    if provider == "claude":
-        a = ["claude", "-p", task, "--output-format", "json"]
-        if model:
-            a += ["--model", model]
-        if effort:
-            a += ["--effort", effort]
-        return a
-    if provider == "grok":
-        a = ["grok", "--single", task, "--output-format", "json"]
-        if model:
-            a += ["-m", model]
-        if effort:
-            a += ["--effort", effort]
-        return a
-    if provider == "codex":
-        a = ["codex", "exec", task]
-        if model:
-            a += ["-m", model]
-        if effort:
-            a += ["-c", f'model_reasoning_effort="{effort}"']
-        return a
-    if provider == "shell":  # fake provider for tests: task is a shell snippet
-        return [os.environ.get("SHELL", "/bin/bash"), "-c", task]
-    raise TeamctlError(f"no headless adapter for provider '{provider}'")
+    """Headless (non-interactive) launch argv, expanded from the spec."""
+    spec = provider_spec(provider)
+    if spec is None or not spec.get("headless"):
+        raise TeamctlError(f"no headless adapter for provider '{provider}'")
+    return (_expand_tokens(spec["headless"], task=task)
+            + _model_effort_args(spec, provider, model, effort))
 
 
 def resume_argv(provider: str, task: str, model: str, effort: str,
@@ -344,34 +716,32 @@ def resume_argv(provider: str, task: str, model: str, effort: str,
     """Continue a SPECIFIC provider session. Exact-session only — resuming
     'the most recent session' is banned (wrong session under concurrency).
     Flags verified against each CLI's own help: claude `--resume <id>`,
-    grok `-r <id>`, codex `exec resume <SESSION_ID> <prompt>`."""
-    if provider == "claude":
-        a = ["claude", "-p", task, "--output-format", "json",
-             "--resume", session_id]
-        if model:
-            a += ["--model", model]
-        return a
-    if provider == "grok":
-        a = ["grok", "--single", task, "--output-format", "json",
-             "-r", session_id]
-        if model:
-            a += ["-m", model]
-        return a
-    if provider == "codex":
-        return ["codex", "exec", "resume", session_id, task]
-    if provider == "shell":
-        return [os.environ.get("SHELL", "/bin/bash"), "-c", task]
-    raise TeamctlError(f"no resume adapter for provider '{provider}'")
+    grok `-r <id>`, codex `exec resume <SESSION_ID> <prompt>`, gemini
+    `--resume <uuid>` (UUID form only). Model flags ride along when the
+    spec says so (codex's resume takes none); effort is never re-sent on
+    a resume."""
+    spec = provider_spec(provider)
+    if spec is None or not spec.get("resume"):
+        raise TeamctlError(f"no resume adapter for provider '{provider}'")
+    a = _expand_tokens(spec["resume"], task=task, session_id=session_id)
+    if model and spec.get("resume_takes_model") and spec.get("model_args"):
+        a += _expand_tokens(spec["model_args"], model=model)
+    return a
 
 
 def classify_output(text: str) -> str:
-    """Recognize credit-exhaustion / auth failures in provider output."""
+    """Recognize credit-exhaustion / auth failures in provider output.
+    Never provider-keyed, so custom providers get the signals for free.
+    "resource_exhausted" is the Gemini API's quota error status; "set an
+    auth method" is gemini's headless not-signed-in message (verified live
+    against 0.46.0)."""
     low = text.lower()
     if any(s in low for s in ("usage limit", "rate limit", "quota", "out of credits",
-                              "insufficient credit")):
+                              "insufficient credit", "resource_exhausted")):
         return "exhausted"
     if any(s in low for s in ("unauthorized", "not logged in", "authentication",
-                              "please log in", "invalid api key")):
+                              "please log in", "invalid api key",
+                              "set an auth method")):
         return "auth-error"
     return "ok"
 
@@ -493,29 +863,19 @@ def _mate_state(role: str, info: dict, live: set[str]) -> str:
 
 def interactive_flags(provider: str, model: str, effort: str) -> list[str]:
     """Model/effort flags for an interactive launch."""
-    f: list[str] = []
-    if provider == "claude":
-        if model:
-            f += ["--model", model]
-        if effort:
-            f += ["--effort", effort]
-    elif provider == "grok":
-        if model:
-            f += ["-m", model]
-        if effort:
-            f += ["--effort", effort]
-    elif provider == "codex":
-        if model:
-            f += ["-m", model]
-        if effort:
-            f += ["-c", f'model_reasoning_effort="{effort}"']
-    return f
+    spec = provider_spec(provider)
+    if spec is None:
+        return []
+    return _model_effort_args(spec, provider, model, effort)
 
 
 def build_launch_line(provider: str, prompt: str, cwd: str,
                       model: str = "", effort: str = "") -> str:
     """The shell command a teammate pane runs. All values are shell-quoted."""
-    launch = list(PROVIDERS[provider]) + interactive_flags(provider, model, effort)
+    spec = provider_spec(provider)
+    if spec is None:
+        raise TeamctlError(f"unknown provider '{provider}'")
+    launch = list(spec["argv"]) + interactive_flags(provider, model, effort)
     if prompt:
         launch.append(prompt)
     return f"cd {shlex.quote(cwd)} && exec {' '.join(shlex.quote(a) for a in launch)}"
@@ -1066,17 +1426,37 @@ _UUID_RE = re.compile(
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 
 
+def _codex_rollout_glob(since: float | None) -> str | None:
+    """codex fallback: the newest rollout log created after the dispatch
+    started whose filename ends in a uuid (the session id appears in the
+    rollout filename — live-verified)."""
+    base = Path.home() / ".codex" / "sessions"
+    if not base.exists():
+        return None
+    logs = sorted(base.glob("*/*/*/rollout-*.jsonl"),
+                  key=lambda p: p.stat().st_mtime, reverse=True)
+    for log in logs[:8]:
+        if since is not None and log.stat().st_mtime < since:
+            continue
+        tail = log.stem[-36:]
+        if _UUID_RE.fullmatch(tail):
+            return tail
+    return None
+
+
 def _extract_session_id(provider: str, hd: Path,
                         since: float | None = None) -> str | None:
     """Best-effort provider session id from a dispatch's artifacts, for
-    exact-session follow-ups.
+    exact-session follow-ups — driven by the spec's session_source.
 
-    codex: `codex exec` prints `session id: <uuid>` on stderr (OBSERVED
-    banner; live-verified — the same uuid appears in the rollout log
-    filename, which is the fallback: newest rollout created after the
-    dispatch started whose name ends in a uuid). claude: the documented
-    session_id field of the --output-format json result. grok: the
-    sessionId field of its json result (observed; parsed defensively)."""
+    stderr-regex (codex): `codex exec` prints `session id: <uuid>` on
+    stderr (OBSERVED banner; live-verified), with the rollout-filename
+    glob as a named built-in fallback. result-json (claude/gemini:
+    session_id; grok: sessionId): the id key found recursively in the
+    JSON artifacts. The result JSON normally lands on stdout
+    (result.json), but a failed run's error JSON can land on stderr
+    instead — gemini verified live: its error JSON, session_id included,
+    is emitted on stderr — so error.log is consulted second."""
     def _read(name: str) -> str:
         f = hd / name
         try:
@@ -1084,31 +1464,30 @@ def _extract_session_id(provider: str, hd: Path,
         except OSError:
             return ""
 
-    if provider == "codex":
-        m = re.search(r"session id:\s*(\S+)", _read("error.log"))
-        if m and _UUID_RE.fullmatch(m.group(1)):
-            return m.group(1)
-        base = Path.home() / ".codex" / "sessions"
-        if base.exists():
-            logs = sorted(base.glob("*/*/*/rollout-*.jsonl"),
-                          key=lambda p: p.stat().st_mtime, reverse=True)
-            for log in logs[:8]:
-                if since is not None and log.stat().st_mtime < since:
-                    continue
-                tail = log.stem[-36:]
-                if _UUID_RE.fullmatch(tail):
-                    return tail
+    src = (provider_spec(provider) or {}).get("session_source")
+    if not src:
         return None
 
-    key = {"claude": "session_id", "grok": "sessionId"}.get(provider)
-    if key is None:
+    if src.get("type") == "stderr-regex":
+        m = re.search(src["pattern"], _read("error.log"))
+        if m:
+            sid = (m.group(1) or "").strip()
+            if sid and (not src.get("uuid") or _UUID_RE.fullmatch(sid)):
+                return sid
+        if src.get("fallback") == "codex-rollout-glob":
+            return _codex_rollout_glob(since)
         return None
-    try:
-        data = json.loads(_read("result.json"))
-    except (json.JSONDecodeError, ValueError):
-        return None
-    sid = _find_key(data, key)
-    return str(sid) if sid else None
+
+    if src.get("type") == "result-json":
+        for artifact in ("result.json", "error.log"):
+            try:
+                data = json.loads(_read(artifact))
+            except (json.JSONDecodeError, ValueError):
+                continue
+            sid = _find_key(data, src["key"])
+            if sid:
+                return str(sid)
+    return None
 
 
 def _dispatch_started_at(info: dict) -> float | None:
@@ -1270,6 +1649,16 @@ def cmd_followup(args: argparse.Namespace) -> int:
               f"`teamctl result {args.role} --wait` first.", file=sys.stderr)
         return 1
 
+    # capability check BEFORE touching the pane: a provider with no resume
+    # shape can never follow up — refuse now, honestly, leaving the
+    # teammate exactly as it was.
+    spec = provider_spec(provider) or {}
+    if not spec.get("resume"):
+        print(f"teamctl: provider '{provider}' cannot resume a session — "
+              "teamctl never guesses 'most recent'. Re-dispatch instead.",
+              file=sys.stderr)
+        return 1
+
     # a finished teammate may still hold its pane open (keep_finished):
     # close it before opening the follow-up pane so the role never shows
     # two panes at once.
@@ -1279,9 +1668,11 @@ def cmd_followup(args: argparse.Namespace) -> int:
 
     # exact-session only: capture the id from the previous turn's artifacts
     # BEFORE they are cleared. Without one, refuse — never resume "the most
-    # recent session", which grabs the wrong one under concurrency.
+    # recent session", which grabs the wrong one under concurrency. (A spec
+    # with a resume shape but no session_source — the shell test provider —
+    # is deliberately sessionless: its "resume" is a fresh process.)
     session_id = ""
-    if provider != "shell":
+    if spec.get("session_source"):
         session_id = _capture_session_id(info, hd) or ""
         if not session_id:
             print(f"teamctl: no session id captured for '{args.role}' — "
@@ -1426,18 +1817,9 @@ def claude_usage() -> dict | None:
 #                   never guessed
 # --------------------------------------------------------------------------
 
-# how a quiet provider wakes up (produces its first usage numbers)
-WAKE_HINTS = {
-    "claude": "run one Claude Code turn with the teamctl statusline "
-              "installed (`teamctl init`)",
-    "codex": "usage appears after the first codex turn, or probe: "
-             "`teamctl usage --probe codex`",
-    "grok": "probe it: `teamctl usage --probe grok`",
-}
-
-# how a locked-out provider signs in (each CLI's own login command)
-LOGIN_HINTS = {"claude": "claude auth login", "codex": "codex login",
-               "grok": "grok login"}
+# wake/login hints live in each provider's spec (wake_hint / login_hint —
+# see PROVIDER_SPECS); the wake_hint() / login_hint() accessors add the
+# fallbacks, so custom providers degrade to honest generic advice.
 
 
 def _known_windows(provider: str) -> dict[str, dict]:
@@ -1491,9 +1873,11 @@ def _usage_summary(provider: str) -> str:
 
 
 def provider_state(provider: str) -> tuple[str, str]:
-    """(lattice state, note) for one provider — see the map above."""
+    """(lattice state, note) for one provider — see the map above. An
+    'unprobed' custom provider renders as quiet/ready with its "auth not
+    probed" note: installed and explicitly configured, auth unknowable."""
     has_data = provider_has_usage_data(provider)
-    if shutil.which(provider) is None:
+    if not provider_installed(provider):
         return ("not installed",
                 "residual usage history found" if has_data else "")
     auth, note = provider_auth_state(provider)
@@ -1565,9 +1949,10 @@ def discover_models(provider: str) -> list[str]:
 
 
 def cmd_models(args: argparse.Namespace) -> int:
-    providers = [args.provider] if args.provider else list(ROUTABLE)
+    routable = routable_providers()
+    providers = [args.provider] if args.provider else list(routable)
     for prov in providers:
-        if prov not in ROUTABLE:
+        if prov not in routable:
             print(f"teamctl: unknown provider '{prov}'.", file=sys.stderr)
             return 2
     for prov in providers:
@@ -1608,6 +1993,16 @@ def cmd_models(args: argparse.Namespace) -> int:
             print("  alias (sonnet, opus, haiku, fable) or a full model name. "
                   "Inside a session,")
             print("  /model opens the interactive picker.")
+        elif prov == "gemini":
+            print("  the gemini CLI has no model-listing command; --model "
+                  "takes any Gemini")
+            print("  model id (e.g. gemini-2.5-pro). GEMINI_MODEL and "
+                  "settings.json model.name")
+            print("  also work — the CLI is the validator.")
+        else:   # a custom provider: teamctl knows only what the block says
+            print("  no model discovery for a custom provider; --model "
+                  "passes through its")
+            print("  model_args verbatim (the CLI validates it).")
         print()
     print("model ids pass through to the provider CLI verbatim — new models "
           "work without updating teamctl.")
@@ -1624,14 +2019,22 @@ def cmd_models(args: argparse.Namespace) -> int:
 
 PROBE_SESSION = "teamctl-probe"
 
-# provider -> how to ask its TUI for usage. claude is deliberately absent:
-# its statusline rate_limits feed (claude-usage.json) is the documented and
-# cheaper source. `command` is typed into the TUI followed by Enter;
-# extra_enters presses Enter again if no numbers appear (menu confirmation).
-PROBES: dict[str, dict] = {
-    "grok": {"argv": ["grok"], "command": "/usage", "extra_enters": 1},
-    "codex": {"argv": ["codex"], "command": "/status", "extra_enters": 1},
-}
+
+def probe_specs() -> dict[str, dict]:
+    """provider -> how to ask its TUI for usage, read off the registry
+    (spec key "probe"; custom providers join via probe_command). claude
+    deliberately has none: its statusline rate_limits feed
+    (claude-usage.json) is the documented and cheaper source. gemini has
+    none either: current builds expose no parseable used-% in /stats
+    (verified 2026-07) — it stays honestly quiet. `command` is typed into
+    the TUI followed by Enter; extra_enters presses Enter again if no
+    numbers appear (menu confirmation)."""
+    out: dict[str, dict] = {}
+    for name in routable_providers():
+        probe = (provider_spec(name) or {}).get("probe")
+        if probe:
+            out[name] = probe
+    return out
 
 
 def _capture_pane(pane_id: str) -> str:
@@ -1771,16 +2174,18 @@ def probe_stale_minutes() -> int:
 
 def _run_probes(which: str) -> int:
     """Handle `usage --probe [provider|all]`. Returns 2 on a bad target."""
+    probes = probe_specs()
     if which == "claude":
         print("claude: probe skipped — the statusline cache is the "
               "documented, cheaper source (install it via `teamctl init`).")
         return 0
     if which == "all":
-        targets = [p for p in PROBES if shutil.which(p)]
+        targets = [p for p in probes
+                   if shutil.which(probes[p]["argv"][0])]
         if not targets:
             print("no probe-able provider CLI installed.", file=sys.stderr)
-    elif which in PROBES:
-        if shutil.which(which):
+    elif which in probes:
+        if shutil.which(probes[which]["argv"][0]):
             targets = [which]
         else:
             targets = []
@@ -1791,7 +2196,7 @@ def _run_probes(which: str) -> int:
         return 2
     for prov in targets:
         print(f"probing {prov} in hidden tmux session '{PROBE_SESSION}'…")
-        result, err = probe_provider(prov, PROBES[prov])
+        result, err = probe_provider(prov, probes[prov])
         if result:
             _save_probe_result(prov, result)
             wins = ", ".join(f"{k} {v['used_percent']:.0f}%"
@@ -1814,7 +2219,7 @@ def cmd_usage(args: argparse.Namespace) -> int:
             return rc
     now = time.time()
 
-    states = {prov: provider_state(prov) for prov in ROUTABLE}
+    states = {prov: provider_state(prov) for prov in routable_providers()}
     live = {prov for prov, (st, _n) in states.items()
             if st in ("ready", "quiet")}
 
@@ -1840,18 +2245,20 @@ def cmd_usage(args: argparse.Namespace) -> int:
     stale_after = probe_stale_minutes() * 60
 
     if args.json:
-        claude_json = None
-        if claude:
-            claude_json = dict(claude)
-            claude_json["captured_at"] = claude_captured
-        print(json.dumps({
-            "codex": codex or None,
-            "claude": claude_json,
-            "grok": None,
-            "probes": probes or None,
-            "states": {prov: {"state": st, "note": note or None}
-                       for prov, (st, note) in states.items()},
-        }, indent=2))
+        # one key per routable provider: its native windows or null (the
+        # spec-registry guarantee — new/custom providers appear here on
+        # day one instead of being hardcoded out)
+        payload: dict = {}
+        for prov in states:
+            wins = {"codex": codex, "claude": claude}.get(prov) or None
+            if prov == "claude" and wins:
+                wins = dict(wins)
+                wins["captured_at"] = claude_captured
+            payload[prov] = wins
+        payload["probes"] = probes or None
+        payload["states"] = {prov: {"state": st, "note": note or None}
+                             for prov, (st, note) in states.items()}
+        print(json.dumps(payload, indent=2))
         return 0
 
     def _stale_note(age_seconds: float) -> str:
@@ -1860,24 +2267,27 @@ def cmd_usage(args: argparse.Namespace) -> int:
         return ""
 
     native = {"codex": codex, "claude": claude}
-    print(f"{'PROVIDER':<8}  USAGE")
-    for prov in ROUTABLE:
+    width = max([8] + [len(p) for p in states])
+    print(f"{'PROVIDER'.ljust(width)}  USAGE")
+    for prov in states:
         state, note = states[prov]
         if state == "not installed":
-            print(f"{prov:<8}  not installed"
+            print(f"{prov.ljust(width)}  not installed"
                   + (f" — {note}" if note else ""))
             continue
         if state == "locked out":
-            print(f"{prov:<8}  locked out — sign in: "
-                  f"`{LOGIN_HINTS.get(prov, prov + ' login')}`")
+            print(f"{prov.ljust(width)}  locked out — sign in: "
+                  f"`{login_hint(prov)}`")
             continue
         if state == "unknown":
-            print(f"{prov:<8}  unknown — {note or 'auth state unreadable'}")
+            print(f"{prov.ljust(width)}  unknown — "
+                  f"{note or 'auth state unreadable'}")
             continue
-        wins = native.get(prov, {})
+        wins = native.get(prov) or {}
         if wins:
             for label, w in wins.items():
-                print(f"{prov:<8}  {label}: {w['used_percent']:.0f}% used, "
+                print(f"{prov.ljust(width)}  {label}: "
+                      f"{w['used_percent']:.0f}% used, "
                       f"resets {_fmt_reset(w['resets_at'], now)}")
             if prov == "claude":
                 if isinstance(claude_captured, (int, float)):
@@ -1885,12 +2295,15 @@ def cmd_usage(args: argparse.Namespace) -> int:
                            + _stale_note(now - claude_captured))
                 else:
                     age = "age unknown"
-                print(f"{prov:<8}  (source: statusline cache, {age})")
+                print(f"{prov.ljust(width)}  (source: statusline cache, "
+                      f"{age})")
         elif state == "ready":       # numbers live in the probe cache below
-            print(f"{prov:<8}  ready — probe data below")
+            print(f"{prov.ljust(width)}  ready — probe data below")
+        elif note.startswith("auth not probed"):
+            print(f"{prov.ljust(width)}  quiet — {note}")
         else:
-            print(f"{prov:<8}  quiet — signed in, no usage data yet "
-                  f"({WAKE_HINTS.get(prov, 'use it once')})")
+            print(f"{prov.ljust(width)}  quiet — signed in, no usage data "
+                  f"yet ({wake_hint(prov)})")
 
     # cached probe results — but never for an uninstalled provider (its
     # residue is already flagged above, and it is not a live provider)
@@ -1924,19 +2337,21 @@ def cmd_providers(args: argparse.Namespace) -> int:
     now = time.time()
 
     rows: list[tuple[str, str, str]] = []
-    for prov in ROUTABLE:
+    for prov in routable_providers():
         state, note = provider_state(prov)
         details: list[str] = []
+        if state == "quiet" and note.startswith("auth not probed"):
+            details.append(note)     # the honest custom-provider caveat
+            note = ""
         if state == "ready":
             summary = _usage_summary(prov)
             if summary:
                 details.append(summary)
-        elif state == "quiet":
+        elif state == "quiet" and not details:
             details.append("signed in, no usage data yet — "
-                           + WAKE_HINTS.get(prov, "use it once"))
+                           + wake_hint(prov))
         elif state == "locked out":
-            details.append("sign in: "
-                           f"`{LOGIN_HINTS.get(prov, prov + ' login')}`")
+            details.append(f"sign in: `{login_hint(prov)}`")
         if note:
             details.append(note if state == "not installed" else f"({note})")
         sig_entry = cached.get(prov, {})
@@ -1965,9 +2380,6 @@ def cmd_providers(args: argparse.Namespace) -> int:
     return 0
 
 
-ROUTABLE = ("claude", "codex", "grok")
-
-
 def _cached_signals() -> dict:
     cache = state_path().parent / "providers.json"
     try:
@@ -1985,19 +2397,23 @@ def route_select(requested: list[str] | None = None
     auth unknown / exhausted / auth-error. selected is None when no
     candidate survives.
     """
-    candidates = requested if requested else list(ROUTABLE)
+    routable = routable_providers()
+    candidates = requested if requested else list(routable)
     cached = _cached_signals()
     exclusions: dict[str, str] = {}
     survivors: list[str] = []
     for prov in candidates:
-        if prov not in ROUTABLE:
+        if prov not in routable:
             exclusions[prov] = "unknown"
             continue
-        if shutil.which(prov) is None:
+        if not provider_installed(prov):
             exclusions[prov] = "not installed"
             continue
         auth = provider_auth_state(prov)[0]
-        if auth != "signed-in":
+        # 'unprobed' (a custom provider with no auth config) stays IN:
+        # the user configured it deliberately — excluding it would make
+        # the escape hatch useless (the reason line notes it instead)
+        if auth not in ("signed-in", "unprobed"):
             exclusions[prov] = ("locked out" if auth == "signed-out"
                                 else "auth unknown")
             continue
@@ -2009,7 +2425,7 @@ def route_select(requested: list[str] | None = None
 
     preference = (load_config().get("routing") or {}).get("preference")
     if not isinstance(preference, list) or not preference:
-        preference = list(ROUTABLE)
+        preference = list(routable)
     ranked = sorted(
         survivors,
         key=lambda p: (preference.index(p) if p in preference else len(preference),
@@ -2165,7 +2581,7 @@ def _detect_providers() -> list[tuple[str, str]]:
     """(provider, lattice state) for every routable provider. A provider is
     usable for config/routing when signed in — state `quiet` or `ready`
     (usage data changes the word, not the eligibility)."""
-    return [(prov, provider_state(prov)[0]) for prov in ROUTABLE]
+    return [(prov, provider_state(prov)[0]) for prov in routable_providers()]
 
 
 def _usable(rows: list[tuple[str, str]]) -> list[str]:
@@ -2729,7 +3145,9 @@ def _run_cockpit():
 def _apply_cockpit(state: dict, ready: list[str]) -> int:
     g = _out_glyphs()
     providers_cfg = {p: {"model": state["models"].get(p, ""),
-                         "effort": state["effort"]} for p in ready}
+                         "effort": (state["effort"]
+                                    if provider_supports_effort(p) else "")}
+                     for p in ready}
     changes: list[tuple[str, str]] = []
     cfg_path, backed_up = _write_wizard_config(
         providers_cfg, state["voice"], list(state["route"]), state["lead"],
@@ -2819,7 +3237,9 @@ def _plain_init(args: argparse.Namespace) -> int:
     if not _ask_yn(f"  write {_tilde(cfg_path)}? [Y/n] ", default=True):
         print("  nothing written.")
         return 0
-    providers_cfg = {p: {"model": models.get(p, ""), "effort": effort}
+    providers_cfg = {p: {"model": models.get(p, ""),
+                         "effort": (effort if provider_supports_effort(p)
+                                    else "")}
                      for p in ready}
     changes: list[tuple[str, str]] = []
     path, backed_up = _write_wizard_config(providers_cfg, voice, route, lead,
@@ -2856,7 +3276,12 @@ def _init_express(args: argparse.Namespace) -> int:
     upd_line = None if getattr(args, "yes", False) else _session_update_line()
     rows = _detect_providers()
     ready = _usable(rows)
-    providers_cfg = {p: {"model": "", "effort": "high"} for p in ready}
+    # a provider with no effort control (gemini) gets no effort key — an
+    # unusable setting must not be written just to be ignored later
+    providers_cfg = {p: {"model": "",
+                         "effort": ("high" if provider_supports_effort(p)
+                                    else "")}
+                     for p in ready}
     preference = sorted(ready)
     changes: list[tuple[str, str]] = []
     cfg_path, backed_up = _write_wizard_config(
@@ -3206,7 +3631,7 @@ main chat; teammates are tmux panes tiled to your right.
 
 ## Command reference
 
-    teamctl spawn <role> --provider claude|codex|grok [--model M] [--effort E] [--prompt TEXT]
+    teamctl spawn <role> --provider claude|codex|grok|gemini [--model M] [--effort E] [--prompt TEXT]
     teamctl dispatch <role> --provider P --task "…"   # headless, watchable pane
     teamctl result <role> --wait                      # read the result back
     teamctl followup <role> --task "…"                # another turn, same session
@@ -3316,12 +3741,15 @@ def _lead_paths() -> dict[str, Path]:
 # Where each CLI reads GLOBAL instructions (all officially documented):
 # claude: ~/.claude/CLAUDE.md; codex: ~/.codex/AGENTS.md (global scope, read
 # first); grok: ~/.grok/AGENTS.md (global rules, deeper files take
-# precedence). The skill and hook tiers are Claude Code mechanisms with no
-# codex/grok equivalent — that's parity with what each CLI offers, not bias.
+# precedence); gemini: ~/.gemini/GEMINI.md (the global context file — the
+# default contextFileName, loaded for every project). The skill and hook
+# tiers are Claude Code mechanisms with no equivalent elsewhere — that's
+# parity with what each CLI offers, not bias.
 LEAD_BLOCK_FILES: dict[str, tuple[str, str]] = {
     "claude": (".claude", "CLAUDE.md"),
     "codex": (".codex", "AGENTS.md"),
     "grok": (".grok", "AGENTS.md"),
+    "gemini": (".gemini", "GEMINI.md"),
 }
 
 
@@ -4252,15 +4680,15 @@ def _resolve_chat() -> tuple[str | None, str, str, str]:
     the chosen provider isn't ready (not installed / locked out / unknown)
     — the message names the fix, never a stack trace."""
     prov, model, effort = _chat_defaults()
-    if prov and prov not in PROVIDERS:
+    if prov and provider_spec(prov) is None:
         return None, "", "", (f"[lead] chat_provider is '{prov}', which is "
                               "not a known provider — fix it with `teamctl "
                               "settings` or `teamctl config lead.chat_provider "
-                              "claude|codex|grok`.")
+                              f"{'|'.join(routable_providers())}`.")
     if not prov:
         prov = default_provider()
     if prov is None:
-        avail = [p for p in ROUTABLE if provider_state(p)[0] in
+        avail = [p for p in routable_providers() if provider_state(p)[0] in
                  ("ready", "quiet")]
         if avail:
             return None, "", "", (
@@ -4279,7 +4707,7 @@ def _resolve_chat() -> tuple[str | None, str, str, str]:
     if state == "locked out":
         return None, "", "", (
             f"{prov} is installed but signed out — sign in with "
-            f"`{LOGIN_HINTS.get(prov, prov + ' login')}`, then run `teamctl`.")
+            f"`{login_hint(prov)}`, then run `teamctl`.")
     if state == "unknown":
         return None, "", "", (
             f"{prov}'s login state can't be read — check the CLI, or pick "
@@ -4411,11 +4839,11 @@ def _check_tmux() -> tuple[str, str]:
 
 
 def _check_providers() -> tuple[str, str]:
-    states = {p: provider_state(p)[0] for p in ROUTABLE}
+    states = {p: provider_state(p)[0] for p in routable_providers()}
     usable = [p for p, s in states.items() if s in ("ready", "quiet")]
     locked = [p for p, s in states.items() if s == "locked out"]
     if usable:
-        parts = [f"{p} {states[p]}" for p in ROUTABLE
+        parts = [f"{p} {states[p]}" for p in states
                  if states[p] != "not installed"]
         return "ok", "; ".join(parts) or ", ".join(usable)
     if locked:
@@ -4968,9 +5396,15 @@ def settings_catalog(data: dict) -> list[dict]:
         rows.append({"key": key, "section": section, "label": label,
                      "value": val, "choices": _menu_choices(key, val)})
     # per-provider model + effort, only for providers the user actually has
-    # configured (init writes a [providers.<p>] block per ready provider)
+    # configured (init writes a [providers.<p>] block per ready provider).
+    # "custom" is the [providers.custom.*] table, not a provider itself;
+    # an effort row is omitted when the CLI has no effort control.
     for prov in sorted((data.get("providers") or {})):
+        if prov == "custom":
+            continue
         for leaf, lbl in (("model", "model"), ("effort", "effort")):
+            if leaf == "effort" and not provider_supports_effort(prov):
+                continue
             key = f"providers.{prov}.{leaf}"
             val = _settings_value(data, key)
             rows.append({"key": key, "section": f"{prov}", "label": lbl,
@@ -5161,7 +5595,7 @@ def build_parser() -> argparse.ArgumentParser:
                           "skill + optional hook for Claude Code); off: remove "
                           "exactly what on installed; status: report tiers")
     lp2.add_argument("--cli", default="",
-                     choices=["claude", "codex", "grok", "all"],
+                     choices=[*LEAD_BLOCK_FILES, "all"],
                      help="which CLI's identity to manage (default: every "
                           "detected CLI for on; everything for off)")
     lp2.add_argument("--hook", action="store_true",
@@ -5201,10 +5635,11 @@ def build_parser() -> argparse.ArgumentParser:
                     help="interactive numbered menu of current settings")
     cp.set_defaults(func=cmd_config)
 
+    provider_names = "|".join(known_provider_names())
     sp = sub.add_parser("spawn", help="open a teammate in a new tmux pane")
     sp.add_argument("role", help="descriptive role name, e.g. code-reviewer")
     sp.add_argument("--provider", default="",
-                    help="claude|codex|grok|shell (default: first entry of your "
+                    help=f"{provider_names} (default: first entry of your "
                          "[routing] preference, or the only detected provider; "
                          "with several providers and no preference you must "
                          "choose)")
@@ -5233,7 +5668,7 @@ def build_parser() -> argparse.ArgumentParser:
     dsp = sub.add_parser("dispatch", help="hand a teammate a task headlessly (watchable)")
     dsp.add_argument("role")
     dsp.add_argument("--provider", default="",
-                     help="claude|codex|grok|shell (default: first entry of your "
+                     help=f"{provider_names} (default: first entry of your "
                           "[routing] preference, or the only detected provider)")
     dsp.add_argument("--task", required=True, help="the task/instruction")
     dsp.add_argument("--context-file", default="", help="file whose contents are appended as context")
@@ -5257,10 +5692,9 @@ def build_parser() -> argparse.ArgumentParser:
     rt.add_argument("role")
     rt.add_argument("--task", required=True, help="the task/instruction")
     rt.add_argument("--providers", default="",
-                    help="comma-separated candidate providers (default: all three; "
-                         "ranked by your [routing] preference — without one the "
-                         "order is alphabetical, which is arbitrary, not a "
-                         "recommendation)")
+                    help="comma-separated candidate providers (default: every "
+                         "routable provider; ranked by your [routing] "
+                         "preference/strategy)")
     rt.add_argument("--model", default="", help="override model")
     rt.add_argument("--effort", default="", help="override effort/reasoning level")
     rt.add_argument("--cwd", default="", help="working directory for the teammate")
@@ -5297,7 +5731,7 @@ def build_parser() -> argparse.ArgumentParser:
                              "always pass through verbatim — new models need "
                              "no teamctl update)")
     mo.add_argument("provider", nargs="?", default="",
-                    help="claude|codex|grok (default: all)")
+                    help="any routable provider (default: all)")
     mo.set_defaults(func=cmd_models)
 
     slp = sub.add_parser(

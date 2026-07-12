@@ -60,13 +60,16 @@ class ThrowawayHomeTestCase(unittest.TestCase):
         # exported provider API key counts as signed in
         os.environ["TEAMCTL_NO_KEYCHAIN"] = "1"
         self._saved_env = {}
-        for var in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "XAI_API_KEY"):
+        for var in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "XAI_API_KEY",
+                    "GEMINI_API_KEY", "GOOGLE_API_KEY",
+                    "GOOGLE_APPLICATION_CREDENTIALS"):
             self._saved_env[var] = os.environ.pop(var, None)
-        # pin CLI detection: all three "installed", regardless of the machine
+        # pin CLI detection: all four "installed", regardless of the machine
         # (lead's default --cli set and provider detection read shutil.which)
         self._which = tc.shutil.which
         tc.shutil.which = lambda name, *a, **k: (
-            f"/fake/bin/{name}" if name in ("claude", "codex", "grok")
+            f"/fake/bin/{name}"
+            if name in ("claude", "codex", "grok", "gemini")
             else self._which(name))
 
     def tearDown(self):
@@ -540,8 +543,8 @@ class LeadStatusTests(ThrowawayHomeTestCase):
     def test_status_tracks_each_tier(self):
         rc, out, _ = self.run_cli(["lead", "status"])
         self.assertEqual(rc, 0)
-        # skill + three CLI blocks + hook
-        self.assertEqual(out.count("not installed"), 5)
+        # skill + four CLI blocks + hook
+        self.assertEqual(out.count("not installed"), 6)
         self.assertIn("Controls", out)                      # discoverability footer
 
         self.assertEqual(self.run_cli(["lead", "on"], answers=["n"])[0], 0)
@@ -551,7 +554,8 @@ class LeadStatusTests(ThrowawayHomeTestCase):
         self.assertEqual(st, {"skill": "installed",
                               "blocks": {"claude": "installed",
                                          "codex": "installed",
-                                         "grok": "installed"},
+                                         "grok": "installed",
+                                         "gemini": "installed"},
                               "hook": "not installed"})
         self.assertEqual(out.count("not installed"), 1)
 
