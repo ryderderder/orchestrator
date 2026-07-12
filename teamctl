@@ -12,6 +12,7 @@ Usage:
     teamctl models [provider]
     teamctl spawn <role> [--provider claude|codex|grok|gemini|shell] [--prompt TEXT] [--cwd DIR]
     teamctl list
+    teamctl status [role] [--json] [--watch [--interval N]]
     teamctl send <role> "<instruction>" [--no-enter]
     teamctl dispatch <role> --provider P --task "…" [--context-file F] [--model M] [--effort E]
     teamctl result <role> [--wait]
@@ -136,6 +137,10 @@ PROVIDER_SPECS: dict[str, dict] = {
         "login_hint": "claude auth login",
         "wake_hint": "run one Claude Code turn with the teamctl statusline "
                      "installed (`teamctl init`)",
+        # OBSERVED-ONLY TUI approval-dialog shapes (see waiting_patterns
+        # note below): Claude Code permission prompts
+        "waiting_patterns": [r"Do you want", r"❯\s*1\.",
+                             r"\by/N\b", r"\bY/n\b"],
         "routable": True,
     },
     "codex": {
@@ -156,6 +161,8 @@ PROVIDER_SPECS: dict[str, dict] = {
         "wake_hint": "usage appears after the first codex turn, or probe: "
                      "`teamctl usage --probe codex`",
         "probe": {"argv": ["codex"], "command": "/status", "extra_enters": 1},
+        "waiting_patterns": [r"(?i)\bapprove\b", r"\[y/[nN]\]",
+                             r"(?i)allow command", r"❯\s*1\."],
         "routable": True,
     },
     "grok": {
@@ -172,6 +179,8 @@ PROVIDER_SPECS: dict[str, dict] = {
         "login_hint": "grok login",
         "wake_hint": "probe it: `teamctl usage --probe grok`",
         "probe": {"argv": ["grok"], "command": "/usage", "extra_enters": 1},
+        "waiting_patterns": [r"(?i)\bapprove\b", r"\[y/[nN]\]",
+                             r"(?i)\ballow\b.*\?", r"❯\s*1\."],
         "routable": True,
     },
     "gemini": {
@@ -208,6 +217,9 @@ PROVIDER_SPECS: dict[str, dict] = {
         # statusline pipe, no session-log rate_limits, and current builds
         # removed the /stats used-% display) — it stays 'quiet' for good
         "wake_hint": "gemini exposes no local usage feed — it stays quiet",
+        "waiting_patterns": [r"(?i)apply this change", r"(?i)allow execution",
+                             r"\((?:Y/n|y/N)\)", r"(?i)waiting for user",
+                             r"❯\s*1\."],
         "routable": True,
     },
     "shell": {
@@ -333,6 +345,20 @@ def custom_provider_specs() -> dict[str, dict]:
             else:
                 resume = [command] + resume_args
 
+        patterns = _str_list(block.get("waiting_patterns", []))
+        if patterns is None:
+            _warn_custom_once(name, "waiting_patterns must be a list of "
+                                    "strings")
+            continue
+        good_patterns = []
+        for pat in patterns:
+            try:
+                re.compile(pat)
+                good_patterns.append(pat)
+            except re.error as exc:
+                _warn_custom_once(name, f"waiting_pattern {pat!r} does not "
+                                        f"compile ({exc}) — dropped")
+
         probe_command = str(block.get("probe_command") or "")
         routable = block.get("routable", True)
         if not isinstance(routable, bool):
@@ -353,6 +379,7 @@ def custom_provider_specs() -> dict[str, dict]:
             "wake_hint": "",
             "probe": ({"argv": [command], "command": probe_command,
                        "extra_enters": 1} if probe_command else None),
+            "waiting_patterns": good_patterns,
             "routable": routable,
             "custom": True,
         }
@@ -1094,6 +1121,13 @@ def cmd_list(args: argparse.Namespace) -> int:
     for role in sorted(mates):
         i = mates[role]
         st = _mate_state(role, i, live)
+        # fast needs-input flag for interactive mates (single capture, no
+        # settle wait — `teamctl status` runs the full busy/idle classifier)
+        if st == "active" and (i.get("pane_id") or "") in live:
+            hit = _match_waiting(_capture_pane(i["pane_id"]),
+                                 _waiting_patterns(i.get("provider", "")))
+            if hit:
+                st = "input?"
         wt = i.get("worktree") or {}
         marker = f"  ⌂ {wt['branch']}" if wt.get("branch") else ""
         print(
@@ -1101,6 +1135,200 @@ def cmd_list(args: argparse.Namespace) -> int:
             f"{i.get('pane_id') or '-':<7}  {st:<11}  "
             f"{i.get('created_at', '')}{marker}"
         )
+    return 0
+
+
+# --------------------------------------------------------------------------
+# teammate status detection — busy / needs-input / idle, on demand (no
+# daemon). Two capture-pane samples ~0.7s apart: changing content = busy;
+# stable content matching the provider's waiting_patterns (OBSERVED-ONLY
+# TUI approval-dialog text — defensive parsing, same posture as the usage
+# probes) = needs-input; anything else = idle. An unrecognized TUI
+# degrades to idle — never a wrong strong claim.
+# --------------------------------------------------------------------------
+
+def _waiting_patterns(provider: str) -> list[str]:
+    return list((provider_spec(provider) or {}).get("waiting_patterns")
+                or [])
+
+
+def _match_waiting(text: str, patterns: list[str]) -> str | None:
+    """The first waiting-shape LINE in the tail of pane text; None when
+    nothing matches (or a pattern is broken — skipped, never fatal)."""
+    tail = [ln for ln in text.rstrip().splitlines()[-15:] if ln.strip()]
+    for pat in patterns:
+        for ln in tail:
+            try:
+                if re.search(pat, ln):
+                    return ln.strip()
+            except re.error:
+                break
+    return None
+
+
+def _pane_activity(pane_id: str, provider: str,
+                   settle: float = 0.7) -> tuple[str, str]:
+    """(state, detail) for a live interactive pane."""
+    first = _capture_pane(pane_id)
+    time.sleep(settle)
+    second = _capture_pane(pane_id)
+    if first != second:
+        return "busy", ""
+    hit = _match_waiting(second, _waiting_patterns(provider))
+    if hit:
+        return "needs-input", hit[:80]
+    return "idle", ""
+
+
+def _classify_mate(role: str, info: dict, live: set[str],
+                   settle: float = 0.7) -> tuple[str, str]:
+    """(state, detail) for any teammate: dispatch mates keep their derived
+    lifecycle states (running/done/failed/died); interactive mates get the
+    pane classifier."""
+    if info.get("mode") == "dispatch":
+        return _mate_state(role, info, live), ""
+    pane = info.get("pane_id") or ""
+    if not pane or pane not in live:
+        return "gone", ""
+    return _pane_activity(pane, info.get("provider", ""), settle)
+
+
+def _status_cache_path() -> Path:
+    return state_path().parent / "status-cache.json"
+
+
+def _load_status_cache() -> dict:
+    try:
+        p = _status_cache_path()
+        data = json.loads(p.read_text()) if p.exists() else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _save_status_cache(cache: dict) -> None:
+    try:
+        p = _status_cache_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(cache, indent=2, sort_keys=True))
+        tmp.replace(p)
+    except OSError:
+        pass    # the cache only powers transition detection — best effort
+
+
+def _notify_argv() -> list[str]:
+    """[notify] command, split into argv — NEVER interpolated through a
+    shell. Context rides environment variables instead."""
+    raw = (load_config().get("notify") or {}).get("command", "")
+    try:
+        return shlex.split(str(raw)) if raw else []
+    except ValueError:
+        return []
+
+
+def _fire_notify(role: str, new_state: str, prev_state: str) -> None:
+    """Run the notify hook for one observed transition. Context via env:
+    TEAMCTL_ROLE, TEAMCTL_MATE_STATE, TEAMCTL_PREV_STATE. (Deliberately
+    NOT 'TEAMCTL_STATE' — that env var already means the state-file
+    override, and a hook that calls teamctl back must keep working.)
+    Best-effort: a broken hook prints one line, never breaks status."""
+    argv = _notify_argv()
+    if not argv:
+        return
+    env = dict(os.environ)
+    env["TEAMCTL_ROLE"] = role
+    env["TEAMCTL_MATE_STATE"] = new_state
+    env["TEAMCTL_PREV_STATE"] = prev_state
+    try:
+        subprocess.run(argv, env=env, capture_output=True, timeout=10)
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"teamctl: notify hook failed: {exc}", file=sys.stderr)
+
+
+def _observe_transitions(states: dict[str, str]) -> None:
+    """Compare freshly-observed states against the persisted last-known
+    ones; fire the notify hook per change. Honest limitation (documented):
+    teamctl has no daemon — transitions are observed only when status/
+    list/--watch actually looks."""
+    cache = _load_status_cache()
+    changed = False
+    for role, new_state in states.items():
+        prev = cache.get(role, "")
+        if prev != new_state:
+            if prev:                    # a first sighting is not a transition
+                _fire_notify(role, new_state, prev)
+            cache[role] = new_state
+            changed = True
+    for role in [r for r in cache if r not in states]:
+        del cache[role]
+        changed = True
+    if changed:
+        _save_status_cache(cache)
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    """One-shot (or --watch) teammate status: busy / needs-input / idle
+    for interactive mates, the derived lifecycle for dispatch mates."""
+    def observe() -> dict[str, tuple[str, str]]:
+        with state_lock():
+            state = reconcile(load_state())
+        mates = state["teammates"]
+        if args.role:
+            if args.role not in mates:
+                return {}
+            mates = {args.role: mates[args.role]}
+        live = live_pane_ids()
+        return {role: _classify_mate(role, info, live)
+                for role, info in sorted(mates.items())}
+
+    if getattr(args, "watch", False):
+        interval = max(1.0, float(getattr(args, "interval", 5.0)))
+        print(f"watching teammate status every {interval:.0f}s — Ctrl-C "
+              "to stop")
+        prev: dict[str, str] = {}
+        try:
+            while True:
+                rows = observe()
+                states = {r: s for r, (s, _d) in rows.items()}
+                for role, (st, detail) in rows.items():
+                    if prev.get(role) != st:
+                        stamp = time.strftime("%H:%M:%S")
+                        extra = f"  ({detail})" if detail else ""
+                        was = prev.get(role, "?")
+                        print(f"{stamp}  {role}: {was} -> {st}{extra}")
+                for role in [r for r in prev if r not in states]:
+                    print(f"{time.strftime('%H:%M:%S')}  {role}: gone")
+                _observe_transitions(states)
+                prev = states
+                time.sleep(interval)
+        except KeyboardInterrupt:
+            print()
+            return 0
+
+    rows = observe()
+    if args.role and not rows:
+        print(f"teamctl: no teammate '{args.role}'.", file=sys.stderr)
+        return 1
+    _observe_transitions({r: s for r, (s, _d) in rows.items()})
+    if args.json:
+        with state_lock():
+            state = reconcile(load_state())
+        out = {}
+        for role, (st, detail) in rows.items():
+            info = state["teammates"].get(role, {})
+            out[role] = {"provider": info.get("provider"),
+                         "mode": info.get("mode"),
+                         "state": st, "detail": detail or None}
+        print(json.dumps(out, indent=2, sort_keys=True))
+        return 0
+    if not rows:
+        print("no active teammates")
+        return 0
+    width = max(len(r) for r in rows)
+    print(f"{'ROLE'.ljust(width)}  STATE        DETAIL")
+    for role, (st, detail) in rows.items():
+        print(f"{role.ljust(width)}  {st:<11}  {detail}")
     return 0
 
 
@@ -6297,6 +6525,22 @@ def build_parser() -> argparse.ArgumentParser:
     lp = sub.add_parser("list", help="show active teammates")
     lp.add_argument("--json", action="store_true", help="machine-readable output")
     lp.set_defaults(func=cmd_list)
+
+    stt = sub.add_parser(
+        "status",
+        help="teammate status: busy / needs-input / idle for interactive "
+             "mates (two pane samples + provider waiting patterns), the "
+             "derived lifecycle for dispatch mates; --watch polls and "
+             "fires the [notify] hook on transitions")
+    stt.add_argument("role", nargs="?", default="",
+                     help="one role (default: every teammate)")
+    stt.add_argument("--json", action="store_true",
+                     help="machine-readable output")
+    stt.add_argument("--watch", action="store_true",
+                     help="poll in the foreground until Ctrl-C")
+    stt.add_argument("--interval", type=float, default=5.0,
+                     help="seconds between --watch polls (default 5)")
+    stt.set_defaults(func=cmd_status)
 
     dp = sub.add_parser("shutdown", help="cleanly stop a teammate and close its pane")
     dp.add_argument("role", help="role name to shut down")
