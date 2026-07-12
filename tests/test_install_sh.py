@@ -127,6 +127,24 @@ class InstallShTestCase(unittest.TestCase):
                              env_extra={"TEAMCTL_PROC_VERSION": str(proc)})
         self.assertNotIn("detected WSL", r.stdout)
 
+    def test_missing_proc_version_is_silent(self):
+        # the macOS reality: /proc/version does not exist. The WSL check
+        # must stay completely silent — the launch-day live proof caught
+        # `bash: line N: /proc/version: No such file or directory` as the
+        # FIRST line of installer output (redirection-order bug: stderr
+        # must be nulled before the input file is opened). Both earlier
+        # WSL fixtures pointed at files that exist, which is exactly how
+        # it slipped through — this pins the missing-file case.
+        self.fake_uname("Darwin")
+        r = self.run_install(
+            "--no-init", "--no-deps",
+            env_extra={"TEAMCTL_PROC_VERSION":
+                       str(self.root / "no-such-proc-version")})
+        self.assertNotIn("No such file or directory", r.stderr)
+        self.assertNotIn("proc-version", r.stderr)
+        self.assertNotIn("detected WSL", r.stdout)
+        self.assertEqual(r.returncode, 0)
+
     # ---- dependency detection & offers -------------------------------------
 
     def test_missing_tmux_no_pkg_manager_prints_manual_hints(self):
