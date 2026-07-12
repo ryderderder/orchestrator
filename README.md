@@ -212,6 +212,28 @@ preference. Every step is skipped if already present, backed up first if it
 changes an existing file, and printed with its exact revert. `teamctl lead
 on` refuses to touch a `settings.json` it cannot parse.
 
+### Delegation posture
+
+How eagerly should a lead agent hand work to teammates? Choose once —
+`[lead] delegation` in the config, asked by the wizard, shown by
+`teamctl lead status`:
+
+- **ask** (default): the first time non-trivial work comes up in a
+  session, the lead asks plainly whether to use agent teams for work like
+  it (parallel teammates; taps your other AI subscriptions and resources)
+  — and offers to remember your answer
+  (`teamctl config lead.delegation always|manual`). Once, then never
+  again that session.
+- **always**: the lead delegates non-trivial work by default.
+- **manual**: single-agent work unless you explicitly ask for a team.
+
+Whatever the posture — including manual — a genuinely large task
+(multi-file, parallelizable, long-running) earns one, and only one,
+"this is big — want me to spin up a team?" suggestion per session; a no
+is final. The per-prompt hook echoes the live posture
+(`delegation=<value>`) on every prompt, so the lead knows the current
+mode even after context compaction.
+
 **The off switch:** `teamctl lead off` removes exactly what `on` installed —
 the skill directory, each CLI's marker block (your surrounding content is
 preserved byte-for-byte), and the teamctl-lead hook entry (other hooks and
@@ -230,6 +252,10 @@ defaults (config file only; no tmux or Claude Code changes).
 ```toml
 [output]
 verbosity = "normal"        # terse | normal | detailed
+
+[lead]
+delegation = "ask"          # ask | always | manual — how eagerly a lead
+                            # agent hands work to teammates (see Lead mode)
 
 [providers.claude]
 model = "opus"              # default --model for claude teammates
@@ -387,12 +413,13 @@ anything (or anyone) able to run teamctl can steer every teammate.
   unknown" / "probe failed" / raw text instead of crashing — but re-verify
   after provider CLI upgrades. (Claude's statusline fields, `codex exec
   resume`, and `grok models` are documented.)
-- **`followup` for Codex resumes the most recent session** (`codex exec
-  resume --last`): with several concurrent codex teammates the wrong session
-  could be resumed. Codex documents id-addressed resume (`codex exec resume
-  <SESSION_ID>`), but capturing the id per dispatch would require its
-  `--json` event stream, which changes the captured result shape — so
-  teamctl doesn't do it yet. Keep concurrent codex followups serialized.
+- **Follow-ups are exact-session on all providers.** `followup` resumes
+  the specific captured session id (claude `--resume <id>`, grok `-r <id>`,
+  codex `exec resume <id>` — all verified against each CLI's help) and
+  refuses rather than guessing "most recent" when no id was captured.
+  The codex id comes from an observed stderr banner (`session id: <uuid>`),
+  with the rollout-log filename as a fallback — re-verify after codex
+  upgrades. claude/grok ids come from their JSON results.
 - **Exhaustion signals are best-effort.** `route` skips a provider only after
   its output was seen to contain a limit/auth error, or Codex's own log shows
   100% on the 5h window; signals with a known reset time auto-expire.
