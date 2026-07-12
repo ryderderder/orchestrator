@@ -26,6 +26,26 @@ tc = importlib.util.module_from_spec(spec)
 loader.exec_module(tc)
 
 
+def seed_signin(home: Path, *providers: str) -> None:
+    """Write a provider's real signed-in artifact into a fixture HOME —
+    the exact shapes the auth probes were verified against on a live
+    signed-in install of each CLI."""
+    for p in providers:
+        if p == "claude":
+            (home / ".claude.json").write_text(json.dumps(
+                {"oauthAccount": {"emailAddress": "t@example.com"}}))
+        elif p == "codex":
+            (home / ".codex").mkdir(exist_ok=True)
+            (home / ".codex" / "auth.json").write_text(json.dumps(
+                {"auth_mode": "chatgpt", "OPENAI_API_KEY": None,
+                 "tokens": {"access_token": "t"}, "last_refresh": "now"}))
+        elif p == "grok":
+            (home / ".grok").mkdir(exist_ok=True)
+            (home / ".grok" / "auth.json").write_text(json.dumps(
+                {"https://auth.x.ai::u1": {"key": "k",
+                                           "refresh_token": "r"}}))
+
+
 class ThrowawayHomeTestCase(unittest.TestCase):
     """HOME points at a fresh temp dir; scripted stdin via tc._input."""
 
@@ -35,6 +55,13 @@ class ThrowawayHomeTestCase(unittest.TestCase):
         self._home_env = os.environ.get("HOME")
         os.environ["HOME"] = str(self.home)
         self._input = tc._input
+        # keep the real machine's auth out of the sandbox: the keychain
+        # probe reads the *user's* keychain regardless of HOME, and an
+        # exported provider API key counts as signed in
+        os.environ["TEAMCTL_NO_KEYCHAIN"] = "1"
+        self._saved_env = {}
+        for var in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "XAI_API_KEY"):
+            self._saved_env[var] = os.environ.pop(var, None)
         # pin CLI detection: all three "installed", regardless of the machine
         # (lead's default --cli set and provider detection read shutil.which)
         self._which = tc.shutil.which
@@ -45,6 +72,10 @@ class ThrowawayHomeTestCase(unittest.TestCase):
     def tearDown(self):
         tc.shutil.which = self._which
         tc._input = self._input
+        os.environ.pop("TEAMCTL_NO_KEYCHAIN", None)
+        for var, val in self._saved_env.items():
+            if val is not None:
+                os.environ[var] = val
         if self._home_env is not None:
             os.environ["HOME"] = self._home_env
         self.tmpdir.cleanup()
@@ -308,19 +339,13 @@ class InitLeadOfferTests(ThrowawayHomeTestCase):
 
     def setUp(self):
         super().setUp()
-        self._which = tc.shutil.which
-        self._auth = tc.AUTH_PATHS
+        self._offer_which = tc.shutil.which
         tc.shutil.which = lambda name, *a, **k: (
             "/fake/bin/claude" if name == "claude" else None)
-        auth = self.home / "auth-claude"
-        auth.write_text("x")
-        tc.AUTH_PATHS = {"claude": auth,
-                         "codex": self.home / "no-codex-auth",
-                         "grok": self.home / "no-grok-auth"}
+        seed_signin(self.home, "claude")
 
     def tearDown(self):
-        tc.shutil.which = self._which
-        tc.AUTH_PATHS = self._auth
+        tc.shutil.which = self._offer_which
         super().tearDown()
 
     def test_init_yes_skips_lead_mode(self):
@@ -401,19 +426,8 @@ class LeadMultiCliTests(ThrowawayHomeTestCase):
 class DefaultProviderTests(ThrowawayHomeTestCase):
     """--provider is never silently defaulted among several providers."""
 
-    def setUp(self):
-        super().setUp()
-        self._auth = tc.AUTH_PATHS
-        tc.AUTH_PATHS = {p: self.home / f"auth-{p}"
-                         for p in ("claude", "codex", "grok")}
-
-    def tearDown(self):
-        tc.AUTH_PATHS = self._auth
-        super().tearDown()
-
     def _auth_up(self, *provs):
-        for p in provs:
-            tc.AUTH_PATHS[p].write_text("x")
+        seed_signin(self.home, *provs)
 
     def test_config_preference_first_entry_wins(self):
         self._auth_up("claude", "codex", "grok")
@@ -454,26 +468,29 @@ class DefaultProviderTests(ThrowawayHomeTestCase):
 
 
 class GrokAuthHeuristicTests(ThrowawayHomeTestCase):
-    """grok login detection: auth.json (observed artifact) first; signs of
-    real CLI use as last resort; NEVER bare ~/.grok existence — `lead on`
-    creates that directory on machines that never logged in."""
+    """grok login detection: auth.json (observed artifact, holding at least
+    one credential entry) first; signs of real CLI use as last resort;
+    NEVER bare ~/.grok existence — `lead on` creates that directory on
+    machines that never logged in."""
 
     def setUp(self):
         super().setUp()
-        self._auth = tc.AUTH_PATHS
-        tc.AUTH_PATHS = dict(tc.AUTH_PATHS)
-        tc.AUTH_PATHS["grok"] = self.home / ".grok" / "auth.json"
         os.environ["TEAMCTL_STATE"] = str(self.home / "state.json")
 
     def tearDown(self):
         os.environ.pop("TEAMCTL_STATE", None)
-        tc.AUTH_PATHS = self._auth
         super().tearDown()
 
     def test_auth_json_is_the_primary_signal(self):
+        seed_signin(self.home, "grok")
+        self.assertTrue(tc.provider_authed("grok"))
+
+    def test_empty_auth_json_is_not_login(self):
+        # a credential-less {} (e.g. after a logout) must not read as a
+        # login — v0.4.0 validates content, not bare file existence
         (self.home / ".grok").mkdir()
         (self.home / ".grok" / "auth.json").write_text("{}")
-        self.assertTrue(tc.provider_authed("grok"))
+        self.assertFalse(tc.provider_authed("grok"))
 
     def test_lead_on_created_dir_is_not_login(self):
         # exactly what `teamctl lead on --cli grok` leaves behind
@@ -499,16 +516,7 @@ class InitRoutingOrderTests(ThrowawayHomeTestCase):
 
     def setUp(self):
         super().setUp()
-        self._auth = tc.AUTH_PATHS
-        auth_c, auth_x = self.home / "auth-claude", self.home / "auth-codex"
-        auth_c.write_text("x")
-        auth_x.write_text("x")
-        tc.AUTH_PATHS = {"claude": auth_c, "codex": auth_x,
-                         "grok": self.home / "no-grok-auth"}
-
-    def tearDown(self):
-        tc.AUTH_PATHS = self._auth
-        super().tearDown()
+        seed_signin(self.home, "claude", "codex")   # grok stays locked out
 
     def _config(self):
         return tomllib.loads(self.cfg.read_text())
@@ -690,14 +698,10 @@ class ConfigShowSetTests(ThrowawayHomeTestCase):
         self.assertEqual(self.cfg.read_text(), "not = toml [")
 
     def test_set_after_init_yes_preserves_provider_sections(self):
-        _which, _auth = tc.shutil.which, tc.AUTH_PATHS
+        _which = tc.shutil.which
         tc.shutil.which = lambda name, *a, **k: (
             "/fake/bin/claude" if name == "claude" else None)
-        auth = self.home / "auth-claude"
-        auth.write_text("x")
-        tc.AUTH_PATHS = {"claude": auth,
-                         "codex": self.home / "no-codex-auth",
-                         "grok": self.home / "no-grok-auth"}
+        seed_signin(self.home, "claude")
         try:
             self.assertEqual(self.run_cli(["init", "--yes"])[0], 0)
             rc, _, _ = self.run_cli(["config", "output.verbosity", "terse"])
@@ -708,7 +712,6 @@ class ConfigShowSetTests(ThrowawayHomeTestCase):
             self.assertEqual(data["output"]["verbosity"], "terse")
         finally:
             tc.shutil.which = _which
-            tc.AUTH_PATHS = _auth
 
 
 class DelegationPostureTests(ThrowawayHomeTestCase):
@@ -731,14 +734,10 @@ class DelegationPostureTests(ThrowawayHomeTestCase):
         self.assertEqual(out.strip(), '"manual"')
 
     def test_wizard_asks_and_persists_posture(self):
-        _which, _auth = tc.shutil.which, tc.AUTH_PATHS
+        _which = tc.shutil.which
         tc.shutil.which = lambda name, *a, **k: (
             "/fake/bin/claude" if name == "claude" else None)
-        auth = self.home / "auth-claude"
-        auth.write_text("x")
-        tc.AUTH_PATHS = {"claude": auth,
-                         "codex": self.home / "no",
-                         "grok": self.home / "no2"}
+        seed_signin(self.home, "claude")
         try:
             # plain path: model, effort, voice, LEAD=always, write
             rc, out, _ = self.run_cli(
@@ -756,7 +755,6 @@ class DelegationPostureTests(ThrowawayHomeTestCase):
                 "ask")
         finally:
             tc.shutil.which = _which
-            tc.AUTH_PATHS = _auth
 
     def test_hook_echo_reports_live_posture(self):
         import subprocess

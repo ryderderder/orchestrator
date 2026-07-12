@@ -89,21 +89,74 @@ def handoff_dir(role: str) -> Path:
     return state_path().parent / role
 
 
-# Where each provider stores auth, for the availability probe. These are
-# OBSERVED login artifacts (teamctl never touches credentials): claude and
-# codex write these files at login; grok's auth.json was observed on a
-# logged-in install alongside its other CLI data.
-AUTH_PATHS = {
-    "claude": Path.home() / ".claude.json",
-    "codex": Path.home() / ".codex" / "auth.json",
-    "grok": Path.home() / ".grok" / "auth.json",
-}
+# --------------------------------------------------------------------------
+# signed-in detection — reading each CLI's own login artifacts (teamctl
+# never touches credentials). Every artifact below was VERIFIED against a
+# live signed-in install of all three CLIs (macOS, 2026-07) and the
+# signed-out shape was verified against sandboxed empty homes. Probes are
+# file reads first (fast, no subprocess), never interactive, and degrade
+# to "unknown" instead of guessing when an artifact exists but is
+# unreadable.
+#
+#   claude  ~/.claude/.credentials.json {"claudeAiOauth": {...}} (file
+#           storage), or ~/.claude.json "oauthAccount" (account metadata,
+#           written on login whatever the credential store), or the macOS
+#           Keychain item "Claude Code-credentials" (attribute lookup only
+#           — never the secret, which could prompt). Cross-checked against
+#           `claude auth status` ({"loggedIn": true|false}).
+#   codex   ~/.codex/auth.json with a non-empty "tokens" dict or
+#           "OPENAI_API_KEY"; `codex logout` removes the credentials.
+#           Cross-checked against `codex login status` (rc 0 / 1).
+#   grok    ~/.grok/auth.json holding at least one credential entry
+#           (issuer-keyed dicts with refresh_token/key were observed).
+#
+# An exported provider API key (ANTHROPIC_API_KEY / OPENAI_API_KEY /
+# XAI_API_KEY) also counts as signed in: the CLI works with it even when
+# no login artifact exists.
+# --------------------------------------------------------------------------
+
+_CORRUPT = object()  # a JSON artifact that exists but cannot be read/parsed
+
+_AUTH_ENV_KEYS = {"claude": "ANTHROPIC_API_KEY", "codex": "OPENAI_API_KEY",
+                  "grok": "XAI_API_KEY"}
 
 # Signs of real grok CLI use, for the last-resort auth fallback. Bare
 # ~/.grok existence is NOT a login signal any more: `teamctl lead on`
 # creates that directory (AGENTS.md) on machines that never logged in.
 GROK_DIR_MARKERS = ("sessions", "config.toml", "agent_id",
                     "active_sessions.json")
+
+GROK_INFERRED_NOTE = ("inferred from ~/.grok CLI data; no auth.json — "
+                      "observed heuristic, verify with `grok models`")
+
+
+def _read_json_artifact(path: Path):
+    """None when missing, _CORRUPT when unreadable/unparseable, else data."""
+    try:
+        if not path.exists():
+            return None
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError, ValueError):
+        return _CORRUPT
+
+
+def _keychain_signed_in() -> bool:
+    """macOS: does the login keychain hold Claude Code's credentials item?
+    Attribute lookup only (`-w` could prompt for the secret; this never
+    does), short timeout, and any failure means 'no signal' — never
+    'signed out'. TEAMCTL_NO_KEYCHAIN=1 disables it (sandboxed tests)."""
+    if os.environ.get("TEAMCTL_NO_KEYCHAIN") == "1":
+        return False
+    if sys.platform != "darwin" or shutil.which("security") is None:
+        return False
+    try:
+        res = subprocess.run(
+            ["security", "find-generic-password",
+             "-s", "Claude Code-credentials"],
+            capture_output=True, timeout=3)
+        return res.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
 
 
 def _grok_auth_fallback(auth_path: Path) -> bool:
@@ -117,15 +170,53 @@ def _grok_auth_fallback(auth_path: Path) -> bool:
         return False
 
 
-def provider_authed(provider: str) -> bool:
-    path = AUTH_PATHS.get(provider)
-    if path is None:
-        return False
-    if path.exists():
-        return True
+def provider_auth_state(provider: str) -> tuple[str, str]:
+    """('signed-in' | 'signed-out' | 'unknown', note) for one provider.
+
+    'unknown' means an auth artifact exists but could not be read — the
+    honest answer, reported instead of guessing either way."""
+    home = Path.home()
+    if os.environ.get(_AUTH_ENV_KEYS.get(provider, ""), ""):
+        return "signed-in", "via exported API key"
+
+    if provider == "claude":
+        cred = _read_json_artifact(home / ".claude" / ".credentials.json")
+        if isinstance(cred, dict) and cred.get("claudeAiOauth"):
+            return "signed-in", ""
+        cj = _read_json_artifact(home / ".claude.json")
+        if isinstance(cj, dict) and cj.get("oauthAccount"):
+            return "signed-in", ""
+        if _keychain_signed_in():
+            return "signed-in", ""
+        if cred is _CORRUPT or cj is _CORRUPT:
+            return "unknown", "auth artifacts exist but are unreadable"
+        return "signed-out", ""
+
+    if provider == "codex":
+        auth = _read_json_artifact(home / ".codex" / "auth.json")
+        if isinstance(auth, dict) and (auth.get("tokens")
+                                       or auth.get("OPENAI_API_KEY")):
+            return "signed-in", ""
+        if auth is _CORRUPT:
+            return "unknown", "auth artifacts exist but are unreadable"
+        return "signed-out", ""  # missing, or logged out (credentials cleared)
+
     if provider == "grok":
-        return _grok_auth_fallback(path)
-    return False
+        auth_path = home / ".grok" / "auth.json"
+        auth = _read_json_artifact(auth_path)
+        if isinstance(auth, dict) and any(bool(v) for v in auth.values()):
+            return "signed-in", ""
+        if _grok_auth_fallback(auth_path):
+            return "signed-in", GROK_INFERRED_NOTE
+        if auth is _CORRUPT:
+            return "unknown", "auth artifacts exist but are unreadable"
+        return "signed-out", ""
+
+    return "unknown", ""
+
+
+def provider_authed(provider: str) -> bool:
+    return provider_auth_state(provider)[0] == "signed-in"
 
 
 def config_path() -> Path:
@@ -1284,6 +1375,97 @@ def claude_usage() -> dict | None:
 
 
 # --------------------------------------------------------------------------
+# the provider state lattice — one honest word per provider, everywhere
+# (providers, usage, the init frames, the installer screen):
+#
+#   not installed   CLI not on PATH; residual usage artifacts are flagged,
+#                   never rendered as a live provider
+#   locked out      installed, not signed in
+#   quiet           signed in, no usage numbers seen yet (it wakes on use)
+#   ready           signed in, with usage numbers
+#   unknown         auth artifacts exist but are unreadable — reported,
+#                   never guessed
+# --------------------------------------------------------------------------
+
+# how a quiet provider wakes up (produces its first usage numbers)
+WAKE_HINTS = {
+    "claude": "run one Claude Code turn with the teamctl statusline "
+              "installed (`teamctl init`)",
+    "codex": "usage appears after the first codex turn, or probe: "
+             "`teamctl usage --probe codex`",
+    "grok": "probe it: `teamctl usage --probe grok`",
+}
+
+# how a locked-out provider signs in (each CLI's own login command)
+LOGIN_HINTS = {"claude": "claude auth login", "codex": "codex login",
+               "grok": "grok login"}
+
+
+def _known_windows(provider: str) -> dict[str, dict]:
+    """label -> {used_percent, resets_at} from the provider's native local
+    source (codex session logs, the claude statusline cache); {} if none."""
+    wins: dict[str, dict] = {}
+    if provider == "codex":
+        rl = codex_usage()
+        if rl:
+            for key, label in (("primary", "5h"), ("secondary", "weekly")):
+                w = rl.get(key) or {}
+                if w.get("used_percent") is not None:
+                    wins[label] = {"used_percent": w["used_percent"],
+                                   "resets_at": w.get("resets_at")}
+    elif provider == "claude":
+        cu = claude_usage()
+        if cu:
+            for key, label in (("five_hour", "5h"), ("seven_day", "weekly")):
+                w = cu["rate_limits"].get(key) or {}
+                if isinstance(w, dict) and w.get("used_percentage") is not None:
+                    wins[label] = {"used_percent": w["used_percentage"],
+                                   "resets_at": w.get("resets_at")}
+    return wins
+
+
+def _probe_windows(provider: str) -> dict[str, dict]:
+    """Cached hidden-probe windows for a provider; {} when none."""
+    entry = load_probe_cache().get(provider)
+    if not isinstance(entry, dict):
+        return {}
+    wins = entry.get("windows")
+    return wins if isinstance(wins, dict) else {}
+
+
+def provider_has_usage_data(provider: str) -> bool:
+    """Any locally-known usage numbers: a native source or a cached
+    hidden-probe result."""
+    return bool(_known_windows(provider)) or bool(_probe_windows(provider))
+
+
+def _usage_summary(provider: str) -> str:
+    """One-line usage digest for a ready provider, e.g. '5h 23% · weekly
+    41% used'; '' when nothing is known."""
+    wins, src = _known_windows(provider), ""
+    if not wins:
+        wins, src = _probe_windows(provider), " (probe)"
+    parts = [f"{label} {w['used_percent']:.0f}%" for label, w in wins.items()
+             if isinstance(w, dict)
+             and isinstance(w.get("used_percent"), (int, float))]
+    return (" · ".join(parts) + " used" + src) if parts else ""
+
+
+def provider_state(provider: str) -> tuple[str, str]:
+    """(lattice state, note) for one provider — see the map above."""
+    has_data = provider_has_usage_data(provider)
+    if shutil.which(provider) is None:
+        return ("not installed",
+                "residual usage history found" if has_data else "")
+    auth, note = provider_auth_state(provider)
+    if auth == "unknown":
+        return "unknown", note
+    if auth == "signed-out":
+        return "locked out", note
+    return ("ready" if has_data else "quiet"), note
+
+
+# --------------------------------------------------------------------------
 # `teamctl models` — best-effort model discovery. Model ids always pass
 # through to the provider CLI verbatim (the CLI is the validator), so new
 # models work without updating teamctl; discovery only powers suggestions.
@@ -1582,39 +1764,35 @@ def _run_probes(which: str) -> int:
 
 
 def cmd_usage(args: argparse.Namespace) -> int:
-    """Real provider usage %/reset where the provider exposes it locally.
-    Also refreshes routing signals: a provider at 100% on its 5h window is
+    """Real provider usage %/reset where the provider exposes it locally,
+    gated by the provider state lattice — residual artifacts left by an
+    uninstalled CLI are flagged, never rendered as a live provider. Also
+    refreshes routing signals: a live provider at 100% on its 5h window is
     marked exhausted so `route` skips it until it resets."""
     if getattr(args, "probe", ""):
         rc = _run_probes(args.probe)
         if rc:
             return rc
     now = time.time()
-    rl = codex_usage()
-    codex = {}
-    if rl:
-        for key, label in (("primary", "5h"), ("secondary", "weekly")):
-            w = rl.get(key) or {}
-            if w.get("used_percent") is not None:
-                codex[label] = {"used_percent": w["used_percent"],
-                                "resets_at": w.get("resets_at")}
-        pw = rl.get("primary") or {}
-        if (pw.get("used_percent") or 0) >= 100 and (pw.get("resets_at") or 0) > now:
-            _record_provider_signal("codex", "exhausted",
-                                    resets_at=pw.get("resets_at"))
 
-    cu = claude_usage()
-    claude = {}
+    states = {prov: provider_state(prov) for prov in ROUTABLE}
+    live = {prov for prov, (st, _n) in states.items()
+            if st in ("ready", "quiet")}
+
+    codex = _known_windows("codex") if "codex" in live else {}
+    pw = codex.get("5h") or {}
+    if (pw.get("used_percent") or 0) >= 100 and (pw.get("resets_at") or 0) > now:
+        _record_provider_signal("codex", "exhausted",
+                                resets_at=pw.get("resets_at"))
+
+    claude = _known_windows("claude") if "claude" in live else {}
     claude_captured = None
-    if cu:
-        claude_captured = cu.get("captured_at")
-        for key, label in (("five_hour", "5h"), ("seven_day", "weekly")):
-            w = cu["rate_limits"].get(key) or {}
-            if isinstance(w, dict) and w.get("used_percentage") is not None:
-                claude[label] = {"used_percent": w["used_percentage"],
-                                 "resets_at": w.get("resets_at")}
-        fh = cu["rate_limits"].get("five_hour") or {}
-        if isinstance(fh, dict) and (fh.get("used_percentage") or 0) >= 100 \
+    if claude:
+        cu = claude_usage()
+        if cu:
+            claude_captured = cu.get("captured_at")
+        fh = claude.get("5h") or {}
+        if (fh.get("used_percent") or 0) >= 100 \
                 and (fh.get("resets_at") or 0) > now:
             _record_provider_signal("claude", "exhausted",
                                     resets_at=fh.get("resets_at"))
@@ -1632,6 +1810,8 @@ def cmd_usage(args: argparse.Namespace) -> int:
             "claude": claude_json,
             "grok": None,
             "probes": probes or None,
+            "states": {prov: {"state": st, "note": note or None}
+                       for prov, (st, note) in states.items()},
         }, indent=2))
         return 0
 
@@ -1640,28 +1820,43 @@ def cmd_usage(args: argparse.Namespace) -> int:
             return " — stale, consider `teamctl usage --probe`"
         return ""
 
+    native = {"codex": codex, "claude": claude}
     print(f"{'PROVIDER':<8}  USAGE")
-    if codex:
-        for label, w in codex.items():
-            print(f"{'codex':<8}  {label}: {w['used_percent']:.0f}% used, "
-                  f"resets {_fmt_reset(w['resets_at'], now)}")
-    else:
-        print(f"{'codex':<8}  no local usage data found")
-    if claude:
-        if isinstance(claude_captured, (int, float)):
-            age = _fmt_age(now - claude_captured) + _stale_note(now - claude_captured)
+    for prov in ROUTABLE:
+        state, note = states[prov]
+        if state == "not installed":
+            print(f"{prov:<8}  not installed"
+                  + (f" — {note}" if note else ""))
+            continue
+        if state == "locked out":
+            print(f"{prov:<8}  locked out — sign in: "
+                  f"`{LOGIN_HINTS.get(prov, prov + ' login')}`")
+            continue
+        if state == "unknown":
+            print(f"{prov:<8}  unknown — {note or 'auth state unreadable'}")
+            continue
+        wins = native.get(prov, {})
+        if wins:
+            for label, w in wins.items():
+                print(f"{prov:<8}  {label}: {w['used_percent']:.0f}% used, "
+                      f"resets {_fmt_reset(w['resets_at'], now)}")
+            if prov == "claude":
+                if isinstance(claude_captured, (int, float)):
+                    age = (_fmt_age(now - claude_captured)
+                           + _stale_note(now - claude_captured))
+                else:
+                    age = "age unknown"
+                print(f"{prov:<8}  (source: statusline cache, {age})")
+        elif state == "ready":       # numbers live in the probe cache below
+            print(f"{prov:<8}  ready — probe data below")
         else:
-            age = "age unknown"
-        for label, w in claude.items():
-            print(f"{'claude':<8}  {label}: {w['used_percent']:.0f}% used, "
-                  f"resets {_fmt_reset(w['resets_at'], now)}")
-        print(f"{'claude':<8}  (source: statusline cache, {age})")
-    else:
-        print(f"{'claude':<8}  no data yet — run any Claude Code turn with the "
-              "teamctl statusline installed (`teamctl init`)")
-    print(f"{'grok':<8}   no local usage data exposed (probe it: "
-          "`teamctl usage --probe grok`)")
+            print(f"{prov:<8}  quiet — signed in, no usage data yet "
+                  f"({WAKE_HINTS.get(prov, 'use it once')})")
 
+    # cached probe results — but never for an uninstalled provider (its
+    # residue is already flagged above, and it is not a live provider)
+    probes = {prov: entry for prov, entry in probes.items()
+              if states.get(prov, ("", ""))[0] != "not installed"}
     if probes:
         print(f"\n{'PROBE':<8}  (TUI-scraped, observed-only formats)")
         for prov in sorted(probes):
@@ -1682,40 +1877,48 @@ def cmd_usage(args: argparse.Namespace) -> int:
 
 
 def cmd_providers(args: argparse.Namespace) -> int:
-    cache = state_path().parent / "providers.json"
-    try:
-        cached = json.loads(cache.read_text()) if cache.exists() else {}
-    except (OSError, json.JSONDecodeError):
-        cached = {}
+    """One lattice state per provider (see provider_state), with usage
+    numbers on ready providers and cached credit/auth signals appended."""
+    cached = _cached_signals()
+    now = time.time()
 
-    rows = []
-    for prov in ("claude", "codex", "grok"):
-        installed = shutil.which(prov) is not None
-        authed = provider_authed(prov)
-        if not installed:
-            status = "not-installed"
-        elif not authed:
-            status = "not-authed"
-        else:
-            status = "available"
-            if prov == "grok" and not AUTH_PATHS["grok"].exists():
-                status += (" (inferred from ~/.grok CLI data; no auth.json "
-                           "— observed heuristic, verify with `grok models`)")
-        last = cached.get(prov, {})
-        sig = _live_signal(last)
-        if sig in ("exhausted", "auth-error"):
-            status = f"{sig} (last seen {last.get('at', '?')})"
-            ra = last.get("resets_at")
+    rows: list[tuple[str, str, str]] = []
+    for prov in ROUTABLE:
+        state, note = provider_state(prov)
+        details: list[str] = []
+        if state == "ready":
+            summary = _usage_summary(prov)
+            if summary:
+                details.append(summary)
+        elif state == "quiet":
+            details.append("signed in, no usage data yet — "
+                           + WAKE_HINTS.get(prov, "use it once"))
+        elif state == "locked out":
+            details.append("sign in: "
+                           f"`{LOGIN_HINTS.get(prov, prov + ' login')}`")
+        if note:
+            details.append(note if state == "not installed" else f"({note})")
+        sig_entry = cached.get(prov, {})
+        sig = _live_signal(sig_entry)
+        if state in ("ready", "quiet") and sig == "exhausted":
+            d = f"usage limit hit (last seen {sig_entry.get('at', '?')})"
+            ra = sig_entry.get("resets_at")
             if ra:
-                status += f", resets {_fmt_reset(ra, time.time())}"
-        rows.append((prov, status))
+                d += f", resets {_fmt_reset(ra, now)}"
+            details.append(d)
+        elif state in ("ready", "quiet") and sig == "auth-error":
+            details.append(f"auth error at last use "
+                           f"({sig_entry.get('at', '?')}) — it may have "
+                           "signed out; try it once")
+        rows.append((prov, state, " · ".join(details)))
 
     if args.json:
-        print(json.dumps({p: s for p, s in rows}, indent=2))
+        print(json.dumps({p: {"state": s, "detail": d or None}
+                          for p, s, d in rows}, indent=2))
         return 0
-    print(f"{'PROVIDER':<8}  STATUS")
-    for prov, status in rows:
-        print(f"{prov:<8}  {status}")
+    print(f"{'PROVIDER':<8}  STATE")
+    for prov, state, detail in rows:
+        print(f"{prov:<8}  {state}" + (f" — {detail}" if detail else ""))
     return 0
 
 
@@ -1735,8 +1938,9 @@ def route_select(requested: list[str] | None = None
     """Pick the best available provider.
 
     Returns (selected, preference, exclusions) where exclusions maps each
-    rejected candidate to a reason: unknown / not-installed / not-authed /
-    exhausted / auth-error. selected is None when no candidate survives.
+    rejected candidate to a reason: unknown / not installed / locked out /
+    auth unknown / exhausted / auth-error. selected is None when no
+    candidate survives.
     """
     candidates = requested if requested else list(ROUTABLE)
     cached = _cached_signals()
@@ -1747,10 +1951,12 @@ def route_select(requested: list[str] | None = None
             exclusions[prov] = "unknown"
             continue
         if shutil.which(prov) is None:
-            exclusions[prov] = "not-installed"
+            exclusions[prov] = "not installed"
             continue
-        if not provider_authed(prov):
-            exclusions[prov] = "not-authed"
+        auth = provider_auth_state(prov)[0]
+        if auth != "signed-in":
+            exclusions[prov] = ("locked out" if auth == "signed-out"
+                                else "auth unknown")
             continue
         signal = _live_signal(cached.get(prov))
         if signal in ("exhausted", "auth-error"):
@@ -1858,10 +2064,16 @@ def _toml_escape(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"')
 
 
-def _detect_providers() -> list[tuple[str, bool, bool]]:
-    """(provider, installed, authed) for every routable provider."""
-    return [(prov, shutil.which(prov) is not None, provider_authed(prov))
-            for prov in ROUTABLE]
+def _detect_providers() -> list[tuple[str, str]]:
+    """(provider, lattice state) for every routable provider. A provider is
+    usable for config/routing when signed in — state `quiet` or `ready`
+    (usage data changes the word, not the eligibility)."""
+    return [(prov, provider_state(prov)[0]) for prov in ROUTABLE]
+
+
+def _usable(rows: list[tuple[str, str]]) -> list[str]:
+    """The signed-in providers from a _detect_providers() listing."""
+    return [prov for prov, state in rows if state in ("quiet", "ready")]
 
 
 def _render_config(providers_cfg: dict[str, dict[str, str]], verbosity: str,
@@ -2298,8 +2510,7 @@ def _run_cockpit():
         locale.setlocale(locale.LC_ALL, "")
     except Exception:
         pass
-    ready = [p for p, installed, authed in _detect_providers()
-             if installed and authed]
+    ready = _usable(_detect_providers())
     discovered = {p: _model_choices(p) for p in ready}
     state = {
         "models": {p: "" for p in ready},
@@ -2470,13 +2681,11 @@ def _snap(value: str, allowed: tuple, default: str) -> str:
 
 def _plain_init(args: argparse.Namespace) -> int:
     rows = _detect_providers()
-    ready = sorted(p for p, installed, authed in rows if installed and authed)
+    ready = sorted(_usable(rows))
     print("teamctl init — plain path")
     print()
-    for prov, installed, authed in rows:
-        word = ("ready" if (installed and authed)
-                else ("locked out" if installed else "quiet"))
-        print(f"  {prov:<7} {word}")
+    for prov, state in rows:
+        print(f"  {prov:<7} {state}")
     print()
 
     models: dict[str, str] = {}
@@ -2536,7 +2745,7 @@ def _init_express(args: argparse.Namespace) -> int:
     config, print one frame (spec §3.3–3.8). `--yes` keeps its scripted
     contract: same writes, no chrome."""
     rows = _detect_providers()
-    ready = [p for p, installed, authed in rows if installed and authed]
+    ready = _usable(rows)
     providers_cfg = {p: {"model": "", "effort": "high"} for p in ready}
     preference = sorted(ready)
     changes: list[tuple[str, str]] = []
@@ -2549,16 +2758,18 @@ def _init_express(args: argparse.Namespace) -> int:
         return 0
 
     g = _out_glyphs()
-    word_role = {"ready": "ok", "quiet": "dim", "locked out": "warn"}
+    word_role = {"ready": "ok", "quiet": "soft", "locked out": "warn",
+                 "not installed": "dim", "unknown": "dim"}
     out = [""]
     out.append("            " + _fg("accent", "t e a m c t l"))
     out.append("         " + _fg("border", g["rule"] * 17))
     out.append("")
-    for prov, installed, authed in rows:
-        word = ("ready" if (installed and authed)
-                else ("locked out" if installed else "quiet"))
-        out.append("  " + _fg("dim", g["dot"]) + f" {prov:<12}"
-                   + _fg(word_role[word], word))
+    for prov, state in rows:
+        line = ("  " + _fg("dim", g["dot"]) + f" {prov:<12}"
+                + _fg(word_role.get(state, "dim"), state))
+        if state == "quiet":
+            line += _fg("dim", f" {g['dash']} signed in, wakes on first use")
+        out.append(line)
     out.append("")
     out.append("  " + _fg("primary", "defaults locked"))
     route_val = (_fg("primary", f" {g['chev']} ".join(preference))
@@ -2575,7 +2786,11 @@ def _init_express(args: argparse.Namespace) -> int:
         out.append("  " + _fg("dim", f"prior config {g['arrow']} "
                                      "config.toml.bak-teamctl"))
     if not ready:
-        out.append("  " + _fg("dim", "log a provider in, then re-run"))
+        if any(state == "locked out" for _p, state in rows):
+            out.append("  " + _fg("dim", "log a provider in, then re-run"))
+        else:
+            out.append("  " + _fg("dim",
+                                  "install a provider CLI, then re-run"))
     out.append("")
     out.append("  " + _fg("dim", f"customize {g['arrow']}  ")
                + _fg("soft", "teamctl init --custom"))

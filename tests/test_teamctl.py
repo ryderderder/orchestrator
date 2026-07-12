@@ -29,6 +29,44 @@ tc = importlib.util.module_from_spec(spec)
 loader.exec_module(tc)
 
 
+def seed_signin(home: Path, *providers: str) -> None:
+    """Write a provider's real signed-in artifact into a fixture HOME —
+    the exact shapes the auth probes were verified against on a live
+    signed-in install of each CLI."""
+    for p in providers:
+        if p == "claude":
+            (home / ".claude.json").write_text(json.dumps(
+                {"oauthAccount": {"emailAddress": "t@example.com"}}))
+        elif p == "codex":
+            (home / ".codex").mkdir(exist_ok=True)
+            (home / ".codex" / "auth.json").write_text(json.dumps(
+                {"auth_mode": "chatgpt", "OPENAI_API_KEY": None,
+                 "tokens": {"access_token": "t"}, "last_refresh": "now"}))
+        elif p == "grok":
+            (home / ".grok").mkdir(exist_ok=True)
+            (home / ".grok" / "auth.json").write_text(json.dumps(
+                {"https://auth.x.ai::u1": {"key": "k",
+                                           "refresh_token": "r"}}))
+
+
+class _AuthSandbox:
+    """Mixin: keep the real machine's auth out of HOME-sandboxed tests —
+    the keychain probe reads the *user's* keychain regardless of HOME, and
+    exported provider API keys count as signed in."""
+
+    def _isolate_auth(self):
+        os.environ["TEAMCTL_NO_KEYCHAIN"] = "1"
+        self._saved_env = {}
+        for var in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "XAI_API_KEY"):
+            self._saved_env[var] = os.environ.pop(var, None)
+
+    def _restore_auth(self):
+        os.environ.pop("TEAMCTL_NO_KEYCHAIN", None)
+        for var, val in self._saved_env.items():
+            if val is not None:
+                os.environ[var] = val
+
+
 class StateTests(unittest.TestCase):
     def setUp(self):
         self.tmp = HERE / ".test-state.json"
@@ -764,8 +802,8 @@ class TmuxMissingTests(unittest.TestCase):
 
 class RouteTests(unittest.TestCase):
     """Deterministic routing: availability is driven by monkeypatched which/
-    AUTH_PATHS/load_config plus a fake providers.json under a temp state dir.
-    All selection tests use --dry-run so no tmux is needed."""
+    provider_auth_state/load_config plus a fake providers.json under a temp
+    state dir. All selection tests use --dry-run so no tmux is needed."""
 
     def setUp(self):
         import tempfile
@@ -774,23 +812,21 @@ class RouteTests(unittest.TestCase):
         os.environ["TEAMCTL_STATE"] = str(self.dir / "state.json")
 
         self._which = tc.shutil.which
-        self._auth = tc.AUTH_PATHS
+        self._auth_state = tc.provider_auth_state
         self._config = tc.load_config
 
-        # default fixture: all three installed and authed, no cached signals
+        # default fixture: all three installed and signed in, no signals
         self.installed = {"claude", "codex", "grok"}
+        self.auth = {p: "signed-in" for p in ("claude", "codex", "grok")}
         tc.shutil.which = lambda name, *a, **k: (
             f"/fake/bin/{name}" if name in self.installed else None)
-        tc.AUTH_PATHS = {}
-        for prov in ("claude", "codex", "grok"):
-            p = self.dir / f"auth-{prov}"
-            p.write_text("x")
-            tc.AUTH_PATHS[prov] = p
+        tc.provider_auth_state = (
+            lambda p: (self.auth.get(p, "signed-out"), ""))
         tc.load_config = lambda: {}
 
     def tearDown(self):
         tc.shutil.which = self._which
-        tc.AUTH_PATHS = self._auth
+        tc.provider_auth_state = self._auth_state
         tc.load_config = self._config
         os.environ.pop("TEAMCTL_STATE", None)
         self.tmpdir.cleanup()
@@ -839,15 +875,24 @@ class RouteTests(unittest.TestCase):
         self.assertIn("route: selected grok", out)
 
     def test_all_excluded_fails_with_reasons(self):
-        self.installed.discard("claude")               # not-installed
-        tc.AUTH_PATHS["codex"].unlink()                # not-authed
+        self.installed.discard("claude")               # not installed
+        self.auth["codex"] = "signed-out"              # locked out
         self._write_signals({"grok": "exhausted"})     # exhausted
         rc, _, err = self._route()
         self.assertNotEqual(rc, 0)
         self.assertIn("no available provider", err)
-        self.assertIn("claude: not-installed", err)
-        self.assertIn("codex: not-authed", err)
+        self.assertIn("claude: not installed", err)
+        self.assertIn("codex: locked out", err)
         self.assertIn("grok: exhausted", err)
+
+    def test_unknown_auth_state_is_excluded_not_guessed(self):
+        # an unreadable auth artifact must exclude the provider with an
+        # honest reason — never silently count as signed in or out
+        self.auth["claude"] = "unknown"
+        rc, out, _ = self._route()
+        self.assertEqual(rc, 0)
+        self.assertIn("route: selected codex", out)
+        self.assertIn("claude: auth unknown", out)
 
     def test_dry_run_needs_no_tmux_and_prints_launch_line(self):
         saved = os.environ.pop("TMUX", None)
@@ -861,7 +906,269 @@ class RouteTests(unittest.TestCase):
                 os.environ["TMUX"] = saved
 
 
-class InitTests(unittest.TestCase):
+class _LatticeHome(_AuthSandbox, unittest.TestCase):
+    """Fixture HOME + pinned PATH detection for lattice tests."""
+
+    def setUp(self):
+        import tempfile
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.home = Path(self.tmpdir.name)
+        self._home_env = os.environ.get("HOME")
+        os.environ["HOME"] = str(self.home)
+        os.environ["TEAMCTL_STATE"] = str(self.home / "state.json")
+        self._isolate_auth()
+        self._which = tc.shutil.which
+        self.installed: set[str] = set()
+        tc.shutil.which = lambda name, *a, **k: (
+            f"/fake/bin/{name}" if name in self.installed else None)
+
+    def tearDown(self):
+        tc.shutil.which = self._which
+        self._restore_auth()
+        os.environ.pop("TEAMCTL_STATE", None)
+        if self._home_env is not None:
+            os.environ["HOME"] = self._home_env
+        self.tmpdir.cleanup()
+
+    def _run(self, *argv):
+        import contextlib
+        import io
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = tc.main(list(argv))
+        return rc, out.getvalue(), err.getvalue()
+
+    def _codex_rollout_with_usage(self):
+        """Real rollout-log shape: a token_count event with rate_limits."""
+        day = self.home / ".codex" / "sessions" / "2026" / "07" / "11"
+        day.mkdir(parents=True, exist_ok=True)
+        (day / "rollout-x.jsonl").write_text(json.dumps(
+            {"payload": {"rate_limits": {"primary": {
+                "used_percent": 12.0, "resets_at": 4102444800}}}}) + "\n")
+
+    def _claude_statusline_cache(self, pct=23.0):
+        import time as _t
+        (self.home / "claude-usage.json").write_text(json.dumps(
+            {"captured_at": _t.time(),
+             "rate_limits": {"five_hour": {"used_percentage": pct,
+                                           "resets_at": _t.time() + 3600}}}))
+
+
+class AuthProbeTests(_LatticeHome):
+    """Signed-in detection against fixture homes carrying each CLI's real
+    artifact shapes (verified 2026-07 on live signed-in installs of all
+    three CLIs; signed-out shapes verified against sandboxed homes)."""
+
+    # ---- claude ----
+    def test_claude_credentials_file_is_signed_in(self):
+        d = self.home / ".claude"
+        d.mkdir()
+        (d / ".credentials.json").write_text(json.dumps(
+            {"claudeAiOauth": {"accessToken": "t", "expiresAt": 1}}))
+        self.assertEqual(tc.provider_auth_state("claude")[0], "signed-in")
+
+    def test_claude_oauth_account_is_signed_in(self):
+        seed_signin(self.home, "claude")
+        self.assertEqual(tc.provider_auth_state("claude")[0], "signed-in")
+
+    def test_claude_state_file_without_account_is_signed_out(self):
+        # ~/.claude.json exists on every install (general app state); only
+        # its oauthAccount key means a login — bare existence must not
+        (self.home / ".claude.json").write_text(
+            json.dumps({"firstStartTime": "2026-01-01"}))
+        self.assertEqual(tc.provider_auth_state("claude")[0], "signed-out")
+
+    def test_claude_keychain_probe_counts(self):
+        kc = tc._keychain_signed_in
+        tc._keychain_signed_in = lambda: True
+        try:
+            self.assertEqual(tc.provider_auth_state("claude")[0],
+                             "signed-in")
+        finally:
+            tc._keychain_signed_in = kc
+
+    def test_claude_corrupt_artifact_is_unknown_not_a_guess(self):
+        (self.home / ".claude.json").write_text("{not json")
+        state, note = tc.provider_auth_state("claude")
+        self.assertEqual(state, "unknown")
+        self.assertIn("unreadable", note)
+
+    def test_env_api_key_counts_as_signed_in(self):
+        for prov, var in (("claude", "ANTHROPIC_API_KEY"),
+                          ("codex", "OPENAI_API_KEY"),
+                          ("grok", "XAI_API_KEY")):
+            os.environ[var] = "sk-test"
+            try:
+                self.assertEqual(tc.provider_auth_state(prov)[0],
+                                 "signed-in", prov)
+            finally:
+                os.environ.pop(var)
+
+    # ---- codex ----
+    def test_codex_tokens_mean_signed_in(self):
+        seed_signin(self.home, "codex")
+        self.assertEqual(tc.provider_auth_state("codex")[0], "signed-in")
+
+    def test_codex_logged_out_shapes_are_signed_out(self):
+        # missing file (codex logout clears credentials) ...
+        self.assertEqual(tc.provider_auth_state("codex")[0], "signed-out")
+        # ... and a credential-less file
+        (self.home / ".codex").mkdir()
+        (self.home / ".codex" / "auth.json").write_text(json.dumps(
+            {"auth_mode": "chatgpt", "OPENAI_API_KEY": None, "tokens": {}}))
+        self.assertEqual(tc.provider_auth_state("codex")[0], "signed-out")
+
+    def test_codex_api_key_in_auth_json_is_signed_in(self):
+        (self.home / ".codex").mkdir()
+        (self.home / ".codex" / "auth.json").write_text(json.dumps(
+            {"OPENAI_API_KEY": "sk-x", "tokens": {}}))
+        self.assertEqual(tc.provider_auth_state("codex")[0], "signed-in")
+
+    def test_codex_corrupt_auth_is_unknown(self):
+        (self.home / ".codex").mkdir()
+        (self.home / ".codex" / "auth.json").write_text("][")
+        self.assertEqual(tc.provider_auth_state("codex")[0], "unknown")
+
+    # ---- grok ----
+    def test_grok_credential_entry_is_signed_in(self):
+        seed_signin(self.home, "grok")
+        state, note = tc.provider_auth_state("grok")
+        self.assertEqual(state, "signed-in")
+        self.assertEqual(note, "")
+
+    def test_grok_empty_auth_json_is_not_login(self):
+        # `{}` holds no credentials (a logout can leave an empty file);
+        # only real CLI-use markers rescue it, and those are flagged
+        (self.home / ".grok").mkdir()
+        (self.home / ".grok" / "auth.json").write_text("{}")
+        self.assertEqual(tc.provider_auth_state("grok")[0], "signed-out")
+
+    def test_grok_markers_fallback_is_flagged_as_inferred(self):
+        (self.home / ".grok").mkdir()
+        (self.home / ".grok" / "sessions").mkdir()
+        state, note = tc.provider_auth_state("grok")
+        self.assertEqual(state, "signed-in")
+        self.assertIn("inferred", note)
+
+
+class ProviderStateTests(_LatticeHome):
+    """The four-state lattice, including the ghost-usage case: three
+    different truths must never share one ambiguous label again."""
+
+    def test_not_installed(self):
+        self.assertEqual(tc.provider_state("codex"), ("not installed", ""))
+
+    def test_ghost_usage_is_flagged_never_live(self):
+        # rollout artifacts but no CLI — the MacBook-Air ghost
+        self._codex_rollout_with_usage()
+        state, note = tc.provider_state("codex")
+        self.assertEqual(state, "not installed")
+        self.assertIn("residual usage history", note)
+
+    def test_locked_out(self):
+        self.installed.add("codex")
+        self.assertEqual(tc.provider_state("codex")[0], "locked out")
+
+    def test_quiet_signed_in_no_data(self):
+        self.installed.add("codex")
+        seed_signin(self.home, "codex")
+        self.assertEqual(tc.provider_state("codex")[0], "quiet")
+
+    def test_ready_with_native_data(self):
+        self.installed.add("codex")
+        seed_signin(self.home, "codex")
+        self._codex_rollout_with_usage()
+        self.assertEqual(tc.provider_state("codex")[0], "ready")
+
+    def test_ready_via_probe_cache(self):
+        self.installed.add("grok")
+        seed_signin(self.home, "grok")
+        (self.home / "probe-usage.json").write_text(json.dumps(
+            {"grok": {"captured_at": 1, "source": "probe",
+                      "windows": {"weekly": {"used_percent": 18.0}}}}))
+        self.assertEqual(tc.provider_state("grok")[0], "ready")
+
+    def test_unknown_auth_is_reported(self):
+        self.installed.add("codex")
+        (self.home / ".codex").mkdir()
+        (self.home / ".codex" / "auth.json").write_text("][")
+        self.assertEqual(tc.provider_state("codex")[0], "unknown")
+
+
+class LatticeRenderTests(_LatticeHome):
+    """`teamctl providers` and `teamctl usage` speak the lattice."""
+
+    def test_providers_full_lattice_rows(self):
+        self.installed |= {"claude", "codex"}
+        seed_signin(self.home, "claude")
+        self._claude_statusline_cache(pct=23.0)
+        rc, out, _ = self._run("providers")
+        self.assertEqual(rc, 0)
+        self.assertIn("ready — 5h 23% used", out)               # claude
+        self.assertIn("locked out — sign in: `codex login`", out)
+        self.assertIn("not installed", out)                     # grok
+
+    def test_providers_json_lattice(self):
+        self.installed |= {"claude", "grok"}
+        seed_signin(self.home, "claude", "grok")
+        rc, out, _ = self._run("providers", "--json")
+        self.assertEqual(rc, 0)
+        data = json.loads(out)
+        self.assertEqual(data["claude"]["state"], "quiet")
+        self.assertEqual(data["grok"]["state"], "quiet")
+        self.assertEqual(data["codex"]["state"], "not installed")
+
+    def test_providers_ghost_usage_parenthetical(self):
+        self._codex_rollout_with_usage()                # codex NOT installed
+        rc, out, _ = self._run("providers")
+        self.assertEqual(rc, 0)
+        self.assertIn("not installed — residual usage history found", out)
+
+    def test_providers_exhausted_signal_appended_to_live_provider(self):
+        import time as _t
+        self.installed.add("claude")
+        seed_signin(self.home, "claude")
+        (self.home / "providers.json").write_text(json.dumps(
+            {"claude": {"signal": "exhausted", "at": "2026-07-12T00:00:00",
+                        "resets_at": _t.time() + 3600}}))
+        rc, out, _ = self._run("providers")
+        self.assertEqual(rc, 0)
+        self.assertIn("quiet", out)
+        self.assertIn("usage limit hit", out)
+
+    def test_usage_ghost_codex_never_renders_as_live(self):
+        # the exact MacBook-Air confusion: rollouts + probe cache, no CLI
+        self._codex_rollout_with_usage()
+        (self.home / "probe-usage.json").write_text(json.dumps(
+            {"codex": {"captured_at": 1, "source": "probe",
+                       "windows": {"5h": {"used_percent": 44.0}}}}))
+        rc, out, _ = self._run("usage")
+        self.assertEqual(rc, 0)
+        self.assertIn("not installed — residual usage history found", out)
+        self.assertNotIn("44%", out)                    # ghost probe hidden
+        self.assertNotIn("12%", out)                    # ghost rollout hidden
+        rc, out, _ = self._run("usage", "--json")
+        data = json.loads(out)
+        self.assertIsNone(data["codex"])                # never a live provider
+        self.assertEqual(data["states"]["codex"]["state"], "not installed")
+        self.assertIn("residual", data["states"]["codex"]["note"])
+
+    def test_usage_quiet_provider_gets_wake_hint(self):
+        self.installed.add("grok")
+        seed_signin(self.home, "grok")
+        rc, out, _ = self._run("usage")
+        self.assertEqual(rc, 0)
+        self.assertIn("quiet — signed in, no usage data yet", out)
+        self.assertIn("teamctl usage --probe grok", out)
+
+    def test_usage_locked_out_provider_gets_login_hint(self):
+        self.installed.add("codex")
+        rc, out, _ = self._run("usage")
+        self.assertEqual(rc, 0)
+        self.assertIn("locked out — sign in: `codex login`", out)
+
+
+class InitTests(_AuthSandbox, unittest.TestCase):
     """`teamctl init` (express) and `init --custom` (rich wizard, exercised
     through its scripted line-prompt fallback: redirected stdio is not a
     tty, so the curses path degrades exactly as documented), run entirely
@@ -873,24 +1180,23 @@ class InitTests(unittest.TestCase):
         self.home = Path(self.tmpdir.name)
         self._home_env = os.environ.get("HOME")
         os.environ["HOME"] = str(self.home)
+        os.environ["TEAMCTL_STATE"] = str(self.home / "state.json")
+        self._isolate_auth()
 
         self._which = tc.shutil.which
-        self._auth = tc.AUTH_PATHS
         self._input = tc._input
 
-        # fixture: only claude is installed and authed
+        # fixture: only claude is installed and signed in (real artifact
+        # shape, exercising the real probe against the throwaway HOME)
         tc.shutil.which = lambda name, *a, **k: (
             "/fake/bin/claude" if name == "claude" else None)
-        auth = self.home / "auth-claude"
-        auth.write_text("x")
-        tc.AUTH_PATHS = {"claude": auth,
-                         "codex": self.home / "no-codex-auth",
-                         "grok": self.home / "no-grok-auth"}
+        seed_signin(self.home, "claude")
 
     def tearDown(self):
         tc.shutil.which = self._which
-        tc.AUTH_PATHS = self._auth
         tc._input = self._input
+        self._restore_auth()
+        os.environ.pop("TEAMCTL_STATE", None)
         if self._home_env is not None:
             os.environ["HOME"] = self._home_env
         self.tmpdir.cleanup()
@@ -938,10 +1244,14 @@ class InitTests(unittest.TestCase):
         self.assertEqual(cfg["lead"]["delegation"], "ask")
         self.assertEqual(cfg["routing"]["preference"], ["claude"])
         self.assertEqual(cfg["providers"]["claude"]["effort"], "high")
-        # spec §3: wordmark + status words + defaults block + one hint
+        # spec §3 (v0.4 lattice): wordmark + status words + defaults block
         self.assertIn("t e a m c t l", out)
-        self.assertIn("ready", out)                     # claude
-        self.assertIn("quiet", out)                     # codex/grok stubs
+        # claude is signed in with no usage data yet -> quiet, with the
+        # inline wake hint (the fresh-machine shape that read as breakage)
+        self.assertIn("quiet", out)
+        self.assertIn("wakes on first use", out)
+        self.assertIn("not installed", out)             # codex/grok: honest
+        self.assertNotIn("locked out", out)             # absent != signed out
         self.assertIn("defaults locked", out)
         self.assertIn("customize", out)
         self.assertIn("teamctl init --custom", out)
@@ -949,11 +1259,23 @@ class InitTests(unittest.TestCase):
         lines = out.rstrip("\n").split("\n")
         self.assertTrue(12 <= len(lines) <= 18, f"{len(lines)} lines")
 
+    def test_express_frame_locked_out_provider(self):
+        # installed but signed out -> "locked out", never offered a route
+        tc.shutil.which = lambda name, *a, **k: f"/fake/bin/{name}"
+        (self.home / ".claude.json").unlink()           # claude signs out
+        rc, out = self._run_init(None)
+        self.assertEqual(rc, 0)
+        self.assertIn("locked out", out)                # all three
+        self.assertIn("log a provider in, then re-run", out)
+        cfg = self._config()
+        self.assertNotIn("routing", cfg)                # nothing usable
+        self.assertNotIn("providers", cfg)
+
     def test_express_frame_none_ready(self):
         tc.shutil.which = lambda name, *a, **k: None    # nothing installed
         rc, out = self._run_init(None)
         self.assertEqual(rc, 0)
-        self.assertIn("log a provider in, then re-run", out)
+        self.assertIn("install a provider CLI, then re-run", out)
         cfg = self._config()
         self.assertNotIn("routing", cfg)                # no route to lock
         self.assertEqual(cfg["lead"]["delegation"], "ask")
@@ -1633,7 +1955,7 @@ class CursesLiveTests(unittest.TestCase):
         root = Path(self.tmpdir.name)
         self.home = root / "home"
         self.home.mkdir()
-        (self.home / ".claude.json").write_text("{}")   # claude "logged in"
+        seed_signin(self.home, "claude")                # claude signed in
         fakebin = root / "bin"
         fakebin.mkdir()
         stub = fakebin / "claude"                        # claude "installed"
@@ -1665,8 +1987,11 @@ class CursesLiveTests(unittest.TestCase):
         self.fail(f"never saw {needle!r}; last capture:\n{self._capture()}")
 
     def _start(self, teamctl_args: str) -> None:
+        # TEAMCTL_NO_KEYCHAIN: the keychain probe reads the *user's*
+        # keychain regardless of HOME — keep the host's real login out
         cmd = (f"env HOME={shlex.quote(str(self.home))} "
                f"PATH={shlex.quote(self.path)} "
+               f"TEAMCTL_NO_KEYCHAIN=1 "
                f"TEAMCTL_STATE={shlex.quote(str(self.home / 'state.json'))} "
                f"{shlex.quote(sys.executable)} {shlex.quote(str(TEAMCTL))} "
                f"{teamctl_args}; sleep 30")

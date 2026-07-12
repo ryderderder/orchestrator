@@ -20,7 +20,8 @@ HERE = Path(__file__).resolve().parent
 INSTALL_SH = HERE.parent / "install.sh"
 
 # real tools the installer needs even in the sandbox
-REAL_TOOLS = ("bash", "sh", "mkdir", "cp", "chmod", "dirname", "cat", "id")
+REAL_TOOLS = ("bash", "sh", "mkdir", "cp", "chmod", "dirname", "cat", "id",
+              "sed", "tail", "head", "date")
 
 
 @unittest.skipUnless(shutil.which("bash"), "requires bash")
@@ -203,6 +204,34 @@ class InstallShTestCase(unittest.TestCase):
         r = self.run_install("--bogus")
         self.assertEqual(r.returncode, 2)
         self.assertIn("unknown option", r.stderr)
+
+    # ---- provider detection screen ------------------------------------------
+
+    def test_provider_screen_lattice_and_hints_when_none_installed(self):
+        self.fake_uname("Darwin")
+        r = self.run_install("--no-init", answers="")
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("providers:", r.stdout)
+        # teamctl's own lattice renders each provider honestly
+        self.assertIn("not installed", r.stdout)
+        self.assertIn("no provider CLI found", r.stdout)
+        for url in ("claude.ai/install.sh", "chatgpt.com/codex/install.sh",
+                    "x.ai/cli/install.sh"):
+            self.assertIn(url, r.stdout)
+
+    def test_installed_provider_is_never_offered(self):
+        # an installed-but-signed-out CLI shows as locked out — its install
+        # one-liner must NOT be printed; missing ones keep theirs
+        self.fake_uname("Darwin")
+        self.fake("claude", "exit 0")                   # claude on PATH
+        r = self.run_install("--no-init", answers="")
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("locked out", r.stdout)           # installed, no login
+        self.assertNotIn("claude.ai/install.sh", r.stdout)
+        self.assertIn("add more providers", r.stdout)
+        self.assertIn("chatgpt.com/codex/install.sh", r.stdout)
+        self.assertIn("x.ai/cli/install.sh", r.stdout)
+        self.assertNotIn("no provider CLI found", r.stdout)
 
     # ---- tmux + init bootstrap ---------------------------------------------
 

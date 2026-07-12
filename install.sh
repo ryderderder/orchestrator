@@ -219,23 +219,73 @@ if [ ${#MISSING[@]} -gt 0 ]; then
 fi
 
 # ---- provider CLIs: never auto-installed, one-liners printed instead -------
-HAVE_PROVIDER=0
-for p in claude codex grok; do
-  command -v "$p" >/dev/null 2>&1 && HAVE_PROVIDER=1
-done
-if [ "$HAVE_PROVIDER" = 0 ]; then
-  cat <<'EOF'
+# Detection is per provider and never offers one that is already installed:
+# installed CLIs get their real state (ready / quiet / locked out) from
+# teamctl itself; missing ones get their official install one-liner.
+install_hint() {
+  case "$1" in
+    claude)
+      echo "    Claude Code:  curl -fsSL https://claude.ai/install.sh | bash"
+      echo "                  (docs: https://code.claude.com/docs/en/setup)"
+      ;;
+    codex)
+      echo "    Codex CLI:    curl -fsSL https://chatgpt.com/codex/install.sh | sh"
+      echo "                  (docs: https://github.com/openai/codex)"
+      ;;
+    grok)
+      echo "    Grok CLI:     curl -fsSL https://x.ai/cli/install.sh | bash"
+      echo "                  (docs: https://docs.x.ai)"
+      ;;
+  esac
+}
 
-no provider CLI found (claude / codex / grok). teamctl needs at least one.
-Their installers change, so install from the official sources yourself:
-  Claude Code:  curl -fsSL https://claude.ai/install.sh | bash
-                (docs: https://code.claude.com/docs/en/setup)
-  Codex CLI:    curl -fsSL https://chatgpt.com/codex/install.sh | sh
-                (docs: https://github.com/openai/codex)
-  Grok CLI:     curl -fsSL https://x.ai/cli/install.sh | bash
-                (docs: https://docs.x.ai)
-then log in with the CLI once, and re-run `teamctl init`.
-EOF
+HAVE_PROVIDER=0
+MISSING_PROVIDERS=()
+for p in claude codex grok; do
+  if command -v "$p" >/dev/null 2>&1; then
+    HAVE_PROVIDER=1
+  else
+    MISSING_PROVIDERS+=("$p")
+  fi
+done
+
+provider_found_lines() { # PATH-only fallback when teamctl cannot run yet
+  for p in claude codex grok; do
+    if command -v "$p" >/dev/null 2>&1; then
+      echo "  $p    found"
+    else
+      echo "  $p    not installed"
+    fi
+  done
+}
+
+echo
+echo "providers:"
+# teamctl's own state lattice: ready / quiet / locked out / not installed
+STATE_LINES=""
+if python_ok; then
+  STATE_LINES="$("$BIN_DIR/teamctl" providers 2>/dev/null | tail -n +2)" ||
+    STATE_LINES=""
+fi
+if [ -n "$STATE_LINES" ]; then
+  printf '%s\n' "$STATE_LINES" | sed 's/^/  /'
+else
+  provider_found_lines
+fi
+
+if [ ${#MISSING_PROVIDERS[@]} -gt 0 ]; then
+  if [ "$HAVE_PROVIDER" = 0 ]; then
+    echo
+    echo "no provider CLI found (claude / codex / grok). teamctl needs at least one."
+    echo "Their installers change, so install from the official sources yourself:"
+  else
+    echo
+    echo "  add more providers any time (official installers):"
+  fi
+  for p in "${MISSING_PROVIDERS[@]}"; do
+    install_hint "$p"
+  done
+  echo "  then sign the CLI in once, and re-run \`teamctl init\`."
 fi
 
 case ":$PATH:" in

@@ -110,8 +110,18 @@ class UsageClaudeCacheTests(unittest.TestCase):
         self.tmpdir = tempfile.TemporaryDirectory()
         self.dir = Path(self.tmpdir.name)
         os.environ["TEAMCTL_STATE"] = str(self.dir / "state.json")
+        # pin the lattice inputs: claude installed and signed in, the other
+        # CLIs absent — `usage` output must not depend on the host machine
+        self._which = tc.shutil.which
+        self._auth_state = tc.provider_auth_state
+        tc.shutil.which = lambda name, *a, **k: (
+            "/fake/bin/claude" if name == "claude" else None)
+        tc.provider_auth_state = lambda p: (
+            ("signed-in", "") if p == "claude" else ("signed-out", ""))
 
     def tearDown(self):
+        tc.shutil.which = self._which
+        tc.provider_auth_state = self._auth_state
         os.environ.pop("TEAMCTL_STATE", None)
         self.tmpdir.cleanup()
 
@@ -152,9 +162,10 @@ class UsageClaudeCacheTests(unittest.TestCase):
         self.assertIn("1m ago", out)
 
     def test_usage_text_no_data_message(self):
+        # signed in with no usage data = quiet, with the wake hint
         rc, out, _ = self._usage()
         self.assertEqual(rc, 0)
-        self.assertIn("no data yet", out)
+        self.assertIn("quiet — signed in, no usage data yet", out)
         self.assertIn("statusline", out)
 
     def test_claude_exhaustion_records_routing_signal(self):
