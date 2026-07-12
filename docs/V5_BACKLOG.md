@@ -49,3 +49,16 @@ Ranked by value ÷ effort. All competitor claims verified against live repos/doc
   the express frame (`TEAMCTL_PATH_NOTE`), and the installer offers to append it to the shell profile.
 - Auth-state lattice unifies vocabulary across init frame AND `providers`; real-auth probes
   (not `~/.claude.json` presence, which exists pre-login).
+
+## Go-public checklist (do BEFORE flipping the repo public)
+- **Ask GitHub Support to purge unreachable pre-scrub objects.** The 2026-07-12
+  history rewrite (AI-attribution trailers + root-commit author normalization)
+  cleaned every clonable ref, but GitHub still holds `refs/pull/1/*` server-side,
+  pinning the pre-scrub commits — closing or deleting the PR does NOT remove it;
+  only GitHub's own GC/Support purge can. Verify afterwards with an explicit
+  `git fetch origin '+refs/pull/*:refs/remotes/pr/*'` + trailer/identity grep.
+- Re-run the fresh-clone verification one last time at flip time: trailer grep 0
+  across --all, identities only `ryderderder <ryder.wolf@pm.me>`, contributors
+  API only ryderderder, CI green.
+- Render + embed the launch GIFs (demo-v2, install-v2) and set the social-preview
+  still per the gif-placement plan.
