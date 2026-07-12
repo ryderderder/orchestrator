@@ -119,9 +119,33 @@ class InstallShTestCase(unittest.TestCase):
         self.fake_pm("brew", creates={"tmux": "tmux"})
         r = self.run_install(answers="y\n")
         self.assertEqual(r.returncode, 0)
-        self.assertIn("Install tmux via brew?", r.stderr)   # the actual prompt
+        # tmux is a hard requirement -> its prompt defaults to YES
+        self.assertIn("Install tmux via brew? [Y/n]", r.stderr)
         self.assertIn("brew install tmux", self.pm_log())
         self.assertNotIn("still missing", r.stdout)
+        # with tmux now present the installer heads into the tmux bootstrap
+        self.assertIn("entering tmux", r.stdout)
+
+    def test_blank_answer_defaults_to_installing_tmux(self):
+        self.fake_uname("Darwin")
+        self.fake_pm("brew", creates={"tmux": "tmux"})
+        r = self.run_install(answers="\n")                  # just press Enter
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("brew install tmux", self.pm_log())
+
+    def test_python3_prompt_still_defaults_to_no(self):
+        self.fake_uname("Darwin")
+        real_tmux = shutil.which("tmux")
+        if real_tmux:
+            (self.fakebin / "tmux").symlink_to(real_tmux)   # tmux not missing
+        self.fake("python3", "exit 1")                      # fails 3.11 probe
+        self.fake_pm("brew", creates={"python": "python3"})
+        # --no-init: tmux is real here and the bootstrap would exec into it
+        r = self.run_install("--no-init", answers="\n")
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("Install python3 via brew? [y/N]", r.stderr)
+        self.assertEqual(self.pm_log(), "")                 # blank means NO
+        self.assertIn("still missing: python3", r.stdout)
 
     def test_declining_offer_runs_nothing_and_hints(self):
         self.fake_uname("Darwin")
@@ -179,6 +203,106 @@ class InstallShTestCase(unittest.TestCase):
         r = self.run_install("--bogus")
         self.assertEqual(r.returncode, 2)
         self.assertIn("unknown option", r.stderr)
+
+    # ---- tmux + init bootstrap ---------------------------------------------
+
+    def test_no_tmux_prints_copy_paste_bootstrap(self):
+        self.fake_uname("Darwin")                           # no pkg mgr, no tmux
+        r = self.run_install(answers="")
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("tmux new-session -A -s teamctl", r.stdout)
+
+    def test_no_init_skips_bootstrap(self):
+        self.fake_uname("Darwin")
+        r = self.run_install("--no-init", answers="")
+        self.assertEqual(r.returncode, 0)
+        self.assertNotIn("new-session", r.stdout)
+        self.assertIn("teamctl init' any time", r.stdout)
+
+    def test_already_inside_tmux_runs_init_directly(self):
+        self.fake_uname("Darwin")
+        real_tmux = shutil.which("tmux")
+        if real_tmux:
+            (self.fakebin / "tmux").symlink_to(real_tmux)
+        r = self.run_install(answers="", env_extra={"TMUX": "/fake/sock,1,0"})
+        self.assertEqual(r.returncode, 0)
+        # TEAMCTL_TTY is not /dev/tty -> the wizard ran non-interactively
+        cfg = self.home / ".config" / "agent-team" / "config.toml"
+        self.assertTrue(cfg.exists(), r.stdout + r.stderr)
+
+    def test_outside_tmux_execs_new_session_bootstrap(self):
+        self.fake_uname("Darwin")
+        self.fake("tmux", f'echo "tmux $*" >> "{self.log}"')
+        r = self.run_install(answers="")
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("entering tmux", r.stdout)
+        log = self.pm_log()
+        self.assertIn("tmux new-session -A -s teamctl", log)
+        self.assertIn("teamctl init", log)
+
+
+@unittest.skipUnless(shutil.which("bash") and shutil.which("tmux"),
+                     "requires bash and tmux")
+class TmuxHandoffTests(unittest.TestCase):
+    """Prove the installer's exec form works in the curl|bash shape: stdin is
+    a PIPE, only the controlling terminal (/dev/tty) is real, and
+    `tmux new-session -A ... < /dev/tty` must still attach and run."""
+
+    def test_piped_stdin_attach_via_dev_tty(self):
+        import fcntl
+        import pty
+        import shlex
+        import termios
+        import threading
+
+        real_tmux = shutil.which("tmux")
+        sock = f"tchandoff{os.getpid()}"
+        with tempfile.TemporaryDirectory() as td:
+            marker = Path(td) / "attached-ok"
+            # the exact shape install.sh uses: resolve the device from fd 2
+            # (tmux refuses a literal /dev/tty as its client terminal)
+            script = ('TTYDEV="$(tty 0<&2 2>/dev/null)" || TTYDEV=""; '
+                      f"exec {shlex.quote(real_tmux)} -L {sock} "
+                      f"new-session -A -s teamctl "
+                      f"{shlex.quote('touch ' + shlex.quote(str(marker)))} "
+                      '< "$TTYDEV"')
+            master, slave = pty.openpty()
+
+            def preexec():
+                os.setsid()
+                fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
+
+            env = {"PATH": os.environ.get("PATH", ""), "HOME": td,
+                   "TERM": "xterm-256color"}   # no TMUX: outside-tmux shape
+            try:
+                p = subprocess.Popen(
+                    ["bash", "-c", script], stdin=subprocess.PIPE,
+                    stdout=slave, stderr=slave, env=env,
+                    preexec_fn=preexec, pass_fds=(slave,), close_fds=True)
+                os.close(slave)
+
+                def drain():   # keep the pty from blocking the tmux client
+                    try:
+                        while os.read(master, 4096):
+                            pass
+                    except OSError:
+                        pass
+                t = threading.Thread(target=drain, daemon=True)
+                t.start()
+                p.stdin.close()
+                rc = p.wait(timeout=30)
+                deadline = 20
+                while not marker.exists() and deadline > 0:
+                    import time
+                    time.sleep(0.25)
+                    deadline -= 1
+                self.assertEqual(rc, 0)
+                self.assertTrue(marker.exists(),
+                                "tmux session command never ran")
+            finally:
+                os.close(master)
+                subprocess.run([real_tmux, "-L", sock, "kill-server"],
+                               capture_output=True)
 
 
 if __name__ == "__main__":

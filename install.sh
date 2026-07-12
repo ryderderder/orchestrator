@@ -5,9 +5,14 @@
 # From a checkout:   ./install.sh
 # One-liner:         curl -fsSL https://raw.githubusercontent.com/ryderderder/teamctl/main/install.sh | bash
 #
+# Default flow on an interactive terminal: install, offer to install missing
+# dependencies (tmux defaults to yes — it is a hard requirement), then enter
+# a tmux session and start the `teamctl init` wizard, leaving you inside a
+# working setup.
+#
 # Options:
-#   --init      run `teamctl init` after installing (no prompt)
-#   --no-init   skip the `teamctl init` offer
+#   --no-init   skip the wizard/tmux bootstrap at the end
+#   --init      kept for compatibility (the wizard now runs by default)
 #   --no-deps   skip dependency detection and install offers
 #
 # The installer never runs a package manager without asking first, and says
@@ -36,7 +41,7 @@ EOF
     ;;
 esac
 
-RUN_INIT="ask"
+RUN_INIT="yes"
 SKIP_DEPS=0
 for arg in "$@"; do
   case "$arg" in
@@ -59,13 +64,19 @@ if { exec 3< "$TTY_IN"; } 2>/dev/null; then
   HAVE_TTY=1
 fi
 
-ask_yn() { # ask_yn "question " -> 0 = yes. Default (blank/EOF/no tty) = no.
-  local ans
+ask_yn() { # ask_yn "question " [yes] -> 0 = yes. Blank/EOF -> the default
+  # ("yes" if given, else no). No tty at all -> ALWAYS no, whatever the
+  # default: nothing is installed without a terminal to ask on.
+  local ans def="${2:-no}"
   [ "$HAVE_TTY" = 1 ] || return 1
   printf "%s" "$1" >&2
-  read -r ans <&3 || return 1
+  if ! read -r ans <&3; then
+    ans=""
+  fi
   case "$ans" in
     y | Y | yes | YES) return 0 ;;
+    n | N | no | NO) return 1 ;;
+    "") [ "$def" = yes ] ;;
     *) return 1 ;;
   esac
 }
@@ -175,7 +186,13 @@ if [ ${#MISSING[@]} -gt 0 ]; then
       TO_INSTALL=("${MISSING[@]}")
     else
       for dep in "${MISSING[@]}"; do
-        if ask_yn "Install $dep via $PKG_MGR? [y/N] "; then
+        # tmux is a hard requirement, so its prompt defaults to YES;
+        # everything else stays an explicit opt-in.
+        if [ "$dep" = tmux ]; then
+          if ask_yn "Install tmux via $PKG_MGR? [Y/n] " yes; then
+            TO_INSTALL+=("$dep")
+          fi
+        elif ask_yn "Install $dep via $PKG_MGR? [y/N] "; then
           TO_INSTALL+=("$dep")
         fi
       done
@@ -226,20 +243,39 @@ case ":$PATH:" in
     ;;
 esac
 
-# ---- offer the onboarding wizard -------------------------------------------
-if [ "$RUN_INIT" = "ask" ]; then
-  RUN_INIT="no"
-  if ask_yn "Run 'teamctl init' (onboarding wizard) now? [y/N] "; then
-    RUN_INIT="yes"
-  fi
-fi
-
-if [ "$RUN_INIT" = "yes" ]; then
+# ---- bootstrap: land the user inside tmux with the wizard running ----------
+# Default flow (opt out with --no-init): if we're already inside tmux, run
+# the wizard here; otherwise enter (or create) a 'teamctl' tmux session and
+# run the wizard inside it. `< "$TTY_IN"` matters: under curl|bash stdin is
+# the pipe, and tmux needs the real terminal.
+TEAMCTL_Q="$(printf "%q" "$BIN_DIR/teamctl")"
+BOOTSTRAP_CMD="$TEAMCTL_Q init; exec \${SHELL:-/bin/sh}"
+if [ "$RUN_INIT" = "no" ]; then
+  echo "done. Run '$BIN_DIR/teamctl init' any time to configure defaults."
+elif [ -n "${TMUX:-}" ]; then
+  # already inside tmux: run the wizard right here
   if [ "$HAVE_TTY" = 1 ] && [ "$TTY_IN" = /dev/tty ]; then
     "$BIN_DIR/teamctl" init < /dev/tty
   else
     "$BIN_DIR/teamctl" init --yes
   fi
+elif command -v tmux >/dev/null 2>&1 && [ "$HAVE_TTY" = 1 ]; then
+  # tmux refuses a literal /dev/tty as its client terminal ("can't use
+  # /dev/tty"), so resolve the concrete device from stderr — still the real
+  # terminal under curl|bash. With TEAMCTL_TTY set (tests), use it as-is.
+  if [ "$TTY_IN" != /dev/tty ]; then
+    TTYDEV="$TTY_IN"
+  else
+    TTYDEV="$(tty 0<&2 2>/dev/null)" || TTYDEV=""
+  fi
+  if [ -n "$TTYDEV" ] && [ -e "$TTYDEV" ]; then
+    echo "entering tmux (session 'teamctl') and starting the setup wizard…"
+    exec tmux new-session -A -s teamctl "$BOOTSTRAP_CMD" < "$TTYDEV"
+  else
+    echo "could not find your terminal device; finish setup with:"
+    echo "  tmux new-session -A -s teamctl '$BIN_DIR/teamctl init; exec \$SHELL'"
+  fi
 else
-  echo "done. Run '$BIN_DIR/teamctl init' any time to configure defaults."
+  echo "finish setup once you have a terminal and tmux:"
+  echo "  tmux new-session -A -s teamctl '$BIN_DIR/teamctl init; exec \$SHELL'"
 fi
