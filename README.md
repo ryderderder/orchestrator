@@ -1,14 +1,39 @@
 # teamctl
 
 **teamctl** turns a tmux window into an AI agent team: a *lead* agent (or you)
-in the left pane manages *teammates* — Claude Code, Codex, or Grok CLI
-sessions — as tmux panes tiled in a square grid to the right. It spawns
-interactive teammates, dispatches headless tasks and reads their results back
-as JSON, routes work to whichever provider is currently available, tracks real
-usage where providers expose it, and tears teammates down cleanly
-(process-tree-verified, no orphans). Single-file Python, stdlib only.
+in the left pane manages *teammates* — Claude Code, Codex, Grok, or Gemini
+CLI sessions, or any CLI you teach it via a custom-provider block — as tmux
+panes tiled in a square grid to the right. It spawns interactive teammates,
+dispatches headless tasks and reads their results back as JSON, gives every
+teammate its own **git worktree** (parallel writers physically cannot
+collide) with a one-command **land** step to merge the work back, routes
+work to the subscription with the **most quota left**, detects which
+teammate is busy / blocked on an approval / idle, resurrects the roster
+after a reboot, and tears teammates down cleanly (process-tree-verified, no
+orphans, no stranded work). Single-file Python, stdlib only.
 
 ## Install
+
+**Tell your agent to install it — paste this** into any AI coding CLI
+(also in [docs/INSTALL_PROMPT.md](docs/INSTALL_PROMPT.md)):
+
+```text
+Install teamctl for me — https://github.com/ryderderder/teamctl
+(it runs AI teammates — Claude Code / Codex / Grok / Gemini CLIs — as tmux panes).
+
+1. Orient first — read these from the repo (main branch):
+   README.md · docs/AGENT_GUIDE.md · llms.txt
+2. Install:
+   curl -fsSL https://raw.githubusercontent.com/ryderderder/teamctl/main/install.sh | bash -s -- --no-init
+   Essentials: ask me before anything that needs sudo; never install a
+   provider CLI without asking; make sure ~/.local/bin is on my PATH.
+3. Configure: run `teamctl init` (zero questions) and show me its summary.
+4. Verify: run `teamctl doctor` and show me the output.
+5. Tell me my controls: `teamctl settings` · `teamctl lead on|off|status` ·
+   `teamctl uninstall` (run `teamctl lead off` first).
+```
+
+Or run the one-liner yourself:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/ryderderder/teamctl/main/install.sh | bash
@@ -39,54 +64,45 @@ providers):
 
 ![Demo: a lead tmux pane runs teamctl usage and route --dry-run, spawns code-reviewer and researcher panes and dispatches an analyst task, each pane labeled with its role and model, then reads the analyst's JSON result back with result --wait and shuts all three down, ending with an empty teammate list](docs/assets/demo.gif)
 
-### Install via your AI agent — paste this prompt
-
-Prefer to have an agent set everything up? Paste this into any AI coding
-CLI (also in [docs/INSTALL_PROMPT.md](docs/INSTALL_PROMPT.md)):
-
-```text
-Install teamctl (https://github.com/ryderderder/teamctl) for me — it manages
-AI teammates (Claude Code / Codex / Grok CLIs) as tmux panes. Do all of the
-following, in order:
-
-1. Run the installer:
-     curl -fsSL https://raw.githubusercontent.com/ryderderder/teamctl/main/install.sh | bash -s -- --no-init
-   (--no-init because you are driving the setup yourself; without it the
-   installer enters tmux and runs the express setup). If it reports missing
-   dependencies (tmux, or python3 older than 3.11), install them with the
-   system package manager (ask me before anything that needs sudo). If it
-   reports no provider CLI, show me the official install one-liners it
-   prints and ask which (if any) to run. Make sure ~/.local/bin is on my
-   PATH; fix my shell profile if not.
-
-2. Configure it: run `teamctl init` (the express setup — zero questions;
-   it detects providers, writes sane defaults, and prints a compact
-   summary). Show me that summary, and tell me I can run
-   `teamctl init --custom` (rich arrow-key wizard) or
-   `teamctl settings` any time to change it. Express uses the
-   detected provider order for routing; if I want a different order, set
-   it with `teamctl config routing.preference ...` — never pick it for me.
-
-3. Offer me lead mode: explain that `teamctl lead on` installs a manager
-   identity into every detected agent CLI's global instructions file
-   (plus a skill and a recommended per-prompt reminder hook for Claude
-   Code — mechanisms the other CLIs don't have), all reversible with
-   `teamctl lead off`. Run it if I say yes.
-
-4. Verify your work: run `teamctl --version`, `teamctl providers`, and
-   `teamctl models`, and show me the output.
-
-5. Report what you did, what you skipped and why, and finish by telling me
-   my controls:
-     - from the shell: `teamctl settings` (or `teamctl config --menu`) to
-       adjust preferences, `teamctl lead on|off|status` for the lead
-       identity, `teamctl uninstall` (run `teamctl lead off` first) to
-       undo everything.
-     - from a chat: with lead mode on, I can just say "open the teamctl
-       menu" to any lead agent and it will present and apply my settings.
-```
-
 [![ci](https://github.com/ryderderder/teamctl/actions/workflows/ci.yml/badge.svg)](https://github.com/ryderderder/teamctl/actions/workflows/ci.yml)
+
+## What's new in v0.5.0
+
+**More providers, safer parallelism, smarter routing** — and four
+behavior changes worth knowing before you upgrade:
+
+1. **Routing picks by headroom now.** `route` (and provider defaults)
+   rank the *usable* providers by remaining quota instead of strict list
+   order — your preference order only breaks ties. Nothing previously
+   excluded can ever be selected; only the order among survivors changes.
+   Want the old behavior? One line: `teamctl config routing.strategy
+   preference`.
+2. **Worktree isolation is ON by default.** `spawn`/`dispatch`/`route`
+   inside a git repo now give the teammate its own branch
+   (`teamctl/<role>`) in its own worktree under the state dir. Opt out
+   per-launch with `--no-worktree` or globally with `teamctl config
+   worktree.enabled false`. Outside a git repo nothing changes (one
+   honest note, plain cwd). Disk note: a worktree is a full checkout of
+   *tracked* files; untracked artifacts (node_modules, venvs, build
+   dirs) are per-worktree by design. See
+   [Worktrees & landing](#worktrees--landing-parallel-writers-that-cannot-collide).
+3. **Gemini CLI is a first-class provider** — spawn, headless dispatch,
+   exact-session follow-ups (`--resume <captured-uuid>`), auth
+   detection, lead-mode block in `~/.gemini/GEMINI.md`. Two honest
+   caveats: Gemini exposes **no local usage feed**, so it shows as
+   `quiet` forever (routing treats it as 0% used); and upstream issue
+   #24808 means a resume can intermittently fail — the failure lands
+   verbatim in `error.log` and is re-triable.
+4. **Bring your own CLI**: a `[providers.custom.*]` config block teaches
+   teamctl any provider that speaks `<cmd> [flags] "<prompt>"` — no code
+   changes. See [Custom providers](#custom-providers-bring-your-own-cli).
+
+Also new: `teamctl status` (busy / needs-input / idle per teammate, with
+a `[notify]` hook on transitions — env vars `TEAMCTL_ROLE` /
+`TEAMCTL_MATE_STATE` / `TEAMCTL_PREV_STATE`), `teamctl land` /
+`teamctl worktree list|prune`, `teamctl resurrect` (the roster survives
+reboots), a doctor `environment` row (including WSL awareness), and
+`--json` on every new surface.
 
 ## Updating
 
@@ -125,12 +141,15 @@ teamctl doctor
 ```
 
 A one-shot environment check in the dark-room style — a `ok` / `warn` /
-`fail` row per concern: python version, tmux (presence + version quirks),
-the [provider states](#provider-states), config parse + schema sanity, the
+`fail` row per concern: the environment itself (WSL is recognized and
+greeted as supported, with a browser-sign-in interop note), python
+version, tmux (presence + version quirks), the
+[provider states](#provider-states), config parse + schema sanity, the
 Claude Code statusline wiring, whether the install-source metadata is
-recorded (so `teamctl update` works), and a writable state dir. The exit
-code reflects the worst finding (`0` ok · `1` warn · `2` fail), so it
-drops into CI or a pre-flight script.
+recorded (so `teamctl update` works), a writable state dir, orphaned
+worktrees, and crash-lost teammates waiting for `teamctl resurrect`. The
+exit code reflects the worst finding (`0` ok · `1` warn · `2` fail), so
+it drops into CI or a pre-flight script.
 
 ## Provider states
 
@@ -142,13 +161,16 @@ same word lattice, so different truths never share one ambiguous label:
 |---|---|---|
 | `ready` | installed, signed in, usage numbers known (shown inline) | nothing — spawn away |
 | `quiet` | installed and signed in; no usage numbers seen yet | nothing — it wakes on first use (each surface shows the exact wake hint) |
-| `locked out` | installed but not signed in | the CLI's own login: `claude auth login` / `codex login` / `grok login` |
+| `locked out` | installed but not signed in | the CLI's own login: `claude auth login` / `codex login` / `grok login` / gemini's in-TUI `/auth` |
 | `not installed` | CLI not on PATH | the installer prints the official install one-liners |
 | `unknown` | auth artifacts exist but can't be read | reported honestly instead of guessing — check the CLI |
 
 `quiet` and `ready` providers are equally usable for spawning and
-routing — usage data changes the word, not the eligibility. Residual
-usage artifacts left by an *uninstalled* CLI (e.g. leftover
+routing — usage data changes the word, not the eligibility. (Gemini is
+the permanent-`quiet` case: it exposes no local usage feed at all, and
+teamctl says so instead of inventing numbers.) A custom provider with no
+auth configuration shows `quiet — auth not probed` and stays routable.
+Residual usage artifacts left by an *uninstalled* CLI (e.g. leftover
 `~/.codex/sessions` rollouts) are flagged as `not installed — residual
 usage history found` and never rendered as a live provider.
 
@@ -158,13 +180,18 @@ usage history found` and never rendered as a live provider.
 | --- | --- |
 | macOS | supported — developed and verified here |
 | Linux | supported — verified by CI (ubuntu-latest, live tmux pane tests) |
+| WSL | runs as Linux — the installer greets it as supported and `doctor` reports the environment (with a note about browser sign-ins through Windows interop). Detection is tested; WSL itself has not been separately field-verified. |
 | Windows | native: **not supported** (tmux doesn't run there). Use WSL — the installer detects native Windows and prints the WSL steps. |
 
 - [tmux](https://github.com/tmux/tmux) (teamctl runs inside a tmux session)
 - Python 3.11+ (3.9+ works, but config-file support needs `tomllib` from 3.11)
+- git, only if you use worktree isolation (on by default *in a git repo*;
+  everything else works without git)
 - At least one provider CLI installed and logged in:
   [Claude Code](https://code.claude.com) (`claude`), OpenAI Codex CLI
-  (`codex`), or Grok CLI (`grok`)
+  (`codex`), Grok CLI (`grok`), or
+  [Gemini CLI](https://geminicli.com) (`gemini`) — or your own via
+  [`[providers.custom.*]`](#custom-providers-bring-your-own-cli)
 
 The installer detects missing tmux/python3 and **offers** to install them via
 your package manager (brew / apt-get / dnf / pacman) — it always asks first
@@ -195,8 +222,9 @@ prints usage as before.
 teamctl spawn reviewer --provider codex \
     --prompt "Review the diff on this branch for correctness."
 
-# See who's active.
+# See who's active — and who's busy, blocked on an approval, or idle.
 teamctl list
+teamctl status            # busy / needs-input / idle (--watch to poll)
 
 # Type a follow-up instruction into a running teammate's pane.
 teamctl send reviewer "Focus on the error handling in server.py."
@@ -216,19 +244,153 @@ teamctl followup researcher --task "Now rank them by effort."
 # teamctl asks rather than silently picking one for you.
 teamctl spawn helper --prompt "Draft release notes from the last 10 commits."
 
-# Or let route pick: first *available* provider in your configured order,
-# skipping anything not installed, not logged in, or known-exhausted.
+# Or let route pick: the usable provider with the most quota left
+# (your configured order breaks ties; anything not installed, not
+# logged in, or known-exhausted is excluded first).
 teamctl route helper --task "Draft release notes from the last 10 commits."
-teamctl route helper --task "..." --dry-run     # preview the choice + command
+teamctl route helper --task "..." --dry-run     # preview: every % it used
 
 # Provider availability, real usage, and current model lists.
 teamctl providers
 teamctl usage
 teamctl models
 
+# A writing teammate worked in its own worktree (the default in a git
+# repo) — review and merge its branch back, then everything cleans up.
+teamctl land reviewer --dry-run       # the plan: diffstat + counts
+teamctl land reviewer                 # checkpoint (asks) → merge → cleanup
+
 # Clean teardown: kills the whole process tree, verifies it, closes the pane.
+# A worktree with un-landed work is KEPT and reported — never discarded.
 teamctl shutdown reviewer
 ```
+
+## Worktrees & landing: parallel writers that cannot collide
+
+The "never two teammates edit the same file" rule used to be prompt
+convention; v0.5.0 makes it **mechanical**. In a git repo, every teammate
+gets its own branch (`teamctl/<role>`) checked out in its own worktree
+under the state dir (`~/.local/state/agent-team/worktrees/…`) — one
+shared object store, zero shared working files. `--no-worktree` opts a
+launch out; `[worktree] enabled = false` opts out globally; outside a git
+repo teamctl says so once and uses the plain cwd.
+
+**Landing** closes the loop:
+
+```sh
+teamctl land <role> --dry-run   # diffstat, commit/dirty counts, target branch
+teamctl land <role>             # checkpoint uncommitted work (asks first)
+                                #   → merge --no-ff into your CHECKED-OUT
+                                #     branch → remove worktree + branch
+```
+
+What `land` will never do: switch your branches (`--into` only *asserts*
+the target), stash for you, auto-resolve conflicts (a conflicted merge is
+aborted and reported, your tree left clean), or land uncommitted work
+silently. It works even after the teammate is gone — a shutdown that
+finds un-landed work **keeps** the worktree and prints the way out, and
+the worktree registry survives reboots. `teamctl worktree list` audits
+everything teamctl ever created; `worktree prune` removes only what
+provably holds nothing (never a live teammate's, never unique work).
+Under the hood teamctl only ever uses git's own *non-forced* commands
+(`worktree remove`, `branch -d`) — git's refusals are the backstop, and a
+test audits that no `-D`/`--force`/`--hard` ever appears.
+
+## Routing: to the subscription with the most quota left
+
+`route` has always excluded the unusable (not installed / locked out /
+exhausted / auth-error). v0.5.0 changes how the *survivors* are ranked:
+**headroom** — the provider with the most remaining quota wins, reading
+the same sources `teamctl usage` shows (native feeds first, probe cache
+second, the tighter of the 5h/weekly windows governs). No usage data
+ranks as 0% used (a quiet provider is usually a genuinely idle one), with
+your preference order breaking ties. The reason line shows every number
+the choice used — unknowns as `?%`, stale probe data flagged:
+
+    route: selected codex (headroom: codex 12% used < claude 63% < grok ?% ·
+    preference tiebreak claude>codex>grok; skipped gemini: not installed)
+
+`teamctl config routing.strategy preference` restores the strict-order
+behavior, bit-for-bit.
+
+## Status: who's busy, who's blocked, who's idle
+
+```sh
+teamctl status                 # one-shot table
+teamctl status --watch         # poll; prints transitions until Ctrl-C
+teamctl status --json          # for an agent lead
+```
+
+Interactive teammates are classified with two pane samples ~0.7s apart:
+changing content = `busy`; stable content matching the provider's known
+approval-dialog shapes = `needs-input` (the matched prompt line is shown
+— this is the "which teammate is silently stuck on a y/n?" answer);
+anything else = `idle`. An unrecognized TUI degrades to `idle` — never a
+wrong strong claim. Dispatch teammates keep their derived lifecycle
+states (`running` / `done` / `failed(rc)` / `died`). A `[notify]
+command = "…"` in config runs on transitions observed by
+`status`/`list`/`--watch` (no daemon — unwatched transitions don't fire;
+that's stated, not hidden), with context in `TEAMCTL_ROLE`,
+`TEAMCTL_MATE_STATE`, `TEAMCTL_PREV_STATE`.
+
+## Resurrect: the roster survives reboots
+
+A reboot (or crash, or an accidentally closed pane) used to silently
+erase interactive teammates from the roster. Now `reconcile` records them
+as **lost**, and:
+
+```sh
+teamctl resurrect --dry-run    # what was lost, what a rebuild would do
+teamctl resurrect              # rebuild (asks once; --yes for scripts)
+```
+
+Interactive teammates respawn **fresh** with everything teamctl recorded
+(provider, model, effort, cwd, prompt — and their worktree is reused when
+it survived). Their opening prompt says, honestly, that prior
+conversation context was *not* restored — teamctl never captured
+interactive session ids and refuses to guess "the most recent session".
+Dispatch teammates never needed resurrecting: their artifacts live on
+disk, and `result`/`followup` keep working — exact-session — after any
+reboot. Bare `teamctl`, `list`, and `doctor` all point out lost teammates;
+nothing is ever auto-resurrected without consent.
+
+## Custom providers: bring your own CLI
+
+Gemini is defined through a provider-spec registry — and the same
+substrate is yours in config. Any CLI that speaks
+`<cmd> [flags] "<prompt>"` drops in with zero code changes:
+
+```toml
+[providers.custom.aider]
+command       = "aider"                          # must be on PATH
+headless_args = ["--message", "{task}", "--yes"] # {task} is required
+model_args    = ["--model", "{model}"]           # optional
+effort_args   = []                               # [] / absent = no effort
+                                                 # control (--effort is
+                                                 # dropped with a note)
+resume_args   = []                               # [] = follow-ups refused
+session_id_key   = ""                            # id key in a JSON result…
+session_id_regex = ""                            # …or a regex over stderr,
+                                                 # then stdout text
+interactive_args = []                            # extra flags for spawn
+auth_env      = "OPENAI_API_KEY"                 # positive-only signal
+auth_files    = ["~/.aider/oauth.json"]          # enables signed-out/in
+login_hint    = "aider --login"
+probe_command = ""                               # its TUI usage command
+waiting_patterns = []                            # approval-dialog regexes
+routable      = true
+```
+
+Everything degrades honestly: no `headless_args` → dispatch refuses
+(spawn-only provider); no resume/session source → `followup` refuses; no
+auth config → the lattice says `quiet — auth not probed` and the provider
+stays routable (you configured it on purpose). A malformed block is
+skipped with one stderr warning and can never take the built-ins down;
+custom names can't shadow built-ins. `{task}`/`{model}`/`{effort}`/
+`{session_id}` substitute inside argv tokens — no shell ever sees them
+unquoted. A worked real-world example (Google Antigravity's `agy`,
+including its macOS-over-SSH auth caveat) lives in
+[docs/AGENT_GUIDE.md](docs/AGENT_GUIDE.md#custom-providers-providerscustom).
 
 ## The lead-agent workflow
 
@@ -294,14 +456,15 @@ agent — the standing rules from the playbook above (stay responsive,
 delegate non-trivial work, decide capacity from `teamctl usage`/`providers`
 live data, one owner per file, zero idle teammates, the user always
 overrides) — into **every detected CLI** (or one, with
-`--cli claude|codex|grok|all`):
+`--cli claude|codex|grok|gemini|all`):
 
-1. **Instructions block** — *always on; all three CLIs*. A compact,
+1. **Instructions block** — *always on; every CLI*. A compact,
    marker-guarded block (`<!-- BEGIN teamctl-lead -->` …
    `<!-- END teamctl-lead -->`) appended to each CLI's documented global
    instructions file: `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`,
-   `~/.grok/AGENTS.md`. In context from the first prompt of every session;
-   re-running `lead on` refreshes a stale block in place (backup first).
+   `~/.grok/AGENTS.md`, `~/.gemini/GEMINI.md`. In context from the first
+   prompt of every session; re-running `lead on` refreshes a stale block
+   in place (backup first).
 2. **Skill** (`~/.claude/skills/teamctl-lead/SKILL.md`) — *discoverable;
    Claude Code only*. Loaded whenever delegation, teammates, multi-agent
    planning, or capacity questions come up. It also teaches the chat-based
@@ -314,7 +477,7 @@ overrides) — into **every detected CLI** (or one, with
    context compaction has dropped instruction-file text from a long
    session. That is why it's the recommended tier.
 
-Skills and hooks are Claude Code mechanisms with no Codex/Grok equivalent —
+Skills and hooks are Claude Code mechanisms with no equivalent elsewhere —
 tiers 2 and 3 being Claude-only is parity with what each CLI offers, not a
 preference. Every step is skipped if already present, backed up first if it
 changes an existing file, and printed with its exact revert. `teamctl lead
@@ -405,13 +568,28 @@ effort = "high"             # grok has no persistent effort setting of its
 [routing]
 preference = ["codex", "claude"]  # YOUR order — express uses the detected
                             # order; the custom wizard asks for it.
-                            # `route` picks the first available entry, and
-                            # a bare spawn/dispatch (no --provider) uses the
-                            # first entry. Without a configured preference
-                            # the fallback order is alphabetical — arbitrary,
-                            # not a recommendation — and several providers
-                            # with no preference means spawn/dispatch ask
-                            # rather than silently choosing.
+                            # Under the default headroom strategy this is
+                            # the TIEBREAK; under strategy = "preference"
+                            # it is the whole ranking. A bare
+                            # spawn/dispatch (no --provider) uses the first
+                            # entry; several providers with no preference
+                            # means spawn/dispatch ask rather than
+                            # silently choosing.
+strategy = "headroom"       # headroom (most remaining quota wins) |
+                            # preference (strict order — the pre-v0.5 rule)
+
+[worktree]
+enabled = true              # teammate worktree isolation in git repos
+                            # (v0.5.0 default ON; --no-worktree per launch)
+# dir = ""                  # "" = <state dir>/worktrees
+# branch_prefix = "teamctl/"
+cleanup = "auto"            # auto: remove provably-clean worktrees at
+                            # shutdown; keep: never remove
+
+[notify]
+# command = "notify-send teamctl"  # run on observed status transitions;
+                            # env: TEAMCTL_ROLE, TEAMCTL_MATE_STATE,
+                            # TEAMCTL_PREV_STATE (argv via shlex — no shell)
 
 [usage]
 probe_stale_minutes = 30    # `usage` flags probe/statusline data older
@@ -467,8 +645,11 @@ teamctl update. `teamctl models [provider]` is best-effort discovery for
 convenience only: grok's documented `grok models` output is passed
 through; Codex's local models cache (`~/.codex/models_cache.json` — an
 observed file, parsed defensively) lists slugs and supported efforts; for
-Claude, which has no listing command, the documented aliases are noted.
+Claude and Gemini, which have no listing commands, the accepted id shapes
+are noted (Claude's documented aliases; any Gemini model id via `-m`).
 The wizard shows the same discovery as suggestions but accepts any id.
+Gemini has no per-invocation effort flag — a `--effort` for it is dropped
+with a one-line note, never silently, and the wizard never writes one.
 
 ### Fresh usage numbers: hidden probes
 
@@ -550,8 +731,29 @@ anything (or anyone) able to run teamctl can steer every teammate.
   the statusline cache (Claude Code pipes documented `rate_limits` fields to
   the status line for subscribers; ours saves them) — so they exist only
   after a Claude Code turn has run with the teamctl statusline installed,
-  and `teamctl usage` labels the cache's age. Grok exposes nothing locally,
-  and `teamctl usage` says so rather than inventing numbers.
+  and `teamctl usage` labels the cache's age. Grok exposes nothing locally
+  (the hidden probe fills it in on request); Gemini exposes nothing at all
+  — `teamctl usage` says so rather than inventing numbers, and headroom
+  routing honestly treats no-data as "probably idle" (0% used) with your
+  preference order as the tiebreak.
+- **Gemini resume has a known upstream flake.** Exact-session follow-ups
+  use `gemini --resume <captured-uuid>`; upstream issue #24808 reports
+  intermittent "Invalid session identifier" failures. When it happens the
+  error lands verbatim in `error.log`/`status` and the followup is
+  re-triable — never silent. Gemini sessions are also project-scoped:
+  follow-ups run from the dispatch cwd (teamctl already guarantees this).
+- **Worktrees cost disk and don't share untracked files.** A teammate's
+  worktree is a full checkout of *tracked* files (shared object store);
+  node_modules/venvs/build dirs must be re-created per worktree — that's
+  inherent to the isolation. `teamctl worktree list` shows everything;
+  `prune` reclaims what provably holds nothing.
+- **Status detection reads TUI text.** The busy/needs-input/idle
+  classifier samples pane content and matches OBSERVED approval-dialog
+  shapes per provider (calibrated against real panes; an unrecognized TUI
+  degrades to `idle`, never a wrong strong claim). Provider TUI redesigns
+  can dull it until patterns are refreshed — `waiting_patterns` in a
+  custom block tunes it per provider. And there's no daemon: the
+  `[notify]` hook fires only on transitions something actually observed.
 - **Some parsed provider formats are observed, not documented.** Grok's JSON
   output shape (`{text, stopReason, sessionId, …}`), the location/format of
   Codex's session-log rate-limit events, Codex's models cache, and the TUI
@@ -563,11 +765,12 @@ anything (or anyone) able to run teamctl can steer every teammate.
   resume`, and `grok models` are documented.)
 - **Follow-ups are exact-session on all providers.** `followup` resumes
   the specific captured session id (claude `--resume <id>`, grok `-r <id>`,
-  codex `exec resume <id>` — all verified against each CLI's help) and
-  refuses rather than guessing "most recent" when no id was captured.
-  The codex id comes from an observed stderr banner (`session id: <uuid>`),
-  with the rollout-log filename as a fallback — re-verify after codex
-  upgrades. claude/grok ids come from their JSON results.
+  codex `exec resume <id>`, gemini `--resume <uuid>` — all verified
+  against each CLI) and refuses rather than guessing "most recent" when no
+  id was captured. The codex id comes from an observed stderr banner
+  (`session id: <uuid>`), with the rollout-log filename as a fallback —
+  re-verify after codex upgrades. claude/grok/gemini ids come from their
+  JSON results (gemini's error JSON arrives on stderr and is checked too).
 - **Exhaustion signals are best-effort.** `route` skips a provider only after
   its output was seen to contain a limit/auth error, or Codex's own log shows
   100% on the 5h window; signals with a known reset time auto-expire.
@@ -579,8 +782,12 @@ anything (or anyone) able to run teamctl can steer every teammate.
   `dispatch`/`result`.
 - **macOS/Linux only** (uses `flock`, `pgrep`, POSIX signals): macOS verified
   directly, Linux verified by CI. Native Windows can't work (no tmux); WSL
-  provides a standard Linux userland and is the supported route there, but
-  hasn't been separately tested.
+  provides a standard Linux userland and is the supported route there —
+  the installer and `doctor` recognize it explicitly — but the detection
+  logic is unit-tested against faked fixtures, not field-tested on a real
+  WSL box. One known WSL rough edge: provider browser sign-ins go through
+  WSL→Windows interop; if a login stalls, copy the printed URL into a
+  Windows browser yourself.
 - Provider CLIs must already be installed and logged in; teamctl never
   handles credentials itself. **Login detection reads observed
   artifacts**, content-validated (never bare file existence): claude's
@@ -591,7 +798,11 @@ anything (or anyone) able to run teamctl can steer every teammate.
   fallback. Exported provider API keys count too. Each artifact was
   verified against a live signed-in install, but a CLI update that moves
   them shows up as `locked out` (and an unreadable artifact as
-  `unknown`); the CLIs themselves stay the source of truth.
+  `unknown`); the CLIs themselves stay the source of truth. Gemini's
+  artifact is `~/.gemini/oauth_creds.json` (plus `GEMINI_API_KEY` /
+  `GOOGLE_API_KEY`); custom providers use whatever `auth_files` /
+  `auth_env` you configure — and with neither, teamctl says "auth not
+  probed" instead of guessing.
 
 ## Credits
 

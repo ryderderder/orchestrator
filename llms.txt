@@ -1,0 +1,40 @@
+# teamctl
+
+> Provider-agnostic AI agent teams on plain tmux: a lead agent manages
+> teammates (Claude Code, Codex, Grok, Gemini — or any CLI via a custom
+> provider block) as panes. Headless dispatch with JSON results,
+> exact-session follow-ups, per-teammate git-worktree isolation with a
+> land step, quota-aware routing, teammate status detection, and a roster
+> that survives reboots. Single-file Python, stdlib only, tmux is the
+> only runtime dependency. Current release: v0.5.0.
+
+Core rule you will meet everywhere: teamctl refuses instead of guessing —
+exact session or refusal, ask instead of silently picking a provider,
+keep-and-report instead of discarding work, "unknown" stated as unknown.
+
+## Docs
+
+- [README.md](README.md): the full human-facing tour — install, quickstart,
+  worktrees + landing, routing, lead mode, configuration, security notes,
+  honest limitations.
+- [docs/AGENT_GUIDE.md](docs/AGENT_GUIDE.md): the agent-facing operational
+  contract — command reference, every --json surface, the lead playbook,
+  worktree lifecycle, custom-provider schema with a worked example.
+- [docs/INSTALL_PROMPT.md](docs/INSTALL_PROMPT.md): the paste-into-your-agent
+  install prompt (a pointer, not a manual).
+
+## Install
+
+- One-liner: `curl -fsSL https://raw.githubusercontent.com/ryderderder/teamctl/main/install.sh | bash`
+- Agent-driven: paste docs/INSTALL_PROMPT.md into any AI coding CLI.
+- Verify with `teamctl doctor` (exit 0 ok / 1 warn / 2 fail).
+
+## Source
+
+- [teamctl](teamctl): the entire tool — one Python file. Provider behavior
+  lives in the PROVIDER_SPECS registry near the top; users extend it via
+  [providers.custom.*] config blocks, no code changes.
+- [install.sh](install.sh): installer (records its source so
+  `teamctl update` works; detects WSL and greets it as supported Linux).
+- [tests/](tests/): 419 tests — run `python3 -m unittest discover -s tests`
+  inside a tmux session to include the live pane tier.
