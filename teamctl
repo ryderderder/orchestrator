@@ -20,6 +20,7 @@ Usage:
     teamctl route <role> --task "…" [--providers claude,codex,grok,gemini] [--dry-run]
     teamctl land <role> [--checkpoint-only] [--into BRANCH] [--dry-run] [--json]
     teamctl worktree list|prune [--json] [--dry-run]
+    teamctl resurrect [role …] [--dry-run] [--yes]
     teamctl providers
     teamctl usage [--json] [--probe [provider|all]]
     teamctl update [--check]
@@ -835,6 +836,10 @@ def live_pane_ids() -> set[str]:
     return {line.strip() for line in out.splitlines() if line.strip()}
 
 
+# the newest N crash/reboot-lost teammates kept for `teamctl resurrect`
+LOST_CAP = 20
+
+
 def reconcile(state: dict) -> dict:
     """Keep tracked teammates honest against the live tmux panes.
 
@@ -847,9 +852,16 @@ def reconcile(state: dict) -> dict:
     whose pane is gone is therefore FINISHED (or died mid-task), not
     vanished — it stays tracked, with its stale pane id cleared, until an
     explicit `teamctl shutdown <role>` removes it. `result` and `followup`
-    keep working from the handoff artifacts indefinitely."""
+    keep working from the handoff artifacts indefinitely.
+
+    An interactive teammate whose pane vanished WITHOUT `teamctl shutdown`
+    (crash, reboot, user-closed pane — explicit shutdown deletes directly
+    and never passes through this path) is moved to state["lost"] instead
+    of being silently forgotten: `teamctl resurrect` rebuilds the roster
+    from those records (capped at the newest LOST_CAP entries)."""
     live = live_pane_ids()
     survivors: dict[str, dict] = {}
+    lost: dict[str, dict] = dict(state.get("lost") or {})
     changed = False
     for role, info in state["teammates"].items():
         pane = info.get("pane_id")
@@ -863,9 +875,16 @@ def reconcile(state: dict) -> dict:
                 changed = True
             survivors[role] = info
             continue
-        changed = True  # interactive teammate without a pane is gone
+        changed = True  # interactive teammate without a pane: LOST
+        lost[role] = {**info,
+                      "lost_at": time.strftime("%Y-%m-%dT%H:%M:%S")}
+    while len(lost) > LOST_CAP:
+        oldest = min(lost, key=lambda r: lost[r].get("lost_at", ""))
+        del lost[oldest]
     if changed:
         state["teammates"] = survivors
+        if lost:
+            state["lost"] = lost
         save_state(state)
     return state
 
@@ -1113,8 +1132,13 @@ def cmd_list(args: argparse.Namespace) -> int:
                      for role, info in mates.items()}
         print(json.dumps(annotated, indent=2, sort_keys=True))
         return 0
+    lost = state.get("lost") or {}
     if not mates:
         print("no active teammates")
+        if lost:
+            print(f"{len(lost)} teammate(s) lost in a crash/reboot "
+                  f"({', '.join(sorted(lost))}) — rebuild: teamctl "
+                  "resurrect")
         return 0
     width = max(len(r) for r in mates)
     print(f"{'ROLE'.ljust(width)}  PROVIDER  PANE     STATE        CREATED")
@@ -1135,6 +1159,9 @@ def cmd_list(args: argparse.Namespace) -> int:
             f"{i.get('pane_id') or '-':<7}  {st:<11}  "
             f"{i.get('created_at', '')}{marker}"
         )
+    if lost:
+        print(f"\n{len(lost)} teammate(s) lost in a crash/reboot "
+              f"({', '.join(sorted(lost))}) — rebuild: teamctl resurrect")
     return 0
 
 
@@ -1431,6 +1458,15 @@ def cmd_shutdown(args: argparse.Namespace) -> int:
         state = reconcile(load_state())
         info = state["teammates"].get(args.role)
         if not info:
+            # an explicit shutdown of a crash-lost role clears its record
+            lost = dict(state.get("lost") or {})
+            if args.role in lost:
+                del lost[args.role]
+                state["lost"] = lost
+                save_state(state)
+                print(f"cleared lost teammate '{args.role}' (it will no "
+                      "longer be offered by `teamctl resurrect`)")
+                return 0
             print(f"teamctl: no active teammate '{args.role}'.", file=sys.stderr)
             return 1
         pane_id = info.get("pane_id") or ""
@@ -2453,6 +2489,155 @@ def cmd_followup(args: argparse.Namespace) -> int:
         save_state(state)
     print(f"follow-up sent to '{args.role}' in pane {pane_id}")
     return 0
+
+
+# --------------------------------------------------------------------------
+# `teamctl resurrect` — rebuild the roster after a crash/reboot.
+#
+# reconcile captures dropped interactive teammates in state["lost"] (the
+# capture point IS the drop point — no parallel manifest that can drift);
+# resurrect respawns them fresh with everything state recorded (provider/
+# model/effort/cwd/prompt/worktree). Honesty first: teamctl never captured
+# an interactive session id (capture is artifact-based, dispatch-only) and
+# resuming "the most recent session in this cwd" would violate the
+# never-guess rule — so a resurrected teammate STARTS OVER and says so in
+# its opening prompt. Dispatch teammates never need resurrecting: their
+# artifacts survive on disk and `result`/`followup` keep working —
+# exact-session — indefinitely.
+# --------------------------------------------------------------------------
+
+RESURRECT_NOTE = ("[teamctl] resurrected after a crash/reboot — prior "
+                  "conversation context was NOT restored.")
+
+
+def _resurrect_plan(role: str, info: dict,
+                    active: dict) -> tuple[str, str, dict | None, str]:
+    """(action, cwd, worktree_to_reuse, note) for one lost teammate.
+    action: respawn | skip | followup | error."""
+    if role in active:
+        return ("skip", "", None,
+                "the role is active again — stale lost entry cleared")
+    if info.get("mode") == "dispatch":
+        return ("followup", "", None,
+                "a dispatch teammate needs no respawn: its artifacts are "
+                f"on disk — `teamctl result {role}` / `teamctl followup "
+                f"{role} --task …` resume the exact session")
+    wt = info.get("worktree")
+    if wt and Path(wt.get("path", "")).is_dir():
+        return ("respawn", wt["path"], dict(wt),
+                f"reusing its worktree ({wt['branch']})")
+    if wt:
+        return ("respawn", wt.get("repo") or info.get("cwd", ""), None,
+                "its worktree path is gone — a fresh one is allocated "
+                "(refused honestly if the old branch still exists)")
+    cwd = info.get("cwd", "")
+    if not cwd or not Path(cwd).is_dir():
+        return ("error", "", None,
+                f"original cwd {cwd or '?'} no longer exists — respawn "
+                f"manually: `teamctl spawn {role} --cwd <dir>`")
+    return ("respawn", cwd, None, "")
+
+
+def cmd_resurrect(args: argparse.Namespace) -> int:
+    with state_lock():
+        state = reconcile(load_state())
+    lost = dict(state.get("lost") or {})
+    targets = list(args.roles) or sorted(lost)
+    if not targets:
+        print("nothing to resurrect — no lost teammates recorded.")
+        return 0
+    missing = [r for r in targets if r not in lost]
+    if missing:
+        print(f"teamctl: not in the lost roster: {', '.join(missing)} "
+              f"(lost: {', '.join(sorted(lost)) or 'none'}).",
+              file=sys.stderr)
+        return 1
+
+    plans = {r: _resurrect_plan(r, lost[r], state["teammates"])
+             for r in targets}
+
+    if args.dry_run:
+        if getattr(args, "json", False):
+            print(json.dumps({r: {
+                "action": a, "cwd": cwd or None,
+                "worktree": (wt or None), "note": note or None,
+                "provider": lost[r].get("provider"),
+                "model": lost[r].get("model") or None,
+                "effort": lost[r].get("effort") or None,
+                "lost_at": lost[r].get("lost_at")}
+                for r, (a, cwd, wt, note) in plans.items()},
+                indent=2, sort_keys=True))
+            return 0
+        for r, (action, cwd, _wt, note) in sorted(plans.items()):
+            info = lost[r]
+            tag = info.get("provider", "?") + (
+                "/" + info["model"] if info.get("model") else "")
+            line = f"{r}: {action} ({tag}"
+            if action == "respawn":
+                line += f", cwd {_tilde(cwd)}"
+            line += ")"
+            if note:
+                line += f" — {note}"
+            print(line)
+        print("\n(a resurrected teammate starts a FRESH session — prior "
+              "interactive context is not restorable; dispatch teammates "
+              "resume exactly via `followup`.)")
+        return 0
+
+    respawns = [r for r, (a, *_r) in plans.items() if a == "respawn"]
+    if respawns and not args.yes:
+        if not _ask_yn(f"resurrect {len(respawns)} teammate(s) "
+                       f"({', '.join(respawns)})? [Y/n] ", default=True):
+            print("nothing resurrected.")
+            return 1
+
+    failures = 0
+    for role in targets:
+        action, cwd, reuse_wt, note = plans[role]
+        info = lost[role]
+        if action == "error":
+            failures += 1
+            print(f"{role}: NOT resurrected — {note}", file=sys.stderr)
+            continue
+        if action in ("skip", "followup"):
+            print(f"{role}: {note}")
+            if action == "skip":
+                _drop_lost_entry(role)
+            continue
+        prompt = RESURRECT_NOTE
+        if info.get("prompt"):
+            prompt += "\n\n" + info["prompt"]
+        ns = argparse.Namespace(
+            role=role, provider=info.get("provider", ""),
+            prompt=prompt, model=info.get("model", ""),
+            effort=info.get("effort", ""), cwd=cwd, dry_run=False,
+            worktree=(False if reuse_wt else None))
+        rc = cmd_spawn(ns)
+        if rc != 0:
+            failures += 1
+            print(f"{role}: respawn failed (rc={rc}) — see above.",
+                  file=sys.stderr)
+            continue
+        if reuse_wt:
+            with state_lock():
+                st = load_state()
+                if role in st["teammates"]:
+                    st["teammates"][role]["worktree"] = reuse_wt
+                    save_state(st)
+        _drop_lost_entry(role)
+        if note:
+            print(f"{role}: {note}")
+    return 1 if failures else 0
+
+
+def _drop_lost_entry(role: str) -> None:
+    with state_lock():
+        st = load_state()
+        lost = dict(st.get("lost") or {})
+        if role in lost:
+            del lost[role]
+            st["lost"] = lost
+            save_state(st)
 
 
 def _record_provider_signal(provider: str, signal: str,
@@ -5597,6 +5782,21 @@ def cmd_launch(args: argparse.Namespace) -> int:
         _init_express(argparse.Namespace(custom=False, yes=False))
         print()
 
+    # a reboot/crash killed the roster? say so at the front door — the
+    # reconcile here is what moves dead-pane teammates into the lost
+    # record after a reboot. Never auto-resurrects: consent first.
+    try:
+        with state_lock():
+            state = reconcile(load_state())
+        lost = state.get("lost") or {}
+        if lost:
+            print(_fg("warn", f"· {len(lost)} teammate(s) lost in a "
+                              f"crash/reboot ({', '.join(sorted(lost))}) "
+                              "— rebuild: teamctl resurrect "
+                              "(preview: --dry-run)"))
+    except TeamctlError:
+        pass    # no tmux yet — the launch path below explains that itself
+
     provider, model, effort, err = _resolve_chat()
     if provider is None:
         print(f"teamctl: {err}", file=sys.stderr)
@@ -5749,6 +5949,16 @@ def _check_install_meta() -> tuple[str, str]:
     return "warn", "missing — re-run install.sh so `teamctl update` works"
 
 
+def _check_lost() -> tuple[str, str]:
+    """Teammates lost to a crash/reboot, waiting for `teamctl resurrect`."""
+    lost = load_state().get("lost") or {}
+    if lost:
+        names = ", ".join(sorted(lost)[:4]) + ("…" if len(lost) > 4 else "")
+        return "warn", (f"{len(lost)} lost teammate(s) ({names}) — "
+                        "rebuild with `teamctl resurrect`")
+    return "ok", "none"
+
+
 def _check_worktrees() -> tuple[str, str]:
     """Orphaned teamctl worktrees (owner gone, work possibly un-landed)."""
     reg = load_worktree_registry()
@@ -5790,6 +6000,7 @@ _DOCTOR_CHECKS = (
     ("install source", _check_install_meta),
     ("state dir", _check_state_dir),
     ("worktrees", _check_worktrees),
+    ("lost teammates", _check_lost),
 )
 
 
@@ -6579,6 +6790,22 @@ def build_parser() -> argparse.ArgumentParser:
     fp.add_argument("role")
     fp.add_argument("--task", required=True, help="the follow-up task")
     fp.set_defaults(func=cmd_followup)
+
+    rsp = sub.add_parser(
+        "resurrect",
+        help="rebuild teammates lost to a crash/reboot: fresh respawn "
+             "with the recorded provider/model/effort/cwd/worktree "
+             "(interactive context is honestly NOT restored; dispatch "
+             "mates resume exactly via followup instead)")
+    rsp.add_argument("roles", nargs="*",
+                     help="lost roles to rebuild (default: all)")
+    rsp.add_argument("--dry-run", action="store_true",
+                     help="print the plan; change nothing")
+    rsp.add_argument("--json", action="store_true",
+                     help="with --dry-run: the plan as JSON")
+    rsp.add_argument("--yes", action="store_true",
+                     help="respawn without the confirmation prompt")
+    rsp.set_defaults(func=cmd_resurrect)
 
     ld = sub.add_parser(
         "land",
