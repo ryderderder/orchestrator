@@ -446,6 +446,47 @@ class DefaultProviderTests(ThrowawayHomeTestCase):
         self.assertIn("unknown provider", err)
 
 
+class GrokAuthHeuristicTests(ThrowawayHomeTestCase):
+    """grok login detection: auth.json (observed artifact) first; signs of
+    real CLI use as last resort; NEVER bare ~/.grok existence — `lead on`
+    creates that directory on machines that never logged in."""
+
+    def setUp(self):
+        super().setUp()
+        self._auth = tc.AUTH_PATHS
+        tc.AUTH_PATHS = dict(tc.AUTH_PATHS)
+        tc.AUTH_PATHS["grok"] = self.home / ".grok" / "auth.json"
+        os.environ["TEAMCTL_STATE"] = str(self.home / "state.json")
+
+    def tearDown(self):
+        os.environ.pop("TEAMCTL_STATE", None)
+        tc.AUTH_PATHS = self._auth
+        super().tearDown()
+
+    def test_auth_json_is_the_primary_signal(self):
+        (self.home / ".grok").mkdir()
+        (self.home / ".grok" / "auth.json").write_text("{}")
+        self.assertTrue(tc.provider_authed("grok"))
+
+    def test_lead_on_created_dir_is_not_login(self):
+        # exactly what `teamctl lead on --cli grok` leaves behind
+        (self.home / ".grok").mkdir()
+        (self.home / ".grok" / "AGENTS.md").write_text(tc.LEAD_CLAUDE_BLOCK)
+        self.assertFalse(tc.provider_authed("grok"))
+        self.assertFalse((self.home / ".grok" / "auth.json").exists())
+
+    def test_cli_use_markers_are_the_last_resort_with_caveat(self):
+        (self.home / ".grok").mkdir()
+        (self.home / ".grok" / "sessions").mkdir()          # real CLI data
+        self.assertTrue(tc.provider_authed("grok"))
+        rc, out, _ = self.run_cli(["providers"])
+        self.assertEqual(rc, 0)
+        self.assertIn("inferred from ~/.grok CLI data", out)
+
+    def test_no_dir_means_not_authed(self):
+        self.assertFalse(tc.provider_authed("grok"))
+
+
 class InitRoutingOrderTests(ThrowawayHomeTestCase):
     """The wizard asks the USER for the auto-routing order."""
 

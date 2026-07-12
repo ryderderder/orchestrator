@@ -82,12 +82,43 @@ def handoff_dir(role: str) -> Path:
     return state_path().parent / role
 
 
-# Where each provider stores auth, for the availability probe.
+# Where each provider stores auth, for the availability probe. These are
+# OBSERVED login artifacts (teamctl never touches credentials): claude and
+# codex write these files at login; grok's auth.json was observed on a
+# logged-in install alongside its other CLI data.
 AUTH_PATHS = {
     "claude": Path.home() / ".claude.json",
     "codex": Path.home() / ".codex" / "auth.json",
-    "grok": Path.home() / ".grok",
+    "grok": Path.home() / ".grok" / "auth.json",
 }
+
+# Signs of real grok CLI use, for the last-resort auth fallback. Bare
+# ~/.grok existence is NOT a login signal any more: `teamctl lead on`
+# creates that directory (AGENTS.md) on machines that never logged in.
+GROK_DIR_MARKERS = ("sessions", "config.toml", "agent_id",
+                    "active_sessions.json")
+
+
+def _grok_auth_fallback(auth_path: Path) -> bool:
+    """auth.json is the observed login artifact; if a grok CLI update moves
+    it, fall back (last resort) to signs of real CLI use in the same dir —
+    never to bare directory existence."""
+    d = auth_path.parent
+    try:
+        return d.is_dir() and any((d / m).exists() for m in GROK_DIR_MARKERS)
+    except OSError:
+        return False
+
+
+def provider_authed(provider: str) -> bool:
+    path = AUTH_PATHS.get(provider)
+    if path is None:
+        return False
+    if path.exists():
+        return True
+    if provider == "grok":
+        return _grok_auth_fallback(path)
+    return False
 
 
 def config_path() -> Path:
@@ -113,7 +144,7 @@ def provider_defaults(provider: str) -> tuple[str | None, str | None]:
 def available_providers() -> list[str]:
     """Installed AND logged-in providers, in (arbitrary) alphabetical order."""
     return [p for p in ROUTABLE
-            if shutil.which(p) is not None and AUTH_PATHS[p].exists()]
+            if shutil.which(p) is not None and provider_authed(p)]
 
 
 def default_provider() -> str | None:
@@ -1488,13 +1519,16 @@ def cmd_providers(args: argparse.Namespace) -> int:
     rows = []
     for prov in ("claude", "codex", "grok"):
         installed = shutil.which(prov) is not None
-        authed = AUTH_PATHS[prov].exists()
+        authed = provider_authed(prov)
         if not installed:
             status = "not-installed"
         elif not authed:
             status = "not-authed"
         else:
             status = "available"
+            if prov == "grok" and not AUTH_PATHS["grok"].exists():
+                status += (" (inferred from ~/.grok CLI data; no auth.json "
+                           "— observed heuristic, verify with `grok models`)")
         last = cached.get(prov, {})
         sig = _live_signal(last)
         if sig in ("exhausted", "auth-error"):
@@ -1543,7 +1577,7 @@ def route_select(requested: list[str] | None = None
         if shutil.which(prov) is None:
             exclusions[prov] = "not-installed"
             continue
-        if not AUTH_PATHS[prov].exists():
+        if not provider_authed(prov):
             exclusions[prov] = "not-authed"
             continue
         signal = _live_signal(cached.get(prov))
@@ -1654,7 +1688,7 @@ def _toml_escape(value: str) -> str:
 
 def _detect_providers() -> list[tuple[str, bool, bool]]:
     """(provider, installed, authed) for every routable provider."""
-    return [(prov, shutil.which(prov) is not None, AUTH_PATHS[prov].exists())
+    return [(prov, shutil.which(prov) is not None, provider_authed(prov))
             for prov in ROUTABLE]
 
 

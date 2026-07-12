@@ -434,7 +434,11 @@ anything (or anyone) able to run teamctl can steer every teammate.
   provides a standard Linux userland and is the supported route there, but
   hasn't been separately tested.
 - Provider CLIs must already be installed and logged in; teamctl never
-  handles credentials itself.
+  handles credentials itself. **Login detection is heuristic**: it infers
+  login from observed artifacts (`~/.claude.json`, `~/.codex/auth.json`,
+  `~/.grok/auth.json` — with signs-of-CLI-use as grok's last-resort
+  fallback, never bare directory existence). A CLI update that moves them
+  shows up as "not-authed"; the CLIs themselves stay the source of truth.
 
 ## Credits
 
