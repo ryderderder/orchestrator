@@ -42,7 +42,10 @@ Ranked by value ÷ effort. All competitor claims verified against live repos/doc
 
 ## Shipped/handled in v0.4.0 (not backlog)
 - A1 role-name injection + path traversal fix (validate role `^[A-Za-z0-9][A-Za-z0-9._-]*$`).
-- A2 default install now wires lead mode + shows a spawn example (bare-teamctl launcher + closing frame).
-- A3 PATH warning survives the tmux takeover.
+- A2 installer first-run now enables lead mode (reversible: `teamctl lead off`); the closing
+  frame shows a real spawn example + "you're in tmux, talk to your lead" orientation, and bare
+  `teamctl` opens that lead chat.
+- A3 the installer's "not on PATH" warning survives the tmux takeover — re-printed durably inside
+  the express frame (`TEAMCTL_PATH_NOTE`), and the installer offers to append it to the shell profile.
 - Auth-state lattice unifies vocabulary across init frame AND `providers`; real-auth probes
   (not `~/.claude.json` presence, which exists pre-login).
