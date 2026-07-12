@@ -45,6 +45,18 @@ EOF
     ;;
 esac
 
+# ---- WSL: presents as Linux and is fully supported — say so ---------------
+# (the native-Windows refusal above does NOT catch WSL: uname is Linux.
+# Pure-bash, bash-3.2-safe check — no external tools, so it works however
+# minimal the PATH. TEAMCTL_PROC_VERSION is a test seam only.)
+_pv=""
+{ IFS= read -r _pv || true; } < "${TEAMCTL_PROC_VERSION:-/proc/version}" 2>/dev/null || true
+case "$_pv" in
+  *[Mm]icrosoft*)
+    echo "detected WSL${WSL_DISTRO_NAME:+ ($WSL_DISTRO_NAME)} — proceeding as Linux (supported)."
+    ;;
+esac
+
 RUN_INIT="yes"
 INIT_ARGS=""
 SKIP_DEPS=0
@@ -291,12 +303,16 @@ install_hint() {
       echo "    Grok CLI:     curl -fsSL https://x.ai/cli/install.sh | bash"
       echo "                  (docs: https://docs.x.ai)"
       ;;
+    gemini)
+      echo "    Gemini CLI:   npm install -g @google/gemini-cli   (or: brew install gemini-cli)"
+      echo "                  (docs: https://geminicli.com)"
+      ;;
   esac
 }
 
 HAVE_PROVIDER=0
 MISSING_PROVIDERS=()
-for p in claude codex grok; do
+for p in claude codex grok gemini; do
   if command -v "$p" >/dev/null 2>&1; then
     HAVE_PROVIDER=1
   else
@@ -305,7 +321,7 @@ for p in claude codex grok; do
 done
 
 provider_found_lines() { # PATH-only fallback when teamctl cannot run yet
-  for p in claude codex grok; do
+  for p in claude codex grok gemini; do
     if command -v "$p" >/dev/null 2>&1; then
       echo "  $p    found"
     else
@@ -331,7 +347,7 @@ fi
 if [ ${#MISSING_PROVIDERS[@]} -gt 0 ]; then
   if [ "$HAVE_PROVIDER" = 0 ]; then
     echo
-    echo "no provider CLI found (claude / codex / grok). teamctl needs at least one."
+    echo "no provider CLI found (claude / codex / grok / gemini). teamctl needs at least one."
     echo "Their installers change, so install from the official sources yourself:"
   else
     echo

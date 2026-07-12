@@ -103,6 +103,30 @@ class InstallShTestCase(unittest.TestCase):
         self.assertIn("Nothing was installed", r.stderr)
         self.assertFalse((self.bin / "teamctl").exists())
 
+    def test_wsl_is_greeted_as_supported_linux(self):
+        # WSL presents as Linux (uname=Linux) — the Windows refusal must
+        # NOT fire; instead a friendly awareness line prints. /proc is
+        # faked via the TEAMCTL_PROC_VERSION test seam. Honest limitation:
+        # this exercises the detection logic, not a real WSL box.
+        self.fake_uname("Linux")
+        proc = self.root / "proc-version"
+        proc.write_text("Linux version 5.15.167.4-microsoft-standard-WSL2 "
+                        "(root@build) #1 SMP\n")
+        r = self.run_install("--no-init", "--no-deps",
+                             env_extra={"TEAMCTL_PROC_VERSION": str(proc),
+                                        "WSL_DISTRO_NAME": "Ubuntu"})
+        self.assertIn("detected WSL (Ubuntu) — proceeding as Linux "
+                      "(supported)", r.stdout)
+        self.assertNotIn("Nothing was installed", r.stderr)
+
+    def test_plain_linux_gets_no_wsl_greeting(self):
+        self.fake_uname("Linux")
+        proc = self.root / "proc-version"
+        proc.write_text("Linux version 6.8.0-45-generic (buildd@x) #1\n")
+        r = self.run_install("--no-init", "--no-deps",
+                             env_extra={"TEAMCTL_PROC_VERSION": str(proc)})
+        self.assertNotIn("detected WSL", r.stdout)
+
     # ---- dependency detection & offers -------------------------------------
 
     def test_missing_tmux_no_pkg_manager_prints_manual_hints(self):

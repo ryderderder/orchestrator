@@ -7,16 +7,20 @@ Usage:
     teamctl init [--custom] [--yes]
     teamctl settings
     teamctl doctor
-    teamctl lead on|off|status [--hook] [--cli claude|codex|grok|all]
+    teamctl lead on|off|status [--hook] [--cli claude|codex|grok|gemini|all]
     teamctl config [<dotted.key> [<value>]] [--menu]
     teamctl models [provider]
-    teamctl spawn <role> [--provider claude|codex|grok|shell] [--prompt TEXT] [--cwd DIR]
+    teamctl spawn <role> [--provider claude|codex|grok|gemini|shell] [--prompt TEXT] [--cwd DIR]
     teamctl list
+    teamctl status [role] [--json] [--watch [--interval N]]
     teamctl send <role> "<instruction>" [--no-enter]
     teamctl dispatch <role> --provider P --task "…" [--context-file F] [--model M] [--effort E]
     teamctl result <role> [--wait]
     teamctl followup <role> --task "…"
-    teamctl route <role> --task "…" [--providers claude,codex,grok] [--dry-run]
+    teamctl route <role> --task "…" [--providers claude,codex,grok,gemini] [--dry-run]
+    teamctl land <role> [--checkpoint-only] [--into BRANCH] [--dry-run] [--json]
+    teamctl worktree list|prune [--json] [--dry-run]
+    teamctl resurrect [role …] [--dry-run] [--yes]
     teamctl providers
     teamctl usage [--json] [--probe [provider|all]]
     teamctl update [--check]
@@ -28,8 +32,10 @@ Every teammate is a tmux pane running a provider CLI. The lead (this process)
 never edits a teammate's work; it only spawns, lists, and cleanly shuts down.
 
 Providers share one launch shape -- `<cmd> [flags] "<prompt>"` starts an
-interactive session seeded with the prompt -- so Claude Code, Codex, and Grok
-all get the same tmux + teammate capability.
+interactive session seeded with the prompt -- so Claude Code, Codex, Grok,
+and Gemini CLI all get the same tmux + teammate capability, and a
+[providers.custom.*] config block teaches teamctl any other CLI that
+speaks the same shape (no code change needed).
 
 State lives in a small JSON file (default ~/.local/state/agent-team/state.json,
 override with $TEAMCTL_STATE). Access is serialized with an flock so concurrent
@@ -65,18 +71,370 @@ try:
 except Exception:  # pragma: no cover - platforms without curses
     curses = None
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 
-# provider -> launch command (as an argv prefix). A positional prompt is
-# appended when supplied. `shell` is a real provider used for verification:
-# it just holds an interactive shell in the pane, proving the tmux mechanics
-# without launching an AI agent.
-PROVIDERS: dict[str, list[str]] = {
-    "claude": ["claude"],
-    "codex": ["codex"],
-    "grok": ["grok"],
-    "shell": [os.environ.get("SHELL", "/bin/bash")],
+# --------------------------------------------------------------------------
+# the provider-spec registry — every provider, built-in OR user-defined via
+# a [providers.custom.*] block in config.toml, is DATA in one schema; the
+# adapter functions (headless_argv / resume_argv / interactive_flags /
+# _extract_session_id / provider_auth_state) are thin template expanders
+# over it. Adding a provider means adding a spec, not editing seven
+# if-chains.
+#
+# argv templates: "{task}", "{model}", "{effort}", "{session_id}" are
+# substituted INSIDE argv tokens. Values only ever land in argv slots (and
+# are shlex-quoted wholesale when a pane command line is built) — no shell
+# ever interpolates them.
+#
+# Spec fields:
+#   argv               interactive launch prefix (a positional prompt may
+#                      be appended by build_launch_line)
+#   headless           one-shot dispatch argv; absent -> dispatch/route
+#                      refuse (a spawn-only provider)
+#   resume             exact-session follow-up argv; absent -> followup
+#                      refuses (teamctl never guesses "most recent")
+#   model_args         appended when a model is set
+#   effort_args        appended when an effort is set; None/missing means
+#                      the CLI has no effort control — teamctl DROPS the
+#                      effort with a one-line stderr note, never silently
+#   resume_takes_model whether resume re-sends the model flags (codex: no;
+#                      effort is never re-sent on resume — v0.4.0 behavior)
+#   session_source     where the exact session id comes from:
+#                        {"type": "result-json", "key": K}  recursive key
+#                           lookup over the result/error JSON artifacts
+#                        {"type": "stderr-regex", "pattern": P, ...}
+#                           group 1 of P over error.log ("uuid": True
+#                           validates the match; "fallback" names a
+#                           built-in fallback strategy)
+#                      None -> no capture (followup refuses; the shell
+#                      test provider is the deliberate sessionless case)
+#   auth_env /         signed-in detection: exported key(s) count as
+#   auth_env_extra /   signed in; auth_files are login artifacts (parse-
+#   auth_files         able non-empty JSON -> signed in, unreadable ->
+#                      "unknown", never guessed)
+#   login_hint /       the lattice's advice strings for locked-out /
+#   wake_hint          quiet providers
+#   probe              hidden TUI usage probe ({"argv", "command",
+#                      "extra_enters"}); absent -> `usage --probe` refuses
+#   routable           participates in route/usage/providers tables
+#   quiet_flags        (shell only) silently ignore model/effort — it is
+#                      the tmux-mechanics test provider, not an AI CLI
+# --------------------------------------------------------------------------
+
+_SHELL = os.environ.get("SHELL", "/bin/bash")
+
+PROVIDER_SPECS: dict[str, dict] = {
+    "claude": {
+        "argv": ["claude"],
+        "headless": ["claude", "-p", "{task}", "--output-format", "json"],
+        "resume": ["claude", "-p", "{task}", "--output-format", "json",
+                   "--resume", "{session_id}"],
+        "model_args": ["--model", "{model}"],
+        "effort_args": ["--effort", "{effort}"],
+        "resume_takes_model": True,
+        # documented session_id field of the --output-format json result
+        "session_source": {"type": "result-json", "key": "session_id"},
+        "auth_env": "ANTHROPIC_API_KEY",
+        "login_hint": "claude auth login",
+        "wake_hint": "run one Claude Code turn with the teamctl statusline "
+                     "installed (`teamctl init`)",
+        # OBSERVED-ONLY TUI approval-dialog shapes (see waiting_patterns
+        # note below): Claude Code permission prompts
+        "waiting_patterns": [r"Do you want", r"❯\s*1\.",
+                             r"\by/N\b", r"\bY/n\b"],
+        "routable": True,
+    },
+    "codex": {
+        "argv": ["codex"],
+        "headless": ["codex", "exec", "{task}"],
+        "resume": ["codex", "exec", "resume", "{session_id}", "{task}"],
+        "model_args": ["-m", "{model}"],
+        "effort_args": ["-c", 'model_reasoning_effort="{effort}"'],
+        "resume_takes_model": False,   # `codex exec resume` takes no flags
+        # `codex exec` prints `session id: <uuid>` on stderr (OBSERVED
+        # banner, live-verified); the rollout-log filename glob is the
+        # built-in fallback (same uuid ends the rollout filename)
+        "session_source": {"type": "stderr-regex",
+                           "pattern": r"session id:\s*(\S+)",
+                           "uuid": True, "fallback": "codex-rollout-glob"},
+        "auth_env": "OPENAI_API_KEY",
+        "login_hint": "codex login",
+        "wake_hint": "usage appears after the first codex turn, or probe: "
+                     "`teamctl usage --probe codex`",
+        "probe": {"argv": ["codex"], "command": "/status", "extra_enters": 1},
+        "waiting_patterns": [r"(?i)\bapprove\b", r"\[y/[nN]\]",
+                             r"(?i)allow command", r"❯\s*1\."],
+        "routable": True,
+    },
+    "grok": {
+        "argv": ["grok"],
+        "headless": ["grok", "--single", "{task}", "--output-format", "json"],
+        "resume": ["grok", "--single", "{task}", "--output-format", "json",
+                   "-r", "{session_id}"],
+        "model_args": ["-m", "{model}"],
+        "effort_args": ["--effort", "{effort}"],
+        "resume_takes_model": True,
+        # sessionId field of its json result (observed; parsed defensively)
+        "session_source": {"type": "result-json", "key": "sessionId"},
+        "auth_env": "XAI_API_KEY",
+        "login_hint": "grok login",
+        "wake_hint": "probe it: `teamctl usage --probe grok`",
+        "probe": {"argv": ["grok"], "command": "/usage", "extra_enters": 1},
+        "waiting_patterns": [r"(?i)\bapprove\b", r"\[y/[nN]\]",
+                             r"(?i)\ballow\b.*\?", r"❯\s*1\."],
+        "routable": True,
+    },
+    "gemini": {
+        # Every flag below was VERIFIED against a live gemini-cli 0.46.0
+        # install (2026-07-12) plus the official docs: `-p` is headless
+        # mode; `--output-format json` emits one JSON object whose
+        # `session_id` field is present on success AND error output (the
+        # error JSON lands on stderr — _extract_session_id reads both
+        # artifacts); `--resume` accepts "latest", a FULL UUID, or an
+        # index — teamctl uses the captured UUID ONLY (exact-session
+        # rule), and the prompt must ride `-p` when resuming (issue
+        # #14180). Sessions are PROJECT-SCOPED (keyed to the cwd), so
+        # follow-ups must run from the dispatch cwd — cmd_followup
+        # already reuses info["cwd"]. Known caveat: issue #24808 reports
+        # intermittent "Invalid session identifier" on resume; failures
+        # surface verbatim in error.log/status and are re-triable.
+        "argv": ["gemini"],
+        "headless": ["gemini", "-p", "{task}", "--output-format", "json"],
+        "resume": ["gemini", "--resume", "{session_id}", "-p", "{task}",
+                   "--output-format", "json"],
+        "model_args": ["-m", "{model}"],
+        # VERIFIED (0.46.0 --help): no per-invocation effort/thinking flag
+        # exists — thinking control lives in settings.json, which teamctl
+        # never mutates. --effort is dropped with a stderr note.
+        "effort_args": None,
+        "resume_takes_model": True,
+        "session_source": {"type": "result-json", "key": "session_id"},
+        "auth_env": "GEMINI_API_KEY",
+        "auth_env_extra": ["GOOGLE_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS"],
+        "auth_files": ["~/.gemini/oauth_creds.json"],
+        # no standalone login subcommand exists; /auth is the in-TUI flow
+        # (the hint renders inside backticks — keep it quote-free)
+        "login_hint": "run gemini, then /auth (Login with Google)",
+        # honesty over cheer: gemini exposes NO local usage feed (no
+        # statusline pipe, no session-log rate_limits, and current builds
+        # removed the /stats used-% display) — it stays 'quiet' for good
+        "wake_hint": "gemini exposes no local usage feed — it stays quiet",
+        "waiting_patterns": [r"(?i)apply this change", r"(?i)allow execution",
+                             r"\((?:Y/n|y/N)\)", r"(?i)waiting for user",
+                             r"❯\s*1\."],
+        "routable": True,
+    },
+    "shell": {
+        "argv": [_SHELL],
+        "headless": [_SHELL, "-c", "{task}"],
+        "resume": [_SHELL, "-c", "{task}"],  # sessionless: a fresh shell
+        "session_source": None,
+        "quiet_flags": True,
+        "routable": False,
+    },
 }
+
+# provider -> interactive launch argv prefix. A thin BUILT-INS view of the
+# registry kept for readers/tests; live lookups (which must also see
+# custom providers) go through provider_spec().
+PROVIDERS: dict[str, list[str]] = {
+    name: list(spec["argv"]) for name, spec in PROVIDER_SPECS.items()
+}
+
+# names a [providers.custom.*] block may never claim: the built-ins, plus
+# words with fixed meanings in teamctl's own surfaces
+_RESERVED_PROVIDER_NAMES = frozenset(PROVIDER_SPECS) | {"all", "probes",
+                                                        "states", "custom"}
+
+_warned_custom_blocks: set[str] = set()
+
+
+def _warn_custom_once(name: str, why: str) -> None:
+    """One stderr line per (block, reason) per process — a malformed custom
+    block must be loud but must never spam or take down built-ins."""
+    key = f"{name}: {why}"
+    if key in _warned_custom_blocks:
+        return
+    _warned_custom_blocks.add(key)
+    print(f"teamctl: ignoring [providers.custom.{name}]: {why}",
+          file=sys.stderr)
+
+
+def _str_list(v) -> list[str] | None:
+    if isinstance(v, list) and all(isinstance(x, str) for x in v):
+        return list(v)
+    return None
+
+
+def custom_provider_specs() -> dict[str, dict]:
+    """User-defined providers from [providers.custom.*] blocks, validated
+    into the same spec schema the built-ins use. Invalid blocks are skipped
+    with one honest stderr warning; built-ins are never affected."""
+    raw = (load_config().get("providers") or {}).get("custom")
+    if not isinstance(raw, dict):
+        return {}
+    specs: dict[str, dict] = {}
+    for name, block in raw.items():
+        if not isinstance(block, dict):
+            _warn_custom_once(str(name), "not a table")
+            continue
+        if name in _RESERVED_PROVIDER_NAMES:
+            _warn_custom_once(name, "the name shadows a built-in provider "
+                                    "(or a reserved word) — pick another")
+            continue
+        if not _role_ok(name) or "." in name:
+            _warn_custom_once(name, "provider names use letters, digits, "
+                                    "'_', '-' (start alphanumeric, no dots)")
+            continue
+        command = block.get("command")
+        if not isinstance(command, str) or not command.strip():
+            _warn_custom_once(name, "`command` (the CLI to run) is required")
+            continue
+        command = command.strip()
+
+        headless_args = _str_list(block.get("headless_args", []))
+        interactive_args = _str_list(block.get("interactive_args", []))
+        resume_args = _str_list(block.get("resume_args", []))
+        model_args = _str_list(block.get("model_args", []))
+        effort_args = _str_list(block.get("effort_args", []))
+        auth_files = _str_list(block.get("auth_files", []))
+        if None in (headless_args, interactive_args, resume_args,
+                    model_args, effort_args, auth_files):
+            _warn_custom_once(name, "*_args and auth_files must be lists "
+                                    "of strings")
+            continue
+        if headless_args and not any("{task}" in t for t in headless_args):
+            _warn_custom_once(name, "headless_args must carry a {task} "
+                                    "placeholder")
+            continue
+        if model_args and not any("{model}" in t for t in model_args):
+            _warn_custom_once(name, "model_args must carry a {model} "
+                                    "placeholder")
+            continue
+        if effort_args and not any("{effort}" in t for t in effort_args):
+            _warn_custom_once(name, "effort_args must carry an {effort} "
+                                    "placeholder")
+            continue
+
+        # exact-session follow-ups need BOTH a resume shape and a session
+        # source; anything less degrades to "no follow-ups", stated once
+        sid_key = str(block.get("session_id_key") or "")
+        sid_regex = str(block.get("session_id_regex") or "")
+        session_source = None
+        if sid_key:
+            session_source = {"type": "result-json", "key": sid_key}
+        elif sid_regex:
+            try:
+                re.compile(sid_regex)
+            except re.error as exc:
+                _warn_custom_once(name, f"session_id_regex does not "
+                                        f"compile ({exc}) — follow-ups "
+                                        "disabled")
+                sid_regex = ""
+            if sid_regex:
+                # a custom text-only CLI may print its id to stdout OR
+                # stderr — scan both artifacts (stderr first)
+                session_source = {"type": "stderr-regex",
+                                  "pattern": sid_regex,
+                                  "artifacts": ["error.log",
+                                                "result.json"]}
+        resume = None
+        if resume_args:
+            if not any("{session_id}" in t for t in resume_args):
+                _warn_custom_once(name, "resume_args must carry a "
+                                        "{session_id} placeholder — "
+                                        "follow-ups disabled")
+            elif session_source is None:
+                _warn_custom_once(name, "resume_args set but no "
+                                        "session_id_key/session_id_regex — "
+                                        "follow-ups disabled")
+            else:
+                resume = [command] + resume_args
+
+        patterns = _str_list(block.get("waiting_patterns", []))
+        if patterns is None:
+            _warn_custom_once(name, "waiting_patterns must be a list of "
+                                    "strings")
+            continue
+        good_patterns = []
+        for pat in patterns:
+            try:
+                re.compile(pat)
+                good_patterns.append(pat)
+            except re.error as exc:
+                _warn_custom_once(name, f"waiting_pattern {pat!r} does not "
+                                        f"compile ({exc}) — dropped")
+
+        probe_command = str(block.get("probe_command") or "")
+        routable = block.get("routable", True)
+        if not isinstance(routable, bool):
+            routable = str(routable).strip().lower() not in ("false", "0",
+                                                             "no", "off")
+        specs[name] = {
+            "argv": [command] + interactive_args,
+            "headless": ([command] + headless_args) if headless_args
+            else None,
+            "resume": resume,
+            "model_args": model_args or None,
+            "effort_args": effort_args or None,
+            "resume_takes_model": True,
+            "session_source": session_source if resume else None,
+            "auth_env": str(block.get("auth_env") or "") or None,
+            "auth_files": auth_files,
+            "login_hint": str(block.get("login_hint") or ""),
+            "wake_hint": "",
+            "probe": ({"argv": [command], "command": probe_command,
+                       "extra_enters": 1} if probe_command else None),
+            "waiting_patterns": good_patterns,
+            "routable": routable,
+            "custom": True,
+        }
+    return specs
+
+
+def provider_spec(name: str) -> dict | None:
+    """The resolved spec for one provider: built-ins, then custom blocks."""
+    if name in PROVIDER_SPECS:
+        return PROVIDER_SPECS[name]
+    return custom_provider_specs().get(name)
+
+
+def known_provider_names() -> list[str]:
+    """Every spawnable provider name, built-ins first."""
+    return list(PROVIDER_SPECS) + sorted(custom_provider_specs())
+
+
+def routable_providers() -> tuple[str, ...]:
+    """Providers that participate in route/usage/providers tables: the
+    routable built-ins plus routable custom providers."""
+    names = [n for n, s in PROVIDER_SPECS.items() if s.get("routable")]
+    names += sorted(n for n, s in custom_provider_specs().items()
+                    if s.get("routable"))
+    return tuple(names)
+
+
+def provider_installed(name: str) -> bool:
+    """Is the provider's actual CLI binary on PATH? (A custom provider's
+    name and its `command` can differ — the command is what must exist.)"""
+    spec = provider_spec(name)
+    if not spec:
+        return False
+    return shutil.which(spec["argv"][0]) is not None
+
+
+def wake_hint(provider: str) -> str:
+    """How a quiet provider produces its first usage numbers."""
+    return (provider_spec(provider) or {}).get("wake_hint") or "use it once"
+
+
+def login_hint(provider: str) -> str:
+    """The provider CLI's own sign-in command/flow."""
+    return ((provider_spec(provider) or {}).get("login_hint")
+            or f"{provider} login")
+
+
+def provider_supports_effort(name: str) -> bool:
+    return bool((provider_spec(name) or {}).get("effort_args"))
 
 
 class TeamctlError(Exception):
@@ -136,16 +494,18 @@ def _reject_bad_role(role: str) -> bool:
 #           Cross-checked against `codex login status` (rc 0 / 1).
 #   grok    ~/.grok/auth.json holding at least one credential entry
 #           (issuer-keyed dicts with refresh_token/key were observed).
+#   gemini  ~/.gemini/oauth_creds.json (OAuth token cache — official auth
+#           docs); the login flow is in-TUI (/auth), there is no
+#           standalone login subcommand.
 #
-# An exported provider API key (ANTHROPIC_API_KEY / OPENAI_API_KEY /
-# XAI_API_KEY) also counts as signed in: the CLI works with it even when
-# no login artifact exists.
+# An exported provider API key (each spec's auth_env/auth_env_extra) also
+# counts as signed in: the CLI works with it even when no login artifact
+# exists. Custom providers with neither auth_env nor auth_files configured
+# are 'unprobed' — teamctl states that it cannot know, instead of guessing
+# either way.
 # --------------------------------------------------------------------------
 
 _CORRUPT = object()  # a JSON artifact that exists but cannot be read/parsed
-
-_AUTH_ENV_KEYS = {"claude": "ANTHROPIC_API_KEY", "codex": "OPENAI_API_KEY",
-                  "grok": "XAI_API_KEY"}
 
 # Signs of real grok CLI use, for the last-resort auth fallback. Bare
 # ~/.grok existence is NOT a login signal any more: `teamctl lead on`
@@ -198,12 +558,17 @@ def _grok_auth_fallback(auth_path: Path) -> bool:
 
 
 def provider_auth_state(provider: str) -> tuple[str, str]:
-    """('signed-in' | 'signed-out' | 'unknown', note) for one provider.
+    """('signed-in' | 'signed-out' | 'unknown' | 'unprobed', note).
 
     'unknown' means an auth artifact exists but could not be read — the
-    honest answer, reported instead of guessing either way."""
+    honest answer, reported instead of guessing either way. 'unprobed'
+    means teamctl has nothing to consult (a custom provider with no
+    auth_env/auth_files configured) — stated, never guessed."""
     home = Path.home()
-    if os.environ.get(_AUTH_ENV_KEYS.get(provider, ""), ""):
+    spec = provider_spec(provider) or {}
+    env_keys = [k for k in [spec.get("auth_env"),
+                            *(spec.get("auth_env_extra") or [])] if k]
+    if any(os.environ.get(k, "") for k in env_keys):
         return "signed-in", "via exported API key"
 
     if provider == "claude":
@@ -239,11 +604,46 @@ def provider_auth_state(provider: str) -> tuple[str, str]:
             return "unknown", "auth artifacts exist but are unreadable"
         return "signed-out", ""
 
-    return "unknown", ""
+    # generic artifact probe (gemini and custom providers) — the same
+    # discipline as the built-in branches above: a parseable, non-empty
+    # JSON artifact means signed in; exists-but-unreadable means 'unknown';
+    # nothing found means signed out. A provider that gave teamctl nothing
+    # to consult is 'unprobed' — the honest non-answer.
+    files = [Path(os.path.expanduser(p))
+             for p in (spec.get("auth_files") or [])]
+    if not files:
+        # for a CUSTOM provider an env key is a POSITIVE-only signal: its
+        # absence proves nothing (the CLI may hold its own login — a
+        # keyring, its own token store). Only auth_files can prove
+        # signed-out. Stated, never guessed.
+        if env_keys and spec.get("custom"):
+            return "unprobed", (f"auth not probed ({env_keys[0]} not set; "
+                                "the CLI may hold its own login — set "
+                                "auth_files to enable detection)")
+        if env_keys:
+            return "signed-out", ""   # built-in with env-only detection
+        note = "auth not probed"
+        if spec.get("custom"):
+            note += (" (custom provider — set auth_files/auth_env to "
+                     "enable detection)")
+        return "unprobed", note
+    corrupt = False
+    for f in files:
+        data = _read_json_artifact(f)
+        if isinstance(data, dict) and any(bool(v) for v in data.values()):
+            return "signed-in", ""
+        if data is _CORRUPT:
+            corrupt = True
+    if corrupt:
+        return "unknown", "auth artifacts exist but are unreadable"
+    return "signed-out", ""
 
 
 def provider_authed(provider: str) -> bool:
-    return provider_auth_state(provider)[0] == "signed-in"
+    """Usable-for-work: signed in, or explicitly configured with nothing
+    to probe (an 'unprobed' custom provider is routable by the user's own
+    choice — refusing would break the escape hatch)."""
+    return provider_auth_state(provider)[0] in ("signed-in", "unprobed")
 
 
 def config_path() -> Path:
@@ -267,9 +667,9 @@ def provider_defaults(provider: str) -> tuple[str | None, str | None]:
 
 
 def available_providers() -> list[str]:
-    """Installed AND logged-in providers, in (arbitrary) alphabetical order."""
-    return [p for p in ROUTABLE
-            if shutil.which(p) is not None and provider_authed(p)]
+    """Installed AND logged-in routable providers, in registry order."""
+    return [p for p in routable_providers()
+            if provider_installed(p) and provider_authed(p)]
 
 
 def default_provider() -> str | None:
@@ -290,13 +690,14 @@ def _provider_or_fail(requested: str) -> str | None:
     """--provider value -> provider, or None after printing why (exit 2).
     Never silently picks among several providers: that choice is the user's."""
     if requested:
-        if requested not in PROVIDERS:
-            print(f"teamctl: unknown provider '{requested}'.", file=sys.stderr)
+        if provider_spec(requested) is None:
+            print(f"teamctl: unknown provider '{requested}' (known: "
+                  f"{', '.join(known_provider_names())}).", file=sys.stderr)
             return None
         return requested
     prov = default_provider()
     if prov is not None:
-        if prov not in PROVIDERS:
+        if provider_spec(prov) is None:
             print(f"teamctl: routing.preference starts with unknown provider "
                   f"'{prov}' — fix it with `teamctl config routing.preference "
                   "...`.", file=sys.stderr)
@@ -311,32 +712,46 @@ def _provider_or_fail(requested: str) -> str | None:
     return None
 
 
+def _expand_tokens(tokens: list[str], task: str = "", model: str = "",
+                   effort: str = "", session_id: str = "") -> list[str]:
+    """Substitute {task}/{model}/{effort}/{session_id} INSIDE argv tokens.
+    Values only ever land in argv slots (shlex-quoted wholesale wherever a
+    shell line is built) — no shell interpolation can ever see them."""
+    vals = {"{task}": task, "{model}": model, "{effort}": effort,
+            "{session_id}": session_id}
+    out: list[str] = []
+    for tok in tokens:
+        for ph, val in vals.items():
+            if ph in tok:
+                tok = tok.replace(ph, val)
+        out.append(tok)
+    return out
+
+
+def _model_effort_args(spec: dict, provider: str, model: str,
+                       effort: str) -> list[str]:
+    """The optional model/effort flags for one launch. An effort requested
+    from a provider with no effort control is DROPPED with a one-line
+    stderr note — never silently, never guessed into some other flag."""
+    a: list[str] = []
+    if model and spec.get("model_args"):
+        a += _expand_tokens(spec["model_args"], model=model)
+    if effort:
+        if spec.get("effort_args"):
+            a += _expand_tokens(spec["effort_args"], effort=effort)
+        elif not spec.get("quiet_flags"):
+            print(f"teamctl: note: {provider} has no effort flag — "
+                  "--effort ignored", file=sys.stderr)
+    return a
+
+
 def headless_argv(provider: str, task: str, model: str, effort: str) -> list[str]:
-    """Headless (non-interactive) launch argv for each provider."""
-    if provider == "claude":
-        a = ["claude", "-p", task, "--output-format", "json"]
-        if model:
-            a += ["--model", model]
-        if effort:
-            a += ["--effort", effort]
-        return a
-    if provider == "grok":
-        a = ["grok", "--single", task, "--output-format", "json"]
-        if model:
-            a += ["-m", model]
-        if effort:
-            a += ["--effort", effort]
-        return a
-    if provider == "codex":
-        a = ["codex", "exec", task]
-        if model:
-            a += ["-m", model]
-        if effort:
-            a += ["-c", f'model_reasoning_effort="{effort}"']
-        return a
-    if provider == "shell":  # fake provider for tests: task is a shell snippet
-        return [os.environ.get("SHELL", "/bin/bash"), "-c", task]
-    raise TeamctlError(f"no headless adapter for provider '{provider}'")
+    """Headless (non-interactive) launch argv, expanded from the spec."""
+    spec = provider_spec(provider)
+    if spec is None or not spec.get("headless"):
+        raise TeamctlError(f"no headless adapter for provider '{provider}'")
+    return (_expand_tokens(spec["headless"], task=task)
+            + _model_effort_args(spec, provider, model, effort))
 
 
 def resume_argv(provider: str, task: str, model: str, effort: str,
@@ -344,34 +759,32 @@ def resume_argv(provider: str, task: str, model: str, effort: str,
     """Continue a SPECIFIC provider session. Exact-session only — resuming
     'the most recent session' is banned (wrong session under concurrency).
     Flags verified against each CLI's own help: claude `--resume <id>`,
-    grok `-r <id>`, codex `exec resume <SESSION_ID> <prompt>`."""
-    if provider == "claude":
-        a = ["claude", "-p", task, "--output-format", "json",
-             "--resume", session_id]
-        if model:
-            a += ["--model", model]
-        return a
-    if provider == "grok":
-        a = ["grok", "--single", task, "--output-format", "json",
-             "-r", session_id]
-        if model:
-            a += ["-m", model]
-        return a
-    if provider == "codex":
-        return ["codex", "exec", "resume", session_id, task]
-    if provider == "shell":
-        return [os.environ.get("SHELL", "/bin/bash"), "-c", task]
-    raise TeamctlError(f"no resume adapter for provider '{provider}'")
+    grok `-r <id>`, codex `exec resume <SESSION_ID> <prompt>`, gemini
+    `--resume <uuid>` (UUID form only). Model flags ride along when the
+    spec says so (codex's resume takes none); effort is never re-sent on
+    a resume."""
+    spec = provider_spec(provider)
+    if spec is None or not spec.get("resume"):
+        raise TeamctlError(f"no resume adapter for provider '{provider}'")
+    a = _expand_tokens(spec["resume"], task=task, session_id=session_id)
+    if model and spec.get("resume_takes_model") and spec.get("model_args"):
+        a += _expand_tokens(spec["model_args"], model=model)
+    return a
 
 
 def classify_output(text: str) -> str:
-    """Recognize credit-exhaustion / auth failures in provider output."""
+    """Recognize credit-exhaustion / auth failures in provider output.
+    Never provider-keyed, so custom providers get the signals for free.
+    "resource_exhausted" is the Gemini API's quota error status; "set an
+    auth method" is gemini's headless not-signed-in message (verified live
+    against 0.46.0)."""
     low = text.lower()
     if any(s in low for s in ("usage limit", "rate limit", "quota", "out of credits",
-                              "insufficient credit")):
+                              "insufficient credit", "resource_exhausted")):
         return "exhausted"
     if any(s in low for s in ("unauthorized", "not logged in", "authentication",
-                              "please log in", "invalid api key")):
+                              "please log in", "invalid api key",
+                              "set an auth method")):
         return "auth-error"
     return "ok"
 
@@ -436,6 +849,10 @@ def live_pane_ids() -> set[str]:
     return {line.strip() for line in out.splitlines() if line.strip()}
 
 
+# the newest N crash/reboot-lost teammates kept for `teamctl resurrect`
+LOST_CAP = 20
+
+
 def reconcile(state: dict) -> dict:
     """Keep tracked teammates honest against the live tmux panes.
 
@@ -448,9 +865,16 @@ def reconcile(state: dict) -> dict:
     whose pane is gone is therefore FINISHED (or died mid-task), not
     vanished — it stays tracked, with its stale pane id cleared, until an
     explicit `teamctl shutdown <role>` removes it. `result` and `followup`
-    keep working from the handoff artifacts indefinitely."""
+    keep working from the handoff artifacts indefinitely.
+
+    An interactive teammate whose pane vanished WITHOUT `teamctl shutdown`
+    (crash, reboot, user-closed pane — explicit shutdown deletes directly
+    and never passes through this path) is moved to state["lost"] instead
+    of being silently forgotten: `teamctl resurrect` rebuilds the roster
+    from those records (capped at the newest LOST_CAP entries)."""
     live = live_pane_ids()
     survivors: dict[str, dict] = {}
+    lost: dict[str, dict] = dict(state.get("lost") or {})
     changed = False
     for role, info in state["teammates"].items():
         pane = info.get("pane_id")
@@ -464,9 +888,16 @@ def reconcile(state: dict) -> dict:
                 changed = True
             survivors[role] = info
             continue
-        changed = True  # interactive teammate without a pane is gone
+        changed = True  # interactive teammate without a pane: LOST
+        lost[role] = {**info,
+                      "lost_at": time.strftime("%Y-%m-%dT%H:%M:%S")}
+    while len(lost) > LOST_CAP:
+        oldest = min(lost, key=lambda r: lost[r].get("lost_at", ""))
+        del lost[oldest]
     if changed:
         state["teammates"] = survivors
+        if lost:
+            state["lost"] = lost
         save_state(state)
     return state
 
@@ -493,29 +924,19 @@ def _mate_state(role: str, info: dict, live: set[str]) -> str:
 
 def interactive_flags(provider: str, model: str, effort: str) -> list[str]:
     """Model/effort flags for an interactive launch."""
-    f: list[str] = []
-    if provider == "claude":
-        if model:
-            f += ["--model", model]
-        if effort:
-            f += ["--effort", effort]
-    elif provider == "grok":
-        if model:
-            f += ["-m", model]
-        if effort:
-            f += ["--effort", effort]
-    elif provider == "codex":
-        if model:
-            f += ["-m", model]
-        if effort:
-            f += ["-c", f'model_reasoning_effort="{effort}"']
-    return f
+    spec = provider_spec(provider)
+    if spec is None:
+        return []
+    return _model_effort_args(spec, provider, model, effort)
 
 
 def build_launch_line(provider: str, prompt: str, cwd: str,
                       model: str = "", effort: str = "") -> str:
     """The shell command a teammate pane runs. All values are shell-quoted."""
-    launch = list(PROVIDERS[provider]) + interactive_flags(provider, model, effort)
+    spec = provider_spec(provider)
+    if spec is None:
+        raise TeamctlError(f"unknown provider '{provider}'")
+    launch = list(spec["argv"]) + interactive_flags(provider, model, effort)
     if prompt:
         launch.append(prompt)
     return f"cd {shlex.quote(cwd)} && exec {' '.join(shlex.quote(a) for a in launch)}"
@@ -680,6 +1101,17 @@ def cmd_spawn(args: argparse.Namespace) -> int:
             )
             return 1
 
+        try:
+            wt = _maybe_alloc_worktree(args.role, cwd,
+                                       getattr(args, "worktree", None))
+        except TeamctlError as exc:
+            print(f"teamctl: {exc}", file=sys.stderr)
+            return 2
+        if wt:
+            cwd = wt["path"]
+            inner = build_launch_line(args.provider, args.prompt, cwd,
+                                      model, effort)
+
         existing = [i.get("pane_id", "") for i in state["teammates"].values()]
         pane_id = _open_pane(inner, existing)
         _set_pane_title(pane_id, args.role, model)
@@ -694,6 +1126,8 @@ def cmd_spawn(args: argparse.Namespace) -> int:
             "mode": "interactive",
             "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         }
+        if wt:
+            state["teammates"][args.role]["worktree"] = wt
         save_state(state)
 
     print(f"spawned teammate '{args.role}' ({args.provider}"
@@ -711,18 +1145,230 @@ def cmd_list(args: argparse.Namespace) -> int:
                      for role, info in mates.items()}
         print(json.dumps(annotated, indent=2, sort_keys=True))
         return 0
+    lost = state.get("lost") or {}
     if not mates:
         print("no active teammates")
+        if lost:
+            print(f"{len(lost)} teammate(s) lost in a crash/reboot "
+                  f"({', '.join(sorted(lost))}) — rebuild: teamctl "
+                  "resurrect")
         return 0
     width = max(len(r) for r in mates)
     print(f"{'ROLE'.ljust(width)}  PROVIDER  PANE     STATE        CREATED")
     for role in sorted(mates):
         i = mates[role]
         st = _mate_state(role, i, live)
+        # fast needs-input flag for interactive mates (single capture, no
+        # settle wait — `teamctl status` runs the full busy/idle classifier)
+        if st == "active" and (i.get("pane_id") or "") in live:
+            hit = _match_waiting(_capture_pane(i["pane_id"]),
+                                 _waiting_patterns(i.get("provider", "")))
+            if hit:
+                st = "input?"
+        wt = i.get("worktree") or {}
+        marker = f"  ⌂ {wt['branch']}" if wt.get("branch") else ""
         print(
             f"{role.ljust(width)}  {i['provider']:<8}  "
-            f"{i.get('pane_id') or '-':<7}  {st:<11}  {i.get('created_at', '')}"
+            f"{i.get('pane_id') or '-':<7}  {st:<11}  "
+            f"{i.get('created_at', '')}{marker}"
         )
+    if lost:
+        print(f"\n{len(lost)} teammate(s) lost in a crash/reboot "
+              f"({', '.join(sorted(lost))}) — rebuild: teamctl resurrect")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# teammate status detection — busy / needs-input / idle, on demand (no
+# daemon). Two capture-pane samples ~0.7s apart: changing content = busy;
+# stable content matching the provider's waiting_patterns (OBSERVED-ONLY
+# TUI approval-dialog text — defensive parsing, same posture as the usage
+# probes) = needs-input; anything else = idle. An unrecognized TUI
+# degrades to idle — never a wrong strong claim.
+# --------------------------------------------------------------------------
+
+def _waiting_patterns(provider: str) -> list[str]:
+    return list((provider_spec(provider) or {}).get("waiting_patterns")
+                or [])
+
+
+def _match_waiting(text: str, patterns: list[str]) -> str | None:
+    """The first waiting-shape LINE in the tail of pane text; None when
+    nothing matches (or a pattern is broken — skipped, never fatal)."""
+    tail = [ln for ln in text.rstrip().splitlines()[-15:] if ln.strip()]
+    for pat in patterns:
+        for ln in tail:
+            try:
+                if re.search(pat, ln):
+                    return ln.strip()
+            except re.error:
+                break
+    return None
+
+
+def _pane_activity(pane_id: str, provider: str,
+                   settle: float = 0.7) -> tuple[str, str]:
+    """(state, detail) for a live interactive pane."""
+    first = _capture_pane(pane_id)
+    time.sleep(settle)
+    second = _capture_pane(pane_id)
+    if first != second:
+        return "busy", ""
+    hit = _match_waiting(second, _waiting_patterns(provider))
+    if hit:
+        return "needs-input", hit[:80]
+    return "idle", ""
+
+
+def _classify_mate(role: str, info: dict, live: set[str],
+                   settle: float = 0.7) -> tuple[str, str]:
+    """(state, detail) for any teammate: dispatch mates keep their derived
+    lifecycle states (running/done/failed/died); interactive mates get the
+    pane classifier."""
+    if info.get("mode") == "dispatch":
+        return _mate_state(role, info, live), ""
+    pane = info.get("pane_id") or ""
+    if not pane or pane not in live:
+        return "gone", ""
+    return _pane_activity(pane, info.get("provider", ""), settle)
+
+
+def _status_cache_path() -> Path:
+    return state_path().parent / "status-cache.json"
+
+
+def _load_status_cache() -> dict:
+    try:
+        p = _status_cache_path()
+        data = json.loads(p.read_text()) if p.exists() else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _save_status_cache(cache: dict) -> None:
+    try:
+        p = _status_cache_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(cache, indent=2, sort_keys=True))
+        tmp.replace(p)
+    except OSError:
+        pass    # the cache only powers transition detection — best effort
+
+
+def _notify_argv() -> list[str]:
+    """[notify] command, split into argv — NEVER interpolated through a
+    shell. Context rides environment variables instead."""
+    raw = (load_config().get("notify") or {}).get("command", "")
+    try:
+        return shlex.split(str(raw)) if raw else []
+    except ValueError:
+        return []
+
+
+def _fire_notify(role: str, new_state: str, prev_state: str) -> None:
+    """Run the notify hook for one observed transition. Context via env:
+    TEAMCTL_ROLE, TEAMCTL_MATE_STATE, TEAMCTL_PREV_STATE. (Deliberately
+    NOT 'TEAMCTL_STATE' — that env var already means the state-file
+    override, and a hook that calls teamctl back must keep working.)
+    Best-effort: a broken hook prints one line, never breaks status."""
+    argv = _notify_argv()
+    if not argv:
+        return
+    env = dict(os.environ)
+    env["TEAMCTL_ROLE"] = role
+    env["TEAMCTL_MATE_STATE"] = new_state
+    env["TEAMCTL_PREV_STATE"] = prev_state
+    try:
+        subprocess.run(argv, env=env, capture_output=True, timeout=10)
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"teamctl: notify hook failed: {exc}", file=sys.stderr)
+
+
+def _observe_transitions(states: dict[str, str]) -> None:
+    """Compare freshly-observed states against the persisted last-known
+    ones; fire the notify hook per change. Honest limitation (documented):
+    teamctl has no daemon — transitions are observed only when status/
+    list/--watch actually looks."""
+    cache = _load_status_cache()
+    changed = False
+    for role, new_state in states.items():
+        prev = cache.get(role, "")
+        if prev != new_state:
+            if prev:                    # a first sighting is not a transition
+                _fire_notify(role, new_state, prev)
+            cache[role] = new_state
+            changed = True
+    for role in [r for r in cache if r not in states]:
+        del cache[role]
+        changed = True
+    if changed:
+        _save_status_cache(cache)
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    """One-shot (or --watch) teammate status: busy / needs-input / idle
+    for interactive mates, the derived lifecycle for dispatch mates."""
+    def observe() -> dict[str, tuple[str, str]]:
+        with state_lock():
+            state = reconcile(load_state())
+        mates = state["teammates"]
+        if args.role:
+            if args.role not in mates:
+                return {}
+            mates = {args.role: mates[args.role]}
+        live = live_pane_ids()
+        return {role: _classify_mate(role, info, live)
+                for role, info in sorted(mates.items())}
+
+    if getattr(args, "watch", False):
+        interval = max(1.0, float(getattr(args, "interval", 5.0)))
+        print(f"watching teammate status every {interval:.0f}s — Ctrl-C "
+              "to stop")
+        prev: dict[str, str] = {}
+        try:
+            while True:
+                rows = observe()
+                states = {r: s for r, (s, _d) in rows.items()}
+                for role, (st, detail) in rows.items():
+                    if prev.get(role) != st:
+                        stamp = time.strftime("%H:%M:%S")
+                        extra = f"  ({detail})" if detail else ""
+                        was = prev.get(role, "?")
+                        print(f"{stamp}  {role}: {was} -> {st}{extra}")
+                for role in [r for r in prev if r not in states]:
+                    print(f"{time.strftime('%H:%M:%S')}  {role}: gone")
+                _observe_transitions(states)
+                prev = states
+                time.sleep(interval)
+        except KeyboardInterrupt:
+            print()
+            return 0
+
+    rows = observe()
+    if args.role and not rows:
+        print(f"teamctl: no teammate '{args.role}'.", file=sys.stderr)
+        return 1
+    _observe_transitions({r: s for r, (s, _d) in rows.items()})
+    if args.json:
+        with state_lock():
+            state = reconcile(load_state())
+        out = {}
+        for role, (st, detail) in rows.items():
+            info = state["teammates"].get(role, {})
+            out[role] = {"provider": info.get("provider"),
+                         "mode": info.get("mode"),
+                         "state": st, "detail": detail or None}
+        print(json.dumps(out, indent=2, sort_keys=True))
+        return 0
+    if not rows:
+        print("no active teammates")
+        return 0
+    width = max(len(r) for r in rows)
+    print(f"{'ROLE'.ljust(width)}  STATE        DETAIL")
+    for role, (st, detail) in rows.items():
+        print(f"{role.ljust(width)}  {st:<11}  {detail}")
     return 0
 
 
@@ -765,14 +1411,17 @@ def _kill_tree(pid: int) -> bool:
         if not any(_pid_alive(p) for p in pids):
             return True
         time.sleep(0.15)
-    # escalate
+    # escalate — and give the reap time to settle: a just-KILLed process
+    # lingers as a zombie (os.kill(pid, 0) still succeeds) until its
+    # parent reaps it, which a loaded machine can take seconds to do.
+    # Success returns early; only the true-failure path waits this long.
     for p in pids:
         if _pid_alive(p):
             try:
                 os.kill(p, 9)
             except (ProcessLookupError, PermissionError):
                 pass
-    for _ in range(4):
+    for _ in range(20):
         if not any(_pid_alive(p) for p in pids):
             return True
         time.sleep(0.15)
@@ -806,10 +1455,11 @@ def _close_pane(pane_id: str) -> bool:
     if pid is not None and _pid_alive(pid):
         if not _kill_tree(pid):
             return False
-    # now close the (possibly still-open) pane
+    # now close the (possibly still-open) pane; the poll is generous for
+    # the same zombie-reap reason as _kill_tree — success returns early
     if pane_id in live_pane_ids():
         tmux("kill-pane", "-t", pane_id, check=False)
-    for _ in range(4):
+    for _ in range(20):
         pane_gone = pane_id not in live_pane_ids()
         proc_gone = pid is None or not _pid_alive(pid)
         if pane_gone and proc_gone:
@@ -825,6 +1475,15 @@ def cmd_shutdown(args: argparse.Namespace) -> int:
         state = reconcile(load_state())
         info = state["teammates"].get(args.role)
         if not info:
+            # an explicit shutdown of a crash-lost role clears its record
+            lost = dict(state.get("lost") or {})
+            if args.role in lost:
+                del lost[args.role]
+                state["lost"] = lost
+                save_state(state)
+                print(f"cleared lost teammate '{args.role}' (it will no "
+                      "longer be offered by `teamctl resurrect`)")
+                return 0
             print(f"teamctl: no active teammate '{args.role}'.", file=sys.stderr)
             return 1
         pane_id = info.get("pane_id") or ""
@@ -843,6 +1502,13 @@ def cmd_shutdown(args: argparse.Namespace) -> int:
         hd = Path(info.get("handoff") or handoff_dir(args.role))
         if hd.is_dir() and hd != state_path().parent:
             shutil.rmtree(hd, ignore_errors=True)
+
+    # worktree reconciliation AFTER the process is verifiably dead (never
+    # remove a directory from under a live teammate): clean -> removed,
+    # anything un-landed -> kept and reported. Stranding is impossible.
+    wt = info.get("worktree")
+    if wt:
+        _shutdown_worktree(args.role, wt)
 
     _enforce_lead_width()
     if pane_id:
@@ -880,6 +1546,503 @@ def cmd_send(args: argparse.Namespace) -> int:
         tmux("send-keys", "-t", pane_id, "C-m", check=False)
 
     print(f"sent to '{args.role}' (pane {pane_id})")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# git-worktree isolation — every teammate gets its own branch in its own
+# directory (one shared object store), so parallel writers PHYSICALLY
+# cannot collide: the "never two teammates edit the same file" rule,
+# mechanically enforced. ON by default in a git repo; spawning elsewhere
+# degrades to the plain cwd with one honest note. `teamctl land <role>`
+# closes the loop (review → checkpoint → merge → cleanup), and shutdown
+# can never strand work: a worktree with anything un-landed is KEPT and
+# reported, never silently discarded — with the registry
+# (<state>/worktrees.json) as the durable record that outlives the
+# teammate's state entry.
+#
+# Git safety rule, enforced by construction and audited by tests: teamctl
+# NEVER passes -D, --force, or --hard to git. `git worktree remove` and
+# `git branch -d` refuse on anything unsaved/unmerged — git's own safety
+# is the backstop for any logic error in the checks here.
+# --------------------------------------------------------------------------
+
+def worktree_settings() -> dict:
+    """[worktree]: enabled (default TRUE — v0.5.0 turns isolation on),
+    dir ('' → <state>/worktrees), branch_prefix, cleanup (auto | keep)."""
+    raw = load_config().get("worktree") or {}
+    enabled = raw.get("enabled", True)
+    if not isinstance(enabled, bool):
+        enabled = str(enabled).strip().lower() not in ("false", "0", "no",
+                                                       "off")
+    cleanup = str(raw.get("cleanup") or "auto")
+    if cleanup not in ("auto", "keep"):
+        cleanup = "auto"
+    return {"enabled": enabled, "dir": str(raw.get("dir") or ""),
+            "branch_prefix": str(raw.get("branch_prefix") or "teamctl/"),
+            "cleanup": cleanup}
+
+
+def _git(repo: str, *args: str,
+         timeout: float = 30.0) -> subprocess.CompletedProcess | None:
+    """Run git with the same never-prompt/never-hang discipline as the
+    update fetches; None when git cannot run at all."""
+    env = dict(os.environ)
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    try:
+        return subprocess.run(["git", "-C", repo, *args],
+                              capture_output=True, text=True,
+                              timeout=timeout, env=env)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _git_ok(repo: str, *args: str) -> str | None:
+    """git stdout (stripped) on success, None on any failure."""
+    res = _git(repo, *args)
+    if res is None or res.returncode != 0:
+        return None
+    return res.stdout.strip()
+
+
+def _git_fail_tail(res: subprocess.CompletedProcess | None,
+                   fallback: str) -> str:
+    if res is None:
+        return "git not runnable"
+    tail = res.stderr.strip().splitlines()
+    return tail[-1] if tail else fallback
+
+
+def _repo_root(cwd: str) -> str | None:
+    return _git_ok(cwd, "rev-parse", "--show-toplevel")
+
+
+def worktrees_root() -> Path:
+    d = worktree_settings()["dir"]
+    if d:
+        return Path(os.path.expanduser(d))
+    return state_path().parent / "worktrees"
+
+
+def worktree_registry_path() -> Path:
+    return state_path().parent / "worktrees.json"
+
+
+def load_worktree_registry() -> dict:
+    """path -> {role, branch, repo, base_sha, created_at}. The durable
+    record of every teamctl-created worktree — it outlives the teammate's
+    state entry so `land`/`worktree list|prune` keep working after a
+    shutdown that preserved un-landed work (and after a reboot)."""
+    try:
+        p = worktree_registry_path()
+        data = json.loads(p.read_text()) if p.exists() else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_worktree_registry(reg: dict) -> None:
+    p = worktree_registry_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(reg, indent=2, sort_keys=True))
+    tmp.replace(p)
+
+
+def _alloc_worktree(role: str, cwd: str) -> dict:
+    """Create '<role>'s isolated worktree + branch off the current HEAD.
+    Refuses honestly (existing branch/path — never guesses a suffix) and
+    records the allocation in the registry. Returns
+    {path, branch, repo, base_sha}."""
+    root = _repo_root(cwd)
+    if root is None:
+        raise TeamctlError(
+            f"{cwd} is not inside a git repository — worktree isolation "
+            "needs one (use --no-worktree to opt out)")
+    branch = worktree_settings()["branch_prefix"] + role
+    if _git_ok(root, "rev-parse", "--verify", "--quiet",
+               f"refs/heads/{branch}") is not None:
+        raise TeamctlError(
+            f"branch {branch} already exists (un-landed work from a "
+            f"previous '{role}'?) — land it (`teamctl land {role}`), "
+            f"delete it yourself (`git -C {root} branch -D {branch}`), "
+            "or spawn under another role")
+    import hashlib
+    h8 = hashlib.sha256(root.encode()).hexdigest()[:8]
+    path = worktrees_root() / f"{Path(root).name}-{h8}" / role
+    if path.exists():
+        raise TeamctlError(
+            f"worktree path {path} already exists — clear it "
+            "(`teamctl worktree prune`) or spawn under another role")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    res = _git(root, "worktree", "add", "-b", branch, str(path), "HEAD")
+    if res is None or res.returncode != 0:
+        raise TeamctlError(
+            f"could not create worktree for '{role}': "
+            + _git_fail_tail(res, "git worktree add failed"))
+    base = _git_ok(root, "rev-parse", "HEAD") or ""
+    dirty = _git_ok(root, "status", "--porcelain")
+    if dirty:
+        n = len(dirty.splitlines())
+        print(f"note: {n} uncommitted change(s) in {root} are not visible "
+              f"to '{role}' — commit or stash first if it needs them.",
+              file=sys.stderr)
+    wt = {"path": str(path), "branch": branch, "repo": root,
+          "base_sha": base}
+    reg = load_worktree_registry()
+    reg[str(path)] = {**wt, "role": role,
+                      "created_at": time.strftime("%Y-%m-%dT%H:%M:%S")}
+    save_worktree_registry(reg)
+    return wt
+
+
+def _maybe_alloc_worktree(role: str, cwd: str,
+                          flag: bool | None) -> dict | None:
+    """The tri-state gate: --worktree forces (errors honestly when it
+    can't), --no-worktree skips, None follows [worktree] enabled (default
+    on — degrading to the plain cwd with one note outside a git repo, so
+    spawning in ~/notes keeps working)."""
+    enabled = worktree_settings()["enabled"] if flag is None else flag
+    if not enabled:
+        return None
+    explicit = flag is True
+    if shutil.which("git") is None:
+        if explicit:
+            raise TeamctlError("git is not installed — worktree isolation "
+                               "needs it")
+        print("note: git not found — teammate runs without worktree "
+              "isolation", file=sys.stderr)
+        return None
+    if _repo_root(cwd) is None:
+        if explicit:
+            raise TeamctlError(f"{cwd} is not inside a git repository — "
+                               "--worktree needs one")
+        print(f"note: {_tilde(cwd)} is not a git repository — '{role}' "
+              "runs without worktree isolation", file=sys.stderr)
+        return None
+    return _alloc_worktree(role, cwd)
+
+
+def _worktree_unique_work(wt: dict) -> tuple[bool, str]:
+    """(has_unique_work, detail). Dirty files or un-landed commits count
+    as unique work; a landed branch (tip reachable from the repo's HEAD)
+    or a no-new-commits branch does not. Anything UNREADABLE counts as
+    unique work — when unsure, keep; never guess toward deletion."""
+    path, repo = wt["path"], wt["repo"]
+    branch, base = wt["branch"], wt.get("base_sha") or ""
+    if not Path(path).exists():
+        return False, "path gone"
+    dirty = _git(path, "status", "--porcelain")
+    if dirty is None or dirty.returncode != 0:
+        return True, "git status unreadable — keeping"
+    if dirty.stdout.strip():
+        n = len(dirty.stdout.strip().splitlines())
+        return True, f"{n} uncommitted change(s)"
+    if base:
+        cnt = _git_ok(repo, "rev-list", "--count", f"{base}..{branch}")
+        if cnt == "0":
+            return False, "no new commits"
+        if cnt is None:
+            return True, "history unreadable — keeping"
+    merged = _git(repo, "merge-base", "--is-ancestor", branch, "HEAD")
+    if merged is not None and merged.returncode == 0:
+        return False, "landed (branch tip is in HEAD)"
+    if base:
+        cnt = _git_ok(repo, "rev-list", "--count", f"{base}..{branch}")
+        return True, f"{cnt} un-landed commit(s)"
+    return True, "unknown base — keeping"
+
+
+def _remove_worktree(wt: dict) -> tuple[bool, str]:
+    """Remove a worktree + its branch — via git's own NON-forced commands
+    only (`worktree remove`, `branch -d`): if either refuses, the caller
+    keeps everything and says so. Clears the registry entry on success."""
+    repo, path, branch = wt["repo"], wt["path"], wt["branch"]
+    if Path(path).exists():
+        res = _git(repo, "worktree", "remove", path)
+        if res is None or res.returncode != 0:
+            return False, ("git worktree remove refused: "
+                           + _git_fail_tail(res, "worktree remove failed"))
+    else:
+        _git(repo, "worktree", "prune")
+    if _git_ok(repo, "rev-parse", "--verify", "--quiet",
+               f"refs/heads/{branch}") is not None:
+        res = _git(repo, "branch", "-d", branch)
+        if res is None or res.returncode != 0:
+            return False, ("git branch -d refused: "
+                           + _git_fail_tail(res, "branch delete failed"))
+    reg = load_worktree_registry()
+    reg.pop(path, None)
+    save_worktree_registry(reg)
+    return True, "removed"
+
+
+def _shutdown_worktree(role: str, wt: dict) -> None:
+    """Shutdown's strand-proofing: remove a worktree only when it provably
+    holds nothing un-landed; otherwise KEEP it and print the way out. The
+    registry entry survives with it, so `teamctl land <role>` still works
+    after the teammate is gone."""
+    if worktree_settings()["cleanup"] == "keep":
+        print(f"kept worktree: {_tilde(wt['path'])} (branch {wt['branch']}"
+              ", [worktree] cleanup = keep)")
+        return
+    unique, detail = _worktree_unique_work(wt)
+    if not unique:
+        ok, msg = _remove_worktree(wt)
+        if ok:
+            print(f"removed clean worktree {_tilde(wt['path'])} ({detail})")
+        else:
+            print(f"kept worktree {_tilde(wt['path'])}: {msg}",
+                  file=sys.stderr)
+        return
+    print(f"kept worktree with un-landed work: {_tilde(wt['path'])} "
+          f"(branch {wt['branch']}, {detail})")
+    print(f"  land it:  teamctl land {role}    (works after shutdown too)")
+    print("  or list:  teamctl worktree list")
+
+
+def _find_worktree_for_role(role: str) -> tuple[dict | None, dict | None]:
+    """(worktree, live_state_info) for a role: the live state entry first,
+    then the registry (a shutdown that kept un-landed work, or a reboot).
+    Ambiguity (same role in several repos) is refused, never guessed."""
+    with state_lock():
+        state = reconcile(load_state())
+    info = state["teammates"].get(role)
+    if info and info.get("worktree"):
+        return dict(info["worktree"]), info
+    matches = [dict(e) for e in load_worktree_registry().values()
+               if e.get("role") == role]
+    if len(matches) > 1:
+        paths = ", ".join(m["path"] for m in matches)
+        raise TeamctlError(
+            f"'{role}' has worktrees in several repos ({paths}) — "
+            "`teamctl worktree list` and land/prune by hand")
+    return (matches[0] if matches else None), info
+
+
+def cmd_land(args: argparse.Namespace) -> int:
+    """Close the worktree loop: review the diff, checkpoint anything
+    uncommitted (with consent), merge the teammate's branch into the
+    repo's checked-out branch, then clean up. Conflicts stop-and-report
+    (merge aborted, tree left clean) — teamctl never auto-resolves."""
+    role = args.role
+    if _reject_bad_role(role):
+        return 2
+    try:
+        wt, info = _find_worktree_for_role(role)
+    except TeamctlError as exc:
+        print(f"teamctl: {exc}", file=sys.stderr)
+        return 2
+    if wt is None:
+        print(f"teamctl: no worktree recorded for '{role}' — see "
+              "`teamctl worktree list`.", file=sys.stderr)
+        return 1
+
+    # never land under a live teammate: a moving diff cannot be reviewed
+    if info is not None:
+        pane = info.get("pane_id") or ""
+        alive = bool(pane) and pane in live_pane_ids()
+        if info.get("mode") == "dispatch":
+            hd = Path(info.get("handoff") or handoff_dir(role))
+            alive = alive or (_read_status(hd)[0] == "running"
+                              and _teammate_alive(info, hd))
+        if alive:
+            print(f"teamctl: '{role}' is still active — landing under a "
+                  "live teammate risks a moving diff. Shut it down first: "
+                  f"`teamctl shutdown {role}`.", file=sys.stderr)
+            return 1
+
+    repo, path, branch = wt["repo"], wt["path"], wt["branch"]
+    base = wt.get("base_sha") or ""
+    if not Path(path).exists():
+        print(f"teamctl: worktree {path} is gone — nothing to land "
+              f"(branch {branch} may still exist in {repo}).",
+              file=sys.stderr)
+        return 1
+
+    dirty_out = _git_ok(path, "status", "--porcelain") or ""
+    dirty = len(dirty_out.splitlines()) if dirty_out else 0
+    commits = _git_ok(repo, "rev-list", "--count", f"{base}..{branch}") \
+        if base else None
+    target = _git_ok(repo, "symbolic-ref", "--short", "HEAD")
+    diffstat = (_git_ok(repo, "diff", "--stat", f"{base}..{branch}") or "") \
+        if base else ""
+
+    plan = {"role": role, "branch": branch, "path": path, "repo": repo,
+            "base_sha": base, "target": target,
+            "uncommitted_changes": dirty,
+            "unlanded_commits": int(commits) if (commits or "").isdigit()
+            else None}
+
+    if args.dry_run:
+        if args.json:
+            print(json.dumps(plan, indent=2))
+        else:
+            print(f"land plan for '{role}':")
+            print(f"  branch {branch} -> {target or '(detached HEAD)'}"
+                  f"  ({plan['unlanded_commits']} commit(s), "
+                  f"{dirty} uncommitted change(s))")
+            if diffstat:
+                print("  " + "\n  ".join(diffstat.splitlines()))
+            print(f"  full diff: git -C {repo} diff {base}..{branch}")
+        return 0
+
+    # 1. checkpoint uncommitted work (consent required; nothing is ever
+    #    landed silently)
+    if dirty:
+        if args.yes or _ask_yn(
+                f"commit {dirty} uncommitted change(s) in {_tilde(path)} "
+                f"as a checkpoint on {branch}? [Y/n] ", default=True):
+            res = _git(path, "add", "-A")
+            if res is None or res.returncode != 0:
+                print("teamctl: git add failed — nothing landed.",
+                      file=sys.stderr)
+                return 1
+            msg = f"teamctl checkpoint: {role} " \
+                  + time.strftime("%Y-%m-%d %H:%M")
+            res = _git(path, "commit", "-m", msg)
+            if res is None or res.returncode != 0:
+                print("teamctl: checkpoint commit failed: "
+                      + _git_fail_tail(res, "git commit failed"),
+                      file=sys.stderr)
+                return 1
+            print(f"checkpointed {dirty} change(s) on {branch}")
+        else:
+            print("land cancelled — uncommitted changes stay where they "
+                  "are (nothing landed).")
+            return 1
+    if args.checkpoint_only:
+        outcome = {**plan, "landed": False, "checkpointed": dirty}
+        print(json.dumps(outcome, indent=2) if args.json
+              else f"checkpoint done — land later with `teamctl land {role}`")
+        return 0
+
+    commits = _git_ok(repo, "rev-list", "--count", f"{base}..{branch}") \
+        if base else None
+    if commits == "0":
+        print(f"nothing to land: {branch} adds no commits over its base — "
+              f"`teamctl shutdown {role}` / `teamctl worktree prune` "
+              "cleans it up.")
+        return 0
+
+    # 2. integrate into the repo's checked-out branch — teamctl never
+    #    switches the user's branches
+    if not target:
+        print(f"teamctl: {repo} is on a detached HEAD — check out the "
+              "branch you want to land into, then re-run.", file=sys.stderr)
+        return 1
+    if args.into and args.into != target:
+        print(f"teamctl: {repo} has '{target}' checked out, not "
+              f"'{args.into}' — teamctl never switches your branches. "
+              f"Check out {args.into} first.", file=sys.stderr)
+        return 1
+    root_dirty = _git_ok(repo, "status", "--porcelain")
+    if root_dirty:
+        print(f"teamctl: {repo} has uncommitted changes — commit or stash "
+              "them first (landing merges into your checked-out branch).",
+              file=sys.stderr)
+        return 1
+    res = _git(repo, "merge", "--no-ff", "-m",
+               f"teamctl land: {role} ({branch})", branch)
+    if res is None or res.returncode != 0:
+        _git(repo, "merge", "--abort")
+        print("teamctl: land hit merge conflicts — merge aborted, your "
+              "tree is untouched. Resolve by hand:\n"
+              f"  git -C {repo} merge {branch}\n"
+              "then clean up with `teamctl worktree prune`.",
+              file=sys.stderr)
+        return 1
+
+    landed_msg = f"landed '{role}': {branch} -> {target} ({commits} commit(s))"
+    removed = False
+    if not args.keep:
+        unique, _detail = _worktree_unique_work(wt)
+        if not unique:
+            ok, msg = _remove_worktree(wt)
+            removed = ok
+            landed_msg += (" · worktree removed" if ok
+                           else f" · worktree kept ({msg})")
+        else:
+            landed_msg += " · worktree kept (still has unique work)"
+    # a live teammate keeps its state; a registry-only worktree that was
+    # fully landed+removed needs no further tracking
+    if args.json:
+        print(json.dumps({**plan, "landed": True, "target": target,
+                          "worktree_removed": removed}, indent=2))
+    else:
+        print(landed_msg)
+    return 0
+
+
+def cmd_worktree(args: argparse.Namespace) -> int:
+    """`teamctl worktree list|prune` — the audit/recovery surface for
+    every worktree teamctl ever created."""
+    reg = load_worktree_registry()
+    with state_lock():
+        state = reconcile(load_state())
+    owners = {}
+    for r, i in state["teammates"].items():
+        if i.get("worktree"):
+            owners[i["worktree"].get("path", "")] = r
+
+    rows = []
+    for path, entry in sorted(reg.items()):
+        wt = {"path": path, "branch": entry.get("branch", ""),
+              "repo": entry.get("repo", ""),
+              "base_sha": entry.get("base_sha", "")}
+        exists = Path(path).exists()
+        unique, detail = _worktree_unique_work(wt) if exists \
+            else (False, "path gone")
+        rows.append({"role": entry.get("role", "?"), "path": path,
+                     "branch": wt["branch"], "repo": wt["repo"],
+                     "exists": exists, "unique_work": unique,
+                     "detail": detail,
+                     "owner_alive": path in owners,
+                     "created_at": entry.get("created_at", "")})
+
+    if args.action == "list":
+        if args.json:
+            print(json.dumps(rows, indent=2))
+            return 0
+        if not rows:
+            print("no teamctl worktrees.")
+            return 0
+        for r in rows:
+            owner = "live" if r["owner_alive"] else "orphan"
+            state_txt = r["detail"] if r["exists"] else "path gone"
+            print(f"{r['role']:<16} {r['branch']:<28} {owner:<7} "
+                  f"{state_txt}")
+            print(f"{'':<16} {_tilde(r['path'])}")
+        return 0
+
+    # prune: remove only what provably holds nothing — never a live
+    # teammate's worktree, never anything with unique work
+    pruned, kept = [], []
+    for r in rows:
+        wt = {"path": r["path"], "branch": r["branch"], "repo": r["repo"],
+              "base_sha": next((e.get("base_sha", "") for p, e in
+                                reg.items() if p == r["path"]), "")}
+        if r["owner_alive"]:
+            kept.append((r, "owner is live"))
+            continue
+        if r["unique_work"]:
+            kept.append((r, r["detail"]))
+            continue
+        if args.dry_run:
+            pruned.append((r, "would remove"))
+            continue
+        ok, msg = _remove_worktree(wt)
+        if ok:
+            pruned.append((r, "removed"))
+        else:
+            kept.append((r, msg))
+    for r, msg in pruned:
+        print(f"{'(dry-run) ' if args.dry_run else ''}pruned "
+              f"{r['role']}: {_tilde(r['path'])} ({msg})")
+    for r, msg in kept:
+        print(f"kept {r['role']}: {_tilde(r['path'])} — {msg}")
+    if not rows:
+        print("no teamctl worktrees.")
     return 0
 
 
@@ -957,7 +2120,8 @@ def _resolve_dispatch(provider: str, task: str, context_file: str, model_arg: st
 
 
 def _do_dispatch(role: str, provider: str, task: str, context_file: str,
-                 model_arg: str, effort_arg: str, cwd_arg: str) -> int:
+                 model_arg: str, effort_arg: str, cwd_arg: str,
+                 worktree_flag: bool | None = None) -> int:
     """Shared dispatch body used by `dispatch` and `route`."""
     if _reject_bad_role(role):
         return 2
@@ -988,6 +2152,14 @@ def _do_dispatch(role: str, provider: str, task: str, context_file: str,
                       file=sys.stderr)
             return 1
 
+        try:
+            wt = _maybe_alloc_worktree(role, cwd, worktree_flag)
+        except TeamctlError as exc:
+            print(f"teamctl: {exc}", file=sys.stderr)
+            return 2
+        if wt:
+            cwd = wt["path"]
+
         hd = handoff_dir(role)
         hd.mkdir(parents=True, exist_ok=True)
         (hd / "task.md").write_text(task)
@@ -1010,6 +2182,8 @@ def _do_dispatch(role: str, provider: str, task: str, context_file: str,
             "handoff": str(hd),
             "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         }
+        if wt:
+            state["teammates"][role]["worktree"] = wt
         save_state(state)
 
     print(f"dispatched '{role}' ({provider}"
@@ -1022,7 +2196,8 @@ def cmd_dispatch(args: argparse.Namespace) -> int:
     if provider is None:
         return 2
     return _do_dispatch(args.role, provider, args.task, args.context_file,
-                        args.model, args.effort, args.cwd)
+                        args.model, args.effort, args.cwd,
+                        getattr(args, "worktree", None))
 
 
 def _read_status(hd: Path) -> tuple[str, int | None]:
@@ -1066,17 +2241,37 @@ _UUID_RE = re.compile(
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 
 
+def _codex_rollout_glob(since: float | None) -> str | None:
+    """codex fallback: the newest rollout log created after the dispatch
+    started whose filename ends in a uuid (the session id appears in the
+    rollout filename — live-verified)."""
+    base = Path.home() / ".codex" / "sessions"
+    if not base.exists():
+        return None
+    logs = sorted(base.glob("*/*/*/rollout-*.jsonl"),
+                  key=lambda p: p.stat().st_mtime, reverse=True)
+    for log in logs[:8]:
+        if since is not None and log.stat().st_mtime < since:
+            continue
+        tail = log.stem[-36:]
+        if _UUID_RE.fullmatch(tail):
+            return tail
+    return None
+
+
 def _extract_session_id(provider: str, hd: Path,
                         since: float | None = None) -> str | None:
     """Best-effort provider session id from a dispatch's artifacts, for
-    exact-session follow-ups.
+    exact-session follow-ups — driven by the spec's session_source.
 
-    codex: `codex exec` prints `session id: <uuid>` on stderr (OBSERVED
-    banner; live-verified — the same uuid appears in the rollout log
-    filename, which is the fallback: newest rollout created after the
-    dispatch started whose name ends in a uuid). claude: the documented
-    session_id field of the --output-format json result. grok: the
-    sessionId field of its json result (observed; parsed defensively)."""
+    stderr-regex (codex): `codex exec` prints `session id: <uuid>` on
+    stderr (OBSERVED banner; live-verified), with the rollout-filename
+    glob as a named built-in fallback. result-json (claude/gemini:
+    session_id; grok: sessionId): the id key found recursively in the
+    JSON artifacts. The result JSON normally lands on stdout
+    (result.json), but a failed run's error JSON can land on stderr
+    instead — gemini verified live: its error JSON, session_id included,
+    is emitted on stderr — so error.log is consulted second."""
     def _read(name: str) -> str:
         f = hd / name
         try:
@@ -1084,31 +2279,36 @@ def _extract_session_id(provider: str, hd: Path,
         except OSError:
             return ""
 
-    if provider == "codex":
-        m = re.search(r"session id:\s*(\S+)", _read("error.log"))
-        if m and _UUID_RE.fullmatch(m.group(1)):
-            return m.group(1)
-        base = Path.home() / ".codex" / "sessions"
-        if base.exists():
-            logs = sorted(base.glob("*/*/*/rollout-*.jsonl"),
-                          key=lambda p: p.stat().st_mtime, reverse=True)
-            for log in logs[:8]:
-                if since is not None and log.stat().st_mtime < since:
-                    continue
-                tail = log.stem[-36:]
-                if _UUID_RE.fullmatch(tail):
-                    return tail
+    src = (provider_spec(provider) or {}).get("session_source")
+    if not src:
         return None
 
-    key = {"claude": "session_id", "grok": "sessionId"}.get(provider)
-    if key is None:
+    if src.get("type") == "stderr-regex":
+        # which artifacts the pattern scans is part of the source spec:
+        # codex deliberately scans ONLY error.log (its banner is the CLI's
+        # own stderr; scanning the model's stdout could capture a merely
+        # quoted id — a guess). Custom text-only providers that print the
+        # id to stdout opt into ["error.log", "result.json"].
+        for artifact in src.get("artifacts") or ("error.log",):
+            m = re.search(src["pattern"], _read(artifact))
+            if m:
+                sid = (m.group(1) or "").strip()
+                if sid and (not src.get("uuid") or _UUID_RE.fullmatch(sid)):
+                    return sid
+        if src.get("fallback") == "codex-rollout-glob":
+            return _codex_rollout_glob(since)
         return None
-    try:
-        data = json.loads(_read("result.json"))
-    except (json.JSONDecodeError, ValueError):
-        return None
-    sid = _find_key(data, key)
-    return str(sid) if sid else None
+
+    if src.get("type") == "result-json":
+        for artifact in ("result.json", "error.log"):
+            try:
+                data = json.loads(_read(artifact))
+            except (json.JSONDecodeError, ValueError):
+                continue
+            sid = _find_key(data, src["key"])
+            if sid:
+                return str(sid)
+    return None
 
 
 def _dispatch_started_at(info: dict) -> float | None:
@@ -1270,6 +2470,16 @@ def cmd_followup(args: argparse.Namespace) -> int:
               f"`teamctl result {args.role} --wait` first.", file=sys.stderr)
         return 1
 
+    # capability check BEFORE touching the pane: a provider with no resume
+    # shape can never follow up — refuse now, honestly, leaving the
+    # teammate exactly as it was.
+    spec = provider_spec(provider) or {}
+    if not spec.get("resume"):
+        print(f"teamctl: provider '{provider}' cannot resume a session — "
+              "teamctl never guesses 'most recent'. Re-dispatch instead.",
+              file=sys.stderr)
+        return 1
+
     # a finished teammate may still hold its pane open (keep_finished):
     # close it before opening the follow-up pane so the role never shows
     # two panes at once.
@@ -1279,9 +2489,11 @@ def cmd_followup(args: argparse.Namespace) -> int:
 
     # exact-session only: capture the id from the previous turn's artifacts
     # BEFORE they are cleared. Without one, refuse — never resume "the most
-    # recent session", which grabs the wrong one under concurrency.
+    # recent session", which grabs the wrong one under concurrency. (A spec
+    # with a resume shape but no session_source — the shell test provider —
+    # is deliberately sessionless: its "resume" is a fresh process.)
     session_id = ""
-    if provider != "shell":
+    if spec.get("session_source"):
         session_id = _capture_session_id(info, hd) or ""
         if not session_id:
             print(f"teamctl: no session id captured for '{args.role}' — "
@@ -1300,6 +2512,155 @@ def cmd_followup(args: argparse.Namespace) -> int:
         save_state(state)
     print(f"follow-up sent to '{args.role}' in pane {pane_id}")
     return 0
+
+
+# --------------------------------------------------------------------------
+# `teamctl resurrect` — rebuild the roster after a crash/reboot.
+#
+# reconcile captures dropped interactive teammates in state["lost"] (the
+# capture point IS the drop point — no parallel manifest that can drift);
+# resurrect respawns them fresh with everything state recorded (provider/
+# model/effort/cwd/prompt/worktree). Honesty first: teamctl never captured
+# an interactive session id (capture is artifact-based, dispatch-only) and
+# resuming "the most recent session in this cwd" would violate the
+# never-guess rule — so a resurrected teammate STARTS OVER and says so in
+# its opening prompt. Dispatch teammates never need resurrecting: their
+# artifacts survive on disk and `result`/`followup` keep working —
+# exact-session — indefinitely.
+# --------------------------------------------------------------------------
+
+RESURRECT_NOTE = ("[teamctl] resurrected after a crash/reboot — prior "
+                  "conversation context was NOT restored.")
+
+
+def _resurrect_plan(role: str, info: dict,
+                    active: dict) -> tuple[str, str, dict | None, str]:
+    """(action, cwd, worktree_to_reuse, note) for one lost teammate.
+    action: respawn | skip | followup | error."""
+    if role in active:
+        return ("skip", "", None,
+                "the role is active again — stale lost entry cleared")
+    if info.get("mode") == "dispatch":
+        return ("followup", "", None,
+                "a dispatch teammate needs no respawn: its artifacts are "
+                f"on disk — `teamctl result {role}` / `teamctl followup "
+                f"{role} --task …` resume the exact session")
+    wt = info.get("worktree")
+    if wt and Path(wt.get("path", "")).is_dir():
+        return ("respawn", wt["path"], dict(wt),
+                f"reusing its worktree ({wt['branch']})")
+    if wt:
+        return ("respawn", wt.get("repo") or info.get("cwd", ""), None,
+                "its worktree path is gone — a fresh one is allocated "
+                "(refused honestly if the old branch still exists)")
+    cwd = info.get("cwd", "")
+    if not cwd or not Path(cwd).is_dir():
+        return ("error", "", None,
+                f"original cwd {cwd or '?'} no longer exists — respawn "
+                f"manually: `teamctl spawn {role} --cwd <dir>`")
+    return ("respawn", cwd, None, "")
+
+
+def cmd_resurrect(args: argparse.Namespace) -> int:
+    with state_lock():
+        state = reconcile(load_state())
+    lost = dict(state.get("lost") or {})
+    targets = list(args.roles) or sorted(lost)
+    if not targets:
+        print("nothing to resurrect — no lost teammates recorded.")
+        return 0
+    missing = [r for r in targets if r not in lost]
+    if missing:
+        print(f"teamctl: not in the lost roster: {', '.join(missing)} "
+              f"(lost: {', '.join(sorted(lost)) or 'none'}).",
+              file=sys.stderr)
+        return 1
+
+    plans = {r: _resurrect_plan(r, lost[r], state["teammates"])
+             for r in targets}
+
+    if args.dry_run:
+        if getattr(args, "json", False):
+            print(json.dumps({r: {
+                "action": a, "cwd": cwd or None,
+                "worktree": (wt or None), "note": note or None,
+                "provider": lost[r].get("provider"),
+                "model": lost[r].get("model") or None,
+                "effort": lost[r].get("effort") or None,
+                "lost_at": lost[r].get("lost_at")}
+                for r, (a, cwd, wt, note) in plans.items()},
+                indent=2, sort_keys=True))
+            return 0
+        for r, (action, cwd, _wt, note) in sorted(plans.items()):
+            info = lost[r]
+            tag = info.get("provider", "?") + (
+                "/" + info["model"] if info.get("model") else "")
+            line = f"{r}: {action} ({tag}"
+            if action == "respawn":
+                line += f", cwd {_tilde(cwd)}"
+            line += ")"
+            if note:
+                line += f" — {note}"
+            print(line)
+        print("\n(a resurrected teammate starts a FRESH session — prior "
+              "interactive context is not restorable; dispatch teammates "
+              "resume exactly via `followup`.)")
+        return 0
+
+    respawns = [r for r, (a, *_r) in plans.items() if a == "respawn"]
+    if respawns and not args.yes:
+        if not _ask_yn(f"resurrect {len(respawns)} teammate(s) "
+                       f"({', '.join(respawns)})? [Y/n] ", default=True):
+            print("nothing resurrected.")
+            return 1
+
+    failures = 0
+    for role in targets:
+        action, cwd, reuse_wt, note = plans[role]
+        info = lost[role]
+        if action == "error":
+            failures += 1
+            print(f"{role}: NOT resurrected — {note}", file=sys.stderr)
+            continue
+        if action in ("skip", "followup"):
+            print(f"{role}: {note}")
+            if action == "skip":
+                _drop_lost_entry(role)
+            continue
+        prompt = RESURRECT_NOTE
+        if info.get("prompt"):
+            prompt += "\n\n" + info["prompt"]
+        ns = argparse.Namespace(
+            role=role, provider=info.get("provider", ""),
+            prompt=prompt, model=info.get("model", ""),
+            effort=info.get("effort", ""), cwd=cwd, dry_run=False,
+            worktree=(False if reuse_wt else None))
+        rc = cmd_spawn(ns)
+        if rc != 0:
+            failures += 1
+            print(f"{role}: respawn failed (rc={rc}) — see above.",
+                  file=sys.stderr)
+            continue
+        if reuse_wt:
+            with state_lock():
+                st = load_state()
+                if role in st["teammates"]:
+                    st["teammates"][role]["worktree"] = reuse_wt
+                    save_state(st)
+        _drop_lost_entry(role)
+        if note:
+            print(f"{role}: {note}")
+    return 1 if failures else 0
+
+
+def _drop_lost_entry(role: str) -> None:
+    with state_lock():
+        st = load_state()
+        lost = dict(st.get("lost") or {})
+        if role in lost:
+            del lost[role]
+            st["lost"] = lost
+            save_state(st)
 
 
 def _record_provider_signal(provider: str, signal: str,
@@ -1426,18 +2787,9 @@ def claude_usage() -> dict | None:
 #                   never guessed
 # --------------------------------------------------------------------------
 
-# how a quiet provider wakes up (produces its first usage numbers)
-WAKE_HINTS = {
-    "claude": "run one Claude Code turn with the teamctl statusline "
-              "installed (`teamctl init`)",
-    "codex": "usage appears after the first codex turn, or probe: "
-             "`teamctl usage --probe codex`",
-    "grok": "probe it: `teamctl usage --probe grok`",
-}
-
-# how a locked-out provider signs in (each CLI's own login command)
-LOGIN_HINTS = {"claude": "claude auth login", "codex": "codex login",
-               "grok": "grok login"}
+# wake/login hints live in each provider's spec (wake_hint / login_hint —
+# see PROVIDER_SPECS); the wake_hint() / login_hint() accessors add the
+# fallbacks, so custom providers degrade to honest generic advice.
 
 
 def _known_windows(provider: str) -> dict[str, dict]:
@@ -1490,10 +2842,38 @@ def _usage_summary(provider: str) -> str:
     return (" · ".join(parts) + " used" + src) if parts else ""
 
 
+def _used_percent(provider: str) -> float | None:
+    """Binding-constraint usage for headroom ranking: the MAX used_percent
+    across the provider's known windows (5h vs weekly — the tighter one
+    governs), native source first, probe cache second — the same
+    precedence _usage_summary uses. None when nothing is known (a 'quiet'
+    provider, or gemini always — it has no usage source)."""
+    wins = _known_windows(provider)
+    if not wins:
+        wins = _probe_windows(provider)
+    pcts = [w.get("used_percent") for w in wins.values()
+            if isinstance(w, dict)
+            and isinstance(w.get("used_percent"), (int, float))]
+    return float(max(pcts)) if pcts else None
+
+
+def _probe_is_stale(provider: str) -> bool:
+    """True when the provider's cached probe result is older than
+    [usage] probe_stale_minutes."""
+    entry = load_probe_cache().get(provider)
+    if not isinstance(entry, dict):
+        return False
+    cap = entry.get("captured_at")
+    return (isinstance(cap, (int, float))
+            and time.time() - cap > probe_stale_minutes() * 60)
+
+
 def provider_state(provider: str) -> tuple[str, str]:
-    """(lattice state, note) for one provider — see the map above."""
+    """(lattice state, note) for one provider — see the map above. An
+    'unprobed' custom provider renders as quiet/ready with its "auth not
+    probed" note: installed and explicitly configured, auth unknowable."""
     has_data = provider_has_usage_data(provider)
-    if shutil.which(provider) is None:
+    if not provider_installed(provider):
         return ("not installed",
                 "residual usage history found" if has_data else "")
     auth, note = provider_auth_state(provider)
@@ -1565,9 +2945,10 @@ def discover_models(provider: str) -> list[str]:
 
 
 def cmd_models(args: argparse.Namespace) -> int:
-    providers = [args.provider] if args.provider else list(ROUTABLE)
+    routable = routable_providers()
+    providers = [args.provider] if args.provider else list(routable)
     for prov in providers:
-        if prov not in ROUTABLE:
+        if prov not in routable:
             print(f"teamctl: unknown provider '{prov}'.", file=sys.stderr)
             return 2
     for prov in providers:
@@ -1608,6 +2989,16 @@ def cmd_models(args: argparse.Namespace) -> int:
             print("  alias (sonnet, opus, haiku, fable) or a full model name. "
                   "Inside a session,")
             print("  /model opens the interactive picker.")
+        elif prov == "gemini":
+            print("  the gemini CLI has no model-listing command; --model "
+                  "takes any Gemini")
+            print("  model id (e.g. gemini-2.5-pro). GEMINI_MODEL and "
+                  "settings.json model.name")
+            print("  also work — the CLI is the validator.")
+        else:   # a custom provider: teamctl knows only what the block says
+            print("  no model discovery for a custom provider; --model "
+                  "passes through its")
+            print("  model_args verbatim (the CLI validates it).")
         print()
     print("model ids pass through to the provider CLI verbatim — new models "
           "work without updating teamctl.")
@@ -1624,14 +3015,22 @@ def cmd_models(args: argparse.Namespace) -> int:
 
 PROBE_SESSION = "teamctl-probe"
 
-# provider -> how to ask its TUI for usage. claude is deliberately absent:
-# its statusline rate_limits feed (claude-usage.json) is the documented and
-# cheaper source. `command` is typed into the TUI followed by Enter;
-# extra_enters presses Enter again if no numbers appear (menu confirmation).
-PROBES: dict[str, dict] = {
-    "grok": {"argv": ["grok"], "command": "/usage", "extra_enters": 1},
-    "codex": {"argv": ["codex"], "command": "/status", "extra_enters": 1},
-}
+
+def probe_specs() -> dict[str, dict]:
+    """provider -> how to ask its TUI for usage, read off the registry
+    (spec key "probe"; custom providers join via probe_command). claude
+    deliberately has none: its statusline rate_limits feed
+    (claude-usage.json) is the documented and cheaper source. gemini has
+    none either: current builds expose no parseable used-% in /stats
+    (verified 2026-07) — it stays honestly quiet. `command` is typed into
+    the TUI followed by Enter; extra_enters presses Enter again if no
+    numbers appear (menu confirmation)."""
+    out: dict[str, dict] = {}
+    for name in routable_providers():
+        probe = (provider_spec(name) or {}).get("probe")
+        if probe:
+            out[name] = probe
+    return out
 
 
 def _capture_pane(pane_id: str) -> str:
@@ -1771,16 +3170,18 @@ def probe_stale_minutes() -> int:
 
 def _run_probes(which: str) -> int:
     """Handle `usage --probe [provider|all]`. Returns 2 on a bad target."""
+    probes = probe_specs()
     if which == "claude":
         print("claude: probe skipped — the statusline cache is the "
               "documented, cheaper source (install it via `teamctl init`).")
         return 0
     if which == "all":
-        targets = [p for p in PROBES if shutil.which(p)]
+        targets = [p for p in probes
+                   if shutil.which(probes[p]["argv"][0])]
         if not targets:
             print("no probe-able provider CLI installed.", file=sys.stderr)
-    elif which in PROBES:
-        if shutil.which(which):
+    elif which in probes:
+        if shutil.which(probes[which]["argv"][0]):
             targets = [which]
         else:
             targets = []
@@ -1791,7 +3192,7 @@ def _run_probes(which: str) -> int:
         return 2
     for prov in targets:
         print(f"probing {prov} in hidden tmux session '{PROBE_SESSION}'…")
-        result, err = probe_provider(prov, PROBES[prov])
+        result, err = probe_provider(prov, probes[prov])
         if result:
             _save_probe_result(prov, result)
             wins = ", ".join(f"{k} {v['used_percent']:.0f}%"
@@ -1814,7 +3215,7 @@ def cmd_usage(args: argparse.Namespace) -> int:
             return rc
     now = time.time()
 
-    states = {prov: provider_state(prov) for prov in ROUTABLE}
+    states = {prov: provider_state(prov) for prov in routable_providers()}
     live = {prov for prov, (st, _n) in states.items()
             if st in ("ready", "quiet")}
 
@@ -1840,18 +3241,20 @@ def cmd_usage(args: argparse.Namespace) -> int:
     stale_after = probe_stale_minutes() * 60
 
     if args.json:
-        claude_json = None
-        if claude:
-            claude_json = dict(claude)
-            claude_json["captured_at"] = claude_captured
-        print(json.dumps({
-            "codex": codex or None,
-            "claude": claude_json,
-            "grok": None,
-            "probes": probes or None,
-            "states": {prov: {"state": st, "note": note or None}
-                       for prov, (st, note) in states.items()},
-        }, indent=2))
+        # one key per routable provider: its native windows or null (the
+        # spec-registry guarantee — new/custom providers appear here on
+        # day one instead of being hardcoded out)
+        payload: dict = {}
+        for prov in states:
+            wins = {"codex": codex, "claude": claude}.get(prov) or None
+            if prov == "claude" and wins:
+                wins = dict(wins)
+                wins["captured_at"] = claude_captured
+            payload[prov] = wins
+        payload["probes"] = probes or None
+        payload["states"] = {prov: {"state": st, "note": note or None}
+                             for prov, (st, note) in states.items()}
+        print(json.dumps(payload, indent=2))
         return 0
 
     def _stale_note(age_seconds: float) -> str:
@@ -1860,24 +3263,27 @@ def cmd_usage(args: argparse.Namespace) -> int:
         return ""
 
     native = {"codex": codex, "claude": claude}
-    print(f"{'PROVIDER':<8}  USAGE")
-    for prov in ROUTABLE:
+    width = max([8] + [len(p) for p in states])
+    print(f"{'PROVIDER'.ljust(width)}  USAGE")
+    for prov in states:
         state, note = states[prov]
         if state == "not installed":
-            print(f"{prov:<8}  not installed"
+            print(f"{prov.ljust(width)}  not installed"
                   + (f" — {note}" if note else ""))
             continue
         if state == "locked out":
-            print(f"{prov:<8}  locked out — sign in: "
-                  f"`{LOGIN_HINTS.get(prov, prov + ' login')}`")
+            print(f"{prov.ljust(width)}  locked out — sign in: "
+                  f"`{login_hint(prov)}`")
             continue
         if state == "unknown":
-            print(f"{prov:<8}  unknown — {note or 'auth state unreadable'}")
+            print(f"{prov.ljust(width)}  unknown — "
+                  f"{note or 'auth state unreadable'}")
             continue
-        wins = native.get(prov, {})
+        wins = native.get(prov) or {}
         if wins:
             for label, w in wins.items():
-                print(f"{prov:<8}  {label}: {w['used_percent']:.0f}% used, "
+                print(f"{prov.ljust(width)}  {label}: "
+                      f"{w['used_percent']:.0f}% used, "
                       f"resets {_fmt_reset(w['resets_at'], now)}")
             if prov == "claude":
                 if isinstance(claude_captured, (int, float)):
@@ -1885,12 +3291,15 @@ def cmd_usage(args: argparse.Namespace) -> int:
                            + _stale_note(now - claude_captured))
                 else:
                     age = "age unknown"
-                print(f"{prov:<8}  (source: statusline cache, {age})")
+                print(f"{prov.ljust(width)}  (source: statusline cache, "
+                      f"{age})")
         elif state == "ready":       # numbers live in the probe cache below
-            print(f"{prov:<8}  ready — probe data below")
+            print(f"{prov.ljust(width)}  ready — probe data below")
+        elif note.startswith("auth not probed"):
+            print(f"{prov.ljust(width)}  quiet — {note}")
         else:
-            print(f"{prov:<8}  quiet — signed in, no usage data yet "
-                  f"({WAKE_HINTS.get(prov, 'use it once')})")
+            print(f"{prov.ljust(width)}  quiet — signed in, no usage data "
+                  f"yet ({wake_hint(prov)})")
 
     # cached probe results — but never for an uninstalled provider (its
     # residue is already flagged above, and it is not a live provider)
@@ -1924,19 +3333,21 @@ def cmd_providers(args: argparse.Namespace) -> int:
     now = time.time()
 
     rows: list[tuple[str, str, str]] = []
-    for prov in ROUTABLE:
+    for prov in routable_providers():
         state, note = provider_state(prov)
         details: list[str] = []
+        if state == "quiet" and note.startswith("auth not probed"):
+            details.append(note)     # the honest custom-provider caveat
+            note = ""
         if state == "ready":
             summary = _usage_summary(prov)
             if summary:
                 details.append(summary)
-        elif state == "quiet":
+        elif state == "quiet" and not details:
             details.append("signed in, no usage data yet — "
-                           + WAKE_HINTS.get(prov, "use it once"))
+                           + wake_hint(prov))
         elif state == "locked out":
-            details.append("sign in: "
-                           f"`{LOGIN_HINTS.get(prov, prov + ' login')}`")
+            details.append(f"sign in: `{login_hint(prov)}`")
         if note:
             details.append(note if state == "not installed" else f"({note})")
         sig_entry = cached.get(prov, {})
@@ -1965,9 +3376,6 @@ def cmd_providers(args: argparse.Namespace) -> int:
     return 0
 
 
-ROUTABLE = ("claude", "codex", "grok")
-
-
 def _cached_signals() -> dict:
     cache = state_path().parent / "providers.json"
     try:
@@ -1976,28 +3384,51 @@ def _cached_signals() -> dict:
         return {}
 
 
+def routing_strategy() -> str:
+    """[routing] strategy: 'headroom' (default — among usable providers,
+    the one with the most remaining quota wins, preference order breaking
+    ties) or 'preference' (strict order, the v0.4.0 behavior)."""
+    raw = (load_config().get("routing") or {}).get("strategy", "headroom")
+    return raw if raw in ("headroom", "preference") else "headroom"
+
+
+# headroom ranking treats a provider with NO usage data as 0% used
+# (Decision D2: 'quiet' usually means genuinely idle; ranking unknowns
+# last would permanently bury providers with no usage source at all,
+# e.g. gemini). Preference order tie-breaks among unknowns.
+UNKNOWN_USED = 0.0
+
+
 def route_select(requested: list[str] | None = None
-                 ) -> tuple[str | None, list[str], dict[str, str]]:
+                 ) -> tuple[str | None, list[str], dict[str, str],
+                            list[tuple[str, float | None, bool]]]:
     """Pick the best available provider.
 
-    Returns (selected, preference, exclusions) where exclusions maps each
-    rejected candidate to a reason: unknown / not installed / locked out /
-    auth unknown / exhausted / auth-error. selected is None when no
-    candidate survives.
+    Returns (selected, preference, exclusions, ranking). exclusions maps
+    each rejected candidate to a reason: unknown / not installed / locked
+    out / auth unknown / exhausted / auth-error; the exclusion phase is
+    identical under every strategy — ranking only ever reorders the
+    SURVIVORS. ranking is the ranked survivors as (provider, used_percent
+    | None, stale_probe) so the caller can show every number the choice
+    used. selected is None when no candidate survives.
     """
-    candidates = requested if requested else list(ROUTABLE)
+    routable = routable_providers()
+    candidates = requested if requested else list(routable)
     cached = _cached_signals()
     exclusions: dict[str, str] = {}
     survivors: list[str] = []
     for prov in candidates:
-        if prov not in ROUTABLE:
+        if prov not in routable:
             exclusions[prov] = "unknown"
             continue
-        if shutil.which(prov) is None:
+        if not provider_installed(prov):
             exclusions[prov] = "not installed"
             continue
         auth = provider_auth_state(prov)[0]
-        if auth != "signed-in":
+        # 'unprobed' (a custom provider with no auth config) stays IN:
+        # the user configured it deliberately — excluding it would make
+        # the escape hatch useless (the reason line notes it instead)
+        if auth not in ("signed-in", "unprobed"):
             exclusions[prov] = ("locked out" if auth == "signed-out"
                                 else "auth unknown")
             continue
@@ -2009,13 +3440,27 @@ def route_select(requested: list[str] | None = None
 
     preference = (load_config().get("routing") or {}).get("preference")
     if not isinstance(preference, list) or not preference:
-        preference = list(ROUTABLE)
-    ranked = sorted(
-        survivors,
-        key=lambda p: (preference.index(p) if p in preference else len(preference),
-                       survivors.index(p)),
-    )
-    return (ranked[0] if ranked else None), preference, exclusions
+        preference = list(routable)
+
+    def _pref_key(p: str) -> tuple:
+        return (preference.index(p) if p in preference else len(preference),
+                survivors.index(p))
+
+    if routing_strategy() == "headroom":
+        usage = {p: _used_percent(p) for p in survivors}
+        ranked = sorted(
+            survivors,
+            key=lambda p: (usage[p] if usage[p] is not None
+                           else UNKNOWN_USED, *_pref_key(p)))
+    else:                       # strict preference — the v0.4.0 ranking
+        usage = {p: _used_percent(p) for p in survivors}
+        ranked = sorted(survivors, key=_pref_key)
+
+    ranking = [(p, usage[p],
+                usage[p] is not None and not _known_windows(p)
+                and _probe_is_stale(p))
+               for p in ranked]
+    return (ranked[0] if ranked else None), preference, exclusions, ranking
 
 
 def cmd_route(args: argparse.Namespace) -> int:
@@ -2023,7 +3468,7 @@ def cmd_route(args: argparse.Namespace) -> int:
         return 2
     requested = [p.strip() for p in args.providers.split(",") if p.strip()] \
         if args.providers else None
-    selected, preference, exclusions = route_select(requested)
+    selected, preference, exclusions, ranking = route_select(requested)
 
     if selected is None:
         print("teamctl: route found no available provider:", file=sys.stderr)
@@ -2032,10 +3477,21 @@ def cmd_route(args: argparse.Namespace) -> int:
         return 1
 
     configured = (load_config().get("routing") or {}).get("preference")
-    if isinstance(configured, list) and configured:
+    if routing_strategy() == "headroom":
+        # every number the choice used, unknowns as ?%, stale flagged —
+        # the pick must always be auditable
+        rank_txt = " < ".join(
+            f"{p} {f'{u:.0f}%' if u is not None else '?%'}"
+            f"{' (stale probe)' if stale else ''}"
+            for p, u, stale in ranking)
+        reason = (f"headroom: {rank_txt} used · preference tiebreak "
+                  f"{'>'.join(preference)}")
+        if any(stale for _p, _u, stale in ranking):
+            reason += " · refresh stale numbers: teamctl usage --probe"
+    elif isinstance(configured, list) and configured:
         reason = f"first available in your preference {'>'.join(preference)}"
     else:
-        reason = (f"first available in alphabetical order "
+        reason = (f"first available in registry order "
                   f"{'>'.join(preference)} — an arbitrary order, not a "
                   "recommendation; set yours with `teamctl config "
                   "routing.preference ...`")
@@ -2052,7 +3508,8 @@ def cmd_route(args: argparse.Namespace) -> int:
         return 0
 
     return _do_dispatch(args.role, selected, args.task, "",
-                        args.model, args.effort, args.cwd)
+                        args.model, args.effort, args.cwd,
+                        getattr(args, "worktree", None))
 
 
 # --------------------------------------------------------------------------
@@ -2165,7 +3622,7 @@ def _detect_providers() -> list[tuple[str, str]]:
     """(provider, lattice state) for every routable provider. A provider is
     usable for config/routing when signed in — state `quiet` or `ready`
     (usage data changes the word, not the eligibility)."""
-    return [(prov, provider_state(prov)[0]) for prov in ROUTABLE]
+    return [(prov, provider_state(prov)[0]) for prov in routable_providers()]
 
 
 def _usable(rows: list[tuple[str, str]]) -> list[str]:
@@ -2204,6 +3661,9 @@ def _render_config(providers_cfg: dict[str, dict[str, str]], verbosity: str,
             "# your auto-routing order (also the --provider default);",
             "# reorder any time: teamctl config routing.preference \"a,b,c\"",
             f"preference = {_toml_value(list(preference))}",
+            "# strategy: headroom (most remaining quota wins; preference",
+            "# breaks ties) | preference (strict order)",
+            'strategy = "headroom"',
         ]
     for prov, vals in providers_cfg.items():
         lines += ["", f"[providers.{prov}]"]
@@ -2729,7 +4189,9 @@ def _run_cockpit():
 def _apply_cockpit(state: dict, ready: list[str]) -> int:
     g = _out_glyphs()
     providers_cfg = {p: {"model": state["models"].get(p, ""),
-                         "effort": state["effort"]} for p in ready}
+                         "effort": (state["effort"]
+                                    if provider_supports_effort(p) else "")}
+                     for p in ready}
     changes: list[tuple[str, str]] = []
     cfg_path, backed_up = _write_wizard_config(
         providers_cfg, state["voice"], list(state["route"]), state["lead"],
@@ -2819,7 +4281,9 @@ def _plain_init(args: argparse.Namespace) -> int:
     if not _ask_yn(f"  write {_tilde(cfg_path)}? [Y/n] ", default=True):
         print("  nothing written.")
         return 0
-    providers_cfg = {p: {"model": models.get(p, ""), "effort": effort}
+    providers_cfg = {p: {"model": models.get(p, ""),
+                         "effort": (effort if provider_supports_effort(p)
+                                    else "")}
                      for p in ready}
     changes: list[tuple[str, str]] = []
     path, backed_up = _write_wizard_config(providers_cfg, voice, route, lead,
@@ -2856,7 +4320,12 @@ def _init_express(args: argparse.Namespace) -> int:
     upd_line = None if getattr(args, "yes", False) else _session_update_line()
     rows = _detect_providers()
     ready = _usable(rows)
-    providers_cfg = {p: {"model": "", "effort": "high"} for p in ready}
+    # a provider with no effort control (gemini) gets no effort key — an
+    # unusable setting must not be written just to be ignored later
+    providers_cfg = {p: {"model": "",
+                         "effort": ("high" if provider_supports_effort(p)
+                                    else "")}
+                     for p in ready}
     preference = sorted(ready)
     changes: list[tuple[str, str]] = []
     cfg_path, backed_up = _write_wizard_config(
@@ -3206,7 +4675,7 @@ main chat; teammates are tmux panes tiled to your right.
 
 ## Command reference
 
-    teamctl spawn <role> --provider claude|codex|grok [--model M] [--effort E] [--prompt TEXT]
+    teamctl spawn <role> --provider claude|codex|grok|gemini [--model M] [--effort E] [--prompt TEXT]
     teamctl dispatch <role> --provider P --task "…"   # headless, watchable pane
     teamctl result <role> --wait                      # read the result back
     teamctl followup <role> --task "…"                # another turn, same session
@@ -3316,12 +4785,15 @@ def _lead_paths() -> dict[str, Path]:
 # Where each CLI reads GLOBAL instructions (all officially documented):
 # claude: ~/.claude/CLAUDE.md; codex: ~/.codex/AGENTS.md (global scope, read
 # first); grok: ~/.grok/AGENTS.md (global rules, deeper files take
-# precedence). The skill and hook tiers are Claude Code mechanisms with no
-# codex/grok equivalent — that's parity with what each CLI offers, not bias.
+# precedence); gemini: ~/.gemini/GEMINI.md (the global context file — the
+# default contextFileName, loaded for every project). The skill and hook
+# tiers are Claude Code mechanisms with no equivalent elsewhere — that's
+# parity with what each CLI offers, not bias.
 LEAD_BLOCK_FILES: dict[str, tuple[str, str]] = {
     "claude": (".claude", "CLAUDE.md"),
     "codex": (".codex", "AGENTS.md"),
     "grok": (".grok", "AGENTS.md"),
+    "gemini": (".gemini", "GEMINI.md"),
 }
 
 
@@ -4252,15 +5724,15 @@ def _resolve_chat() -> tuple[str | None, str, str, str]:
     the chosen provider isn't ready (not installed / locked out / unknown)
     — the message names the fix, never a stack trace."""
     prov, model, effort = _chat_defaults()
-    if prov and prov not in PROVIDERS:
+    if prov and provider_spec(prov) is None:
         return None, "", "", (f"[lead] chat_provider is '{prov}', which is "
                               "not a known provider — fix it with `teamctl "
                               "settings` or `teamctl config lead.chat_provider "
-                              "claude|codex|grok`.")
+                              f"{'|'.join(routable_providers())}`.")
     if not prov:
         prov = default_provider()
     if prov is None:
-        avail = [p for p in ROUTABLE if provider_state(p)[0] in
+        avail = [p for p in routable_providers() if provider_state(p)[0] in
                  ("ready", "quiet")]
         if avail:
             return None, "", "", (
@@ -4279,7 +5751,7 @@ def _resolve_chat() -> tuple[str | None, str, str, str]:
     if state == "locked out":
         return None, "", "", (
             f"{prov} is installed but signed out — sign in with "
-            f"`{LOGIN_HINTS.get(prov, prov + ' login')}`, then run `teamctl`.")
+            f"`{login_hint(prov)}`, then run `teamctl`.")
     if state == "unknown":
         return None, "", "", (
             f"{prov}'s login state can't be read — check the CLI, or pick "
@@ -4333,6 +5805,21 @@ def cmd_launch(args: argparse.Namespace) -> int:
         _init_express(argparse.Namespace(custom=False, yes=False))
         print()
 
+    # a reboot/crash killed the roster? say so at the front door — the
+    # reconcile here is what moves dead-pane teammates into the lost
+    # record after a reboot. Never auto-resurrects: consent first.
+    try:
+        with state_lock():
+            state = reconcile(load_state())
+        lost = state.get("lost") or {}
+        if lost:
+            print(_fg("warn", f"· {len(lost)} teammate(s) lost in a "
+                              f"crash/reboot ({', '.join(sorted(lost))}) "
+                              "— rebuild: teamctl resurrect "
+                              "(preview: --dry-run)"))
+    except TeamctlError:
+        pass    # no tmux yet — the launch path below explains that itself
+
     provider, model, effort, err = _resolve_chat()
     if provider is None:
         print(f"teamctl: {err}", file=sys.stderr)
@@ -4371,6 +5858,44 @@ def cmd_launch(args: argparse.Namespace) -> int:
 # (ok 0, warn 1, fail 2). The check functions are pure enough to test with
 # a sandboxed HOME + monkeypatched `which`.
 # --------------------------------------------------------------------------
+
+def wsl_environment(osrelease: str = "/proc/sys/kernel/osrelease",
+                    version: str = "/proc/version") -> str | None:
+    """'WSL2 (Ubuntu)' / 'WSL (Ubuntu)' / 'WSL2' / None.
+
+    WSL presents as Linux and teamctl is SUPPORTED there — this is
+    awareness (doctor's environment line, the installer's greeting),
+    never gating. Signal: /proc/sys/kernel/osrelease and /proc/version
+    carry 'microsoft' ('…-microsoft-standard-WSL2' on WSL2,
+    '…-Microsoft' on WSL1 — the documented kernel strings).
+    WSL_DISTRO_NAME only NAMES the distro; a stray env var alone must
+    never claim WSL. The paths are parameters purely as a test seam."""
+    text = ""
+    for p in (osrelease, version):
+        try:
+            text += Path(p).read_text()
+        except OSError:
+            continue
+    low = text.lower()
+    if "microsoft" not in low:
+        return None
+    tag = "WSL2" if "wsl2" in low else "WSL"
+    distro = os.environ.get("WSL_DISTRO_NAME", "").strip()
+    return f"{tag} ({distro})" if distro else tag
+
+
+def _check_environment() -> tuple[str, str]:
+    """Where teamctl is running. WSL runs as Linux and is supported; its
+    one genuine rough edge — provider browser sign-ins from a GUI-less
+    shell — gets pre-empted here."""
+    wsl = wsl_environment()
+    if wsl:
+        return "ok", (f"{wsl} — supported, runs as Linux. Provider "
+                      "browser sign-ins open via Windows interop; if one "
+                      "stalls, copy the printed URL into a Windows "
+                      "browser yourself")
+    return "ok", sys.platform
+
 
 def _tmux_version() -> str | None:
     if shutil.which("tmux") is None:
@@ -4411,11 +5936,11 @@ def _check_tmux() -> tuple[str, str]:
 
 
 def _check_providers() -> tuple[str, str]:
-    states = {p: provider_state(p)[0] for p in ROUTABLE}
+    states = {p: provider_state(p)[0] for p in routable_providers()}
     usable = [p for p, s in states.items() if s in ("ready", "quiet")]
     locked = [p for p, s in states.items() if s == "locked out"]
     if usable:
-        parts = [f"{p} {states[p]}" for p in ROUTABLE
+        parts = [f"{p} {states[p]}" for p in states
                  if states[p] != "not installed"]
         return "ok", "; ".join(parts) or ", ".join(usable)
     if locked:
@@ -4440,6 +5965,8 @@ def _check_config() -> tuple[str, str]:
         (("lead", "delegation"), ("ask", "always", "manual")),
         (("output", "verbosity"), ("normal", "terse", "detailed")),
         (("update", "mode"), ("prompt", "auto", "off")),
+        (("routing", "strategy"), ("headroom", "preference")),
+        (("worktree", "cleanup"), ("auto", "keep")),
     ]
     for (sec, key), allowed in checks:
         v = (data.get(sec) or {}).get(key)
@@ -4483,6 +6010,36 @@ def _check_install_meta() -> tuple[str, str]:
     return "warn", "missing — re-run install.sh so `teamctl update` works"
 
 
+def _check_lost() -> tuple[str, str]:
+    """Teammates lost to a crash/reboot, waiting for `teamctl resurrect`."""
+    lost = load_state().get("lost") or {}
+    if lost:
+        names = ", ".join(sorted(lost)[:4]) + ("…" if len(lost) > 4 else "")
+        return "warn", (f"{len(lost)} lost teammate(s) ({names}) — "
+                        "rebuild with `teamctl resurrect`")
+    return "ok", "none"
+
+
+def _check_worktrees() -> tuple[str, str]:
+    """Orphaned teamctl worktrees (owner gone, work possibly un-landed)."""
+    reg = load_worktree_registry()
+    if not reg:
+        return "ok", "none"
+    try:
+        state = load_state()
+    except Exception:
+        state = {"teammates": {}}
+    owned = {i.get("worktree", {}).get("path")
+             for i in state["teammates"].values() if i.get("worktree")}
+    orphans = [e.get("role", "?") for p, e in reg.items() if p not in owned]
+    if orphans:
+        return "warn", (f"{len(orphans)} orphaned worktree(s) "
+                        f"({', '.join(sorted(orphans)[:4])}"
+                        f"{'…' if len(orphans) > 4 else ''}) — "
+                        "`teamctl worktree list`, land or prune")
+    return "ok", f"{len(reg)} active, none orphaned"
+
+
 def _check_state_dir() -> tuple[str, str]:
     d = state_path().parent
     try:
@@ -4496,6 +6053,7 @@ def _check_state_dir() -> tuple[str, str]:
 
 
 _DOCTOR_CHECKS = (
+    ("environment", _check_environment),
     ("python", _check_python),
     ("tmux", _check_tmux),
     ("providers", _check_providers),
@@ -4503,6 +6061,8 @@ _DOCTOR_CHECKS = (
     ("statusline", _check_statusline),
     ("install source", _check_install_meta),
     ("state dir", _check_state_dir),
+    ("worktrees", _check_worktrees),
+    ("lost teammates", _check_lost),
 )
 
 
@@ -4690,6 +6250,8 @@ _MENU_ENUMS: dict[str, tuple[str, ...]] = {
     "lead.delegation": ("ask", "always", "manual"),
     "output.verbosity": ("normal", "terse", "detailed"),
     "update.mode": ("prompt", "auto", "off"),
+    "routing.strategy": ("headroom", "preference"),
+    "worktree.cleanup": ("auto", "keep"),
 }
 
 
@@ -4926,6 +6488,9 @@ _SETTINGS_DEFAULTS = {
     "lead.chat_provider": "",
     "lead.chat_model": "",
     "lead.chat_effort": "",
+    "routing.strategy": "headroom",
+    "worktree.enabled": True,
+    "worktree.cleanup": "auto",
 }
 
 # (key, section, label) for the fixed settings, in display order. Per-
@@ -4937,6 +6502,9 @@ _SETTINGS_ROWS = (
     ("lead.chat_model", "default chat", "model"),
     ("lead.chat_effort", "default chat", "effort"),
     ("routing.preference", "routing", "provider order"),
+    ("routing.strategy", "routing", "strategy (headroom/preference)"),
+    ("worktree.enabled", "worktree", "isolate teammates in worktrees"),
+    ("worktree.cleanup", "worktree", "cleanup at shutdown"),
     ("lead.delegation", "posture", "delegation"),
     ("output.verbosity", "posture", "voice"),
     ("layout.lead_width", "layout", "lead pane width %"),
@@ -4968,9 +6536,15 @@ def settings_catalog(data: dict) -> list[dict]:
         rows.append({"key": key, "section": section, "label": label,
                      "value": val, "choices": _menu_choices(key, val)})
     # per-provider model + effort, only for providers the user actually has
-    # configured (init writes a [providers.<p>] block per ready provider)
+    # configured (init writes a [providers.<p>] block per ready provider).
+    # "custom" is the [providers.custom.*] table, not a provider itself;
+    # an effort row is omitted when the CLI has no effort control.
     for prov in sorted((data.get("providers") or {})):
+        if prov == "custom":
+            continue
         for leaf, lbl in (("model", "model"), ("effort", "effort")):
+            if leaf == "effort" and not provider_supports_effort(prov):
+                continue
             key = f"providers.{prov}.{leaf}"
             val = _settings_value(data, key)
             rows.append({"key": key, "section": f"{prov}", "label": lbl,
@@ -5161,7 +6735,7 @@ def build_parser() -> argparse.ArgumentParser:
                           "skill + optional hook for Claude Code); off: remove "
                           "exactly what on installed; status: report tiers")
     lp2.add_argument("--cli", default="",
-                     choices=["claude", "codex", "grok", "all"],
+                     choices=[*LEAD_BLOCK_FILES, "all"],
                      help="which CLI's identity to manage (default: every "
                           "detected CLI for on; everything for off)")
     lp2.add_argument("--hook", action="store_true",
@@ -5201,10 +6775,11 @@ def build_parser() -> argparse.ArgumentParser:
                     help="interactive numbered menu of current settings")
     cp.set_defaults(func=cmd_config)
 
+    provider_names = "|".join(known_provider_names())
     sp = sub.add_parser("spawn", help="open a teammate in a new tmux pane")
     sp.add_argument("role", help="descriptive role name, e.g. code-reviewer")
     sp.add_argument("--provider", default="",
-                    help="claude|codex|grok|shell (default: first entry of your "
+                    help=f"{provider_names} (default: first entry of your "
                          "[routing] preference, or the only detected provider; "
                          "with several providers and no preference you must "
                          "choose)")
@@ -5212,12 +6787,33 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--model", default="", help="model for the teammate")
     sp.add_argument("--effort", default="", help="effort/reasoning level")
     sp.add_argument("--cwd", default="", help="working directory for the teammate")
+    sp.add_argument("--worktree", action=argparse.BooleanOptionalAction,
+                    default=None,
+                    help="isolate the teammate in its own git worktree "
+                         "(default: [worktree] enabled — on; "
+                         "--no-worktree opts out)")
     sp.add_argument("--dry-run", action="store_true", help="print the launch line only")
     sp.set_defaults(func=cmd_spawn)
 
     lp = sub.add_parser("list", help="show active teammates")
     lp.add_argument("--json", action="store_true", help="machine-readable output")
     lp.set_defaults(func=cmd_list)
+
+    stt = sub.add_parser(
+        "status",
+        help="teammate status: busy / needs-input / idle for interactive "
+             "mates (two pane samples + provider waiting patterns), the "
+             "derived lifecycle for dispatch mates; --watch polls and "
+             "fires the [notify] hook on transitions")
+    stt.add_argument("role", nargs="?", default="",
+                     help="one role (default: every teammate)")
+    stt.add_argument("--json", action="store_true",
+                     help="machine-readable output")
+    stt.add_argument("--watch", action="store_true",
+                     help="poll in the foreground until Ctrl-C")
+    stt.add_argument("--interval", type=float, default=5.0,
+                     help="seconds between --watch polls (default 5)")
+    stt.set_defaults(func=cmd_status)
 
     dp = sub.add_parser("shutdown", help="cleanly stop a teammate and close its pane")
     dp.add_argument("role", help="role name to shut down")
@@ -5233,13 +6829,17 @@ def build_parser() -> argparse.ArgumentParser:
     dsp = sub.add_parser("dispatch", help="hand a teammate a task headlessly (watchable)")
     dsp.add_argument("role")
     dsp.add_argument("--provider", default="",
-                     help="claude|codex|grok|shell (default: first entry of your "
+                     help=f"{provider_names} (default: first entry of your "
                           "[routing] preference, or the only detected provider)")
     dsp.add_argument("--task", required=True, help="the task/instruction")
     dsp.add_argument("--context-file", default="", help="file whose contents are appended as context")
     dsp.add_argument("--model", default="", help="override model")
     dsp.add_argument("--effort", default="", help="override effort/reasoning level")
     dsp.add_argument("--cwd", default="", help="working directory for the teammate")
+    dsp.add_argument("--worktree", action=argparse.BooleanOptionalAction,
+                     default=None,
+                     help="isolate the teammate in its own git worktree "
+                          "(default: [worktree] enabled — on)")
     dsp.set_defaults(func=cmd_dispatch)
 
     rp = sub.add_parser("result", help="read back a dispatched teammate's result")
@@ -5253,17 +6853,71 @@ def build_parser() -> argparse.ArgumentParser:
     fp.add_argument("--task", required=True, help="the follow-up task")
     fp.set_defaults(func=cmd_followup)
 
+    rsp = sub.add_parser(
+        "resurrect",
+        help="rebuild teammates lost to a crash/reboot: fresh respawn "
+             "with the recorded provider/model/effort/cwd/worktree "
+             "(interactive context is honestly NOT restored; dispatch "
+             "mates resume exactly via followup instead)")
+    rsp.add_argument("roles", nargs="*",
+                     help="lost roles to rebuild (default: all)")
+    rsp.add_argument("--dry-run", action="store_true",
+                     help="print the plan; change nothing")
+    rsp.add_argument("--json", action="store_true",
+                     help="with --dry-run: the plan as JSON")
+    rsp.add_argument("--yes", action="store_true",
+                     help="respawn without the confirmation prompt")
+    rsp.set_defaults(func=cmd_resurrect)
+
+    ld = sub.add_parser(
+        "land",
+        help="land a teammate's worktree branch: review the diff, "
+             "checkpoint uncommitted work (with consent), merge into "
+             "your checked-out branch, clean up")
+    ld.add_argument("role", help="role whose worktree to land (works "
+                                 "after shutdown/reboot too)")
+    ld.add_argument("--into", default="",
+                    help="assert the target branch (must already be "
+                         "checked out — teamctl never switches branches)")
+    ld.add_argument("--checkpoint-only", action="store_true",
+                    dest="checkpoint_only",
+                    help="commit uncommitted work on the teammate's "
+                         "branch and stop (no merge)")
+    ld.add_argument("--keep", action="store_true",
+                    help="keep the worktree and branch after landing")
+    ld.add_argument("--yes", action="store_true",
+                    help="checkpoint without asking")
+    ld.add_argument("--dry-run", action="store_true",
+                    help="print the land plan (diffstat, counts) and exit")
+    ld.add_argument("--json", action="store_true",
+                    help="machine-readable plan/result")
+    ld.set_defaults(func=cmd_land)
+
+    wp = sub.add_parser(
+        "worktree",
+        help="list or prune teamctl-created worktrees (the audit/recovery "
+             "surface — never removes anything with un-landed work)")
+    wp.add_argument("action", choices=["list", "prune"])
+    wp.add_argument("--json", action="store_true",
+                    help="machine-readable output (list)")
+    wp.add_argument("--dry-run", action="store_true",
+                    help="prune: show what would be removed, remove nothing")
+    wp.set_defaults(func=cmd_worktree)
+
     rt = sub.add_parser("route", help="pick the best available provider and dispatch")
     rt.add_argument("role")
     rt.add_argument("--task", required=True, help="the task/instruction")
     rt.add_argument("--providers", default="",
-                    help="comma-separated candidate providers (default: all three; "
-                         "ranked by your [routing] preference — without one the "
-                         "order is alphabetical, which is arbitrary, not a "
-                         "recommendation)")
+                    help="comma-separated candidate providers (default: every "
+                         "routable provider; ranked by your [routing] "
+                         "preference/strategy)")
     rt.add_argument("--model", default="", help="override model")
     rt.add_argument("--effort", default="", help="override effort/reasoning level")
     rt.add_argument("--cwd", default="", help="working directory for the teammate")
+    rt.add_argument("--worktree", action=argparse.BooleanOptionalAction,
+                    default=None,
+                    help="isolate the teammate in its own git worktree "
+                         "(default: [worktree] enabled — on)")
     rt.add_argument("--dry-run", action="store_true",
                     help="print selection + launch line without opening a pane")
     rt.set_defaults(func=cmd_route)
@@ -5297,7 +6951,7 @@ def build_parser() -> argparse.ArgumentParser:
                              "always pass through verbatim — new models need "
                              "no teamctl update)")
     mo.add_argument("provider", nargs="?", default="",
-                    help="claude|codex|grok (default: all)")
+                    help="any routable provider (default: all)")
     mo.set_defaults(func=cmd_models)
 
     slp = sub.add_parser(

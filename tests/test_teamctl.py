@@ -47,6 +47,13 @@ def seed_signin(home: Path, *providers: str) -> None:
             (home / ".grok" / "auth.json").write_text(json.dumps(
                 {"https://auth.x.ai::u1": {"key": "k",
                                            "refresh_token": "r"}}))
+        elif p == "gemini":
+            # the documented OAuth token cache (official auth docs); shape
+            # per issue #5474 — access + refresh tokens
+            (home / ".gemini").mkdir(exist_ok=True)
+            (home / ".gemini" / "oauth_creds.json").write_text(json.dumps(
+                {"access_token": "t", "refresh_token": "r",
+                 "token_type": "Bearer", "expiry_date": 1}))
 
 
 class _AuthSandbox:
@@ -57,7 +64,9 @@ class _AuthSandbox:
     def _isolate_auth(self):
         os.environ["TEAMCTL_NO_KEYCHAIN"] = "1"
         self._saved_env = {}
-        for var in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "XAI_API_KEY"):
+        for var in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "XAI_API_KEY",
+                    "GEMINI_API_KEY", "GOOGLE_API_KEY",
+                    "GOOGLE_APPLICATION_CREDENTIALS"):
             self._saved_env[var] = os.environ.pop(var, None)
 
     def _restore_auth(self):
@@ -365,7 +374,7 @@ class VersionTests(unittest.TestCase):
             tc.main(["--version"])
         self.assertEqual(cm.exception.code, 0)
         self.assertIn(tc.VERSION, buf.getvalue())
-        self.assertEqual(tc.VERSION, "0.4.0")
+        self.assertTrue(tc.VERSION.startswith("0.5.0"), tc.VERSION)
 
 
 class CliTests(unittest.TestCase):
@@ -737,15 +746,16 @@ class ProbeRunTests(unittest.TestCase):
         self.tmpdir = tempfile.TemporaryDirectory()
         self.dir = Path(self.tmpdir.name)
         os.environ["TEAMCTL_STATE"] = str(self.dir / "state.json")
-        self._probes = tc.PROBES
+        self._probes = tc.probe_specs
         self._probe = tc.probe_provider
         self._which = tc.shutil.which
-        tc.PROBES = {"fakeprov": {"argv": ["fakeprov"], "command": "/usage"}}
+        tc.probe_specs = lambda: {"fakeprov": {"argv": ["fakeprov"],
+                                               "command": "/usage"}}
         tc.shutil.which = lambda name, *a, **k: (
             "/fake/bin/fakeprov" if name == "fakeprov" else None)
 
     def tearDown(self):
-        tc.PROBES = self._probes
+        tc.probe_specs = self._probes
         tc.probe_provider = self._probe
         tc.shutil.which = self._which
         os.environ.pop("TEAMCTL_STATE", None)
@@ -875,6 +885,10 @@ class RouteTests(unittest.TestCase):
         self.tmpdir = tempfile.TemporaryDirectory()
         self.dir = Path(self.tmpdir.name)
         os.environ["TEAMCTL_STATE"] = str(self.dir / "state.json")
+        # sandbox HOME too: headroom ranking reads native usage sources
+        # (~/.codex/sessions), which must not leak in from the machine
+        self._home = os.environ.get("HOME")
+        os.environ["HOME"] = str(self.dir)
 
         self._which = tc.shutil.which
         self._auth_state = tc.provider_auth_state
@@ -893,6 +907,8 @@ class RouteTests(unittest.TestCase):
         tc.shutil.which = self._which
         tc.provider_auth_state = self._auth_state
         tc.load_config = self._config
+        if self._home is not None:
+            os.environ["HOME"] = self._home
         os.environ.pop("TEAMCTL_STATE", None)
         self.tmpdir.cleanup()
 
@@ -969,6 +985,234 @@ class RouteTests(unittest.TestCase):
         finally:
             if saved is not None:
                 os.environ["TMUX"] = saved
+
+
+class WslDetectionTests(unittest.TestCase):
+    """WSL awareness (never gating): detection off the documented kernel
+    strings, with WSL_DISTRO_NAME as a name refinement only. Honest
+    limitation, recorded: this logic is unit-tested against FAKED /proc
+    fixtures — not field-tested on a real WSL box."""
+
+    WSL2 = "5.15.167.4-microsoft-standard-WSL2\n"
+    WSL1 = "4.4.0-19041-Microsoft\n"
+    PLAIN = "6.8.0-45-generic\n"
+
+    def setUp(self):
+        import tempfile
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmpdir.name)
+        self._distro = os.environ.pop("WSL_DISTRO_NAME", None)
+
+    def tearDown(self):
+        if self._distro is not None:
+            os.environ["WSL_DISTRO_NAME"] = self._distro
+        else:
+            os.environ.pop("WSL_DISTRO_NAME", None)
+        self.tmpdir.cleanup()
+
+    def _probe(self, osrelease=None, version=None):
+        op = self.dir / "osrelease"
+        vp = self.dir / "version"
+        if osrelease is not None:
+            op.write_text(osrelease)
+        if version is not None:
+            vp.write_text(version)
+        return tc.wsl_environment(str(op), str(vp))
+
+    def test_wsl2_detected_with_distro_name(self):
+        os.environ["WSL_DISTRO_NAME"] = "Ubuntu"
+        self.assertEqual(self._probe(osrelease=self.WSL2), "WSL2 (Ubuntu)")
+
+    def test_wsl1_detected(self):
+        self.assertEqual(self._probe(osrelease=self.WSL1), "WSL")
+
+    def test_plain_linux_is_not_wsl(self):
+        self.assertIsNone(self._probe(osrelease=self.PLAIN,
+                                      version="Linux version "
+                                              + self.PLAIN))
+
+    def test_env_var_alone_never_claims_wsl(self):
+        # a stray WSL_DISTRO_NAME (e.g. leaked through ssh) must not
+        # claim WSL without the kernel marker
+        os.environ["WSL_DISTRO_NAME"] = "Ubuntu"
+        self.assertIsNone(self._probe(osrelease=self.PLAIN))
+
+    def test_missing_proc_files_mean_not_wsl(self):
+        self.assertIsNone(self._probe())          # e.g. macOS
+
+    def test_version_file_alone_suffices(self):
+        cap = self._probe(version="Linux version " + self.WSL2)
+        self.assertEqual(cap, "WSL2")
+
+    def test_doctor_environment_line(self):
+        saved = tc.wsl_environment
+        tc.wsl_environment = lambda *a, **k: "WSL2 (Ubuntu)"
+        try:
+            status, detail = tc._check_environment()
+        finally:
+            tc.wsl_environment = saved
+        self.assertEqual(status, "ok")            # supported, not a warn
+        self.assertIn("WSL2 (Ubuntu)", detail)
+        self.assertIn("Windows browser", detail)  # the sign-in pre-empt
+        tc.wsl_environment = lambda *a, **k: None
+        try:
+            status, detail = tc._check_environment()
+        finally:
+            tc.wsl_environment = saved
+        self.assertEqual((status, detail), ("ok", tc.sys.platform))
+
+
+class HeadroomRouteTests(unittest.TestCase):
+    """v0.5.0 route-to-headroom: among the survivors, the provider with
+    the most remaining quota wins; preference order only breaks ties.
+    Exclusion stays a separate phase — an exhausted provider can never be
+    selected however low its recorded usage."""
+
+    def setUp(self):
+        import tempfile
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmpdir.name)
+        os.environ["TEAMCTL_STATE"] = str(self.dir / "state.json")
+        self._home = os.environ.get("HOME")
+        os.environ["HOME"] = str(self.dir)
+        self._which = tc.shutil.which
+        self._auth_state = tc.provider_auth_state
+        self._config = tc.load_config
+        self.installed = {"claude", "codex", "grok"}
+        self.auth = {p: "signed-in" for p in ("claude", "codex", "grok")}
+        tc.shutil.which = lambda name, *a, **k: (
+            f"/fake/bin/{name}" if name in self.installed else None)
+        tc.provider_auth_state = (
+            lambda p: (self.auth.get(p, "signed-out"), ""))
+        tc.load_config = lambda: {}
+
+    def tearDown(self):
+        tc.shutil.which = self._which
+        tc.provider_auth_state = self._auth_state
+        tc.load_config = self._config
+        if self._home is not None:
+            os.environ["HOME"] = self._home
+        os.environ.pop("TEAMCTL_STATE", None)
+        self.tmpdir.cleanup()
+
+    # ---- usage seeding: one real shape per source tier ----
+    def _seed_codex(self, pct: float):
+        import time as _t
+        day = self.dir / ".codex" / "sessions" / "2026" / "07" / "11"
+        day.mkdir(parents=True, exist_ok=True)
+        (day / "rollout-x.jsonl").write_text(json.dumps(
+            {"payload": {"rate_limits": {"primary": {
+                "used_percent": pct,
+                "resets_at": _t.time() + 3600}}}}) + "\n")
+
+    def _seed_claude(self, pct: float):
+        import time as _t
+        (self.dir / "claude-usage.json").write_text(json.dumps(
+            {"captured_at": _t.time(),
+             "rate_limits": {"five_hour": {"used_percentage": pct,
+                                           "resets_at": _t.time() + 3600}}}))
+
+    def _seed_grok_probe(self, pct: float, age_seconds: float = 0.0):
+        import time as _t
+        (self.dir / "probe-usage.json").write_text(json.dumps(
+            {"grok": {"captured_at": _t.time() - age_seconds,
+                      "source": "probe",
+                      "windows": {"weekly": {"used_percent": pct}}}}))
+
+    def _route(self, *extra):
+        import io
+        import contextlib
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = tc.main(["route", "r", "--task", "do it", "--dry-run",
+                          *extra])
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_headroom_prefers_most_remaining_quota(self):
+        self._seed_claude(63.0)
+        self._seed_codex(12.0)
+        self._seed_grok_probe(80.0)
+        rc, out, _ = self._route()
+        self.assertEqual(rc, 0)
+        self.assertIn("route: selected codex", out)
+        # the reason line is auditable: every number it used is shown
+        self.assertIn("codex 12%", out)
+        self.assertIn("claude 63%", out)
+        self.assertIn("grok 80%", out)
+        self.assertIn("headroom:", out)
+
+    def test_unknown_usage_ranks_as_zero_with_preference_tiebreak(self):
+        # grok has NO data -> optimistic 0% (D2), beating codex at 12%;
+        # unknowns print as ?%
+        self._seed_codex(12.0)
+        self._seed_claude(63.0)
+        rc, out, _ = self._route()
+        self.assertEqual(rc, 0)
+        self.assertIn("route: selected grok", out)
+        self.assertIn("grok ?%", out)
+
+    def test_all_unknown_falls_back_to_preference_order(self):
+        # nothing known anywhere -> bit-identical to the v0.4.0 pick
+        rc, out, _ = self._route()
+        self.assertEqual(rc, 0)
+        self.assertIn("route: selected claude", out)
+
+    def test_binding_constraint_is_the_max_window(self):
+        # codex 5h at 10% but weekly at 90% -> ranks as 90 (the tighter
+        # window governs), so claude at 50% wins
+        import time as _t
+        day = self.dir / ".codex" / "sessions" / "2026" / "07" / "11"
+        day.mkdir(parents=True, exist_ok=True)
+        (day / "rollout-x.jsonl").write_text(json.dumps(
+            {"payload": {"rate_limits": {
+                "primary": {"used_percent": 10.0,
+                            "resets_at": _t.time() + 3600},
+                "secondary": {"used_percent": 90.0,
+                              "resets_at": _t.time() + 86400}}}}) + "\n")
+        self._seed_claude(50.0)
+        self._seed_grok_probe(95.0)
+        rc, out, _ = self._route()
+        self.assertEqual(rc, 0)
+        self.assertIn("route: selected claude", out)
+        self.assertIn("codex 90%", out)
+
+    def test_exhausted_is_excluded_before_ranking(self):
+        # codex has the lowest usage but a live exhausted signal — the
+        # exclusion phase runs first, whatever the strategy says
+        import time as _t
+        self._seed_codex(5.0)
+        self._seed_claude(70.0)
+        (self.dir / "providers.json").write_text(json.dumps(
+            {"codex": {"signal": "exhausted", "at": "2026-07-12T00:00:00",
+                       "resets_at": _t.time() + 3600}}))
+        rc, out, _ = self._route()
+        self.assertEqual(rc, 0)
+        self.assertNotIn("selected codex", out)
+        self.assertIn("codex: exhausted", out)
+
+    def test_strategy_preference_is_v040_behavior(self):
+        tc.load_config = lambda: {"routing": {"strategy": "preference"}}
+        self._seed_claude(99.0)          # nearly exhausted, still first
+        self._seed_codex(1.0)
+        rc, out, _ = self._route()
+        self.assertEqual(rc, 0)
+        self.assertIn("route: selected claude", out)
+        self.assertIn("first available in", out)
+
+    def test_bogus_strategy_falls_back_to_headroom(self):
+        tc.load_config = lambda: {"routing": {"strategy": "bogus"}}
+        self.assertEqual(tc.routing_strategy(), "headroom")
+
+    def test_stale_probe_counts_but_is_flagged(self):
+        # probe data older than probe_stale_minutes still ranks (better
+        # than guessing 0%) but the reason line says so
+        self._seed_claude(10.0)
+        self._seed_grok_probe(90.0, age_seconds=7200)
+        rc, out, _ = self._route()
+        self.assertEqual(rc, 0)
+        self.assertIn("route: selected codex", out)      # codex unknown -> 0%
+        self.assertIn("grok 90% (stale probe)", out)
+        self.assertIn("teamctl usage --probe", out)
 
 
 class _LatticeHome(_AuthSandbox, unittest.TestCase):
@@ -1750,9 +1994,12 @@ class InitTests(_AuthSandbox, unittest.TestCase):
         self.assertIn("defaults locked", out)
         self.assertIn("customize", out)
         self.assertIn("teamctl init --custom", out)
-        # spec §7: final output 12–18 lines
+        # spec §7: final output 12–18 lines (+1 per provider beyond the
+        # original three — the frame gained a gemini row in v0.5.0)
         lines = out.rstrip("\n").split("\n")
-        self.assertTrue(12 <= len(lines) <= 18, f"{len(lines)} lines")
+        extra = len(tc.routable_providers()) - 3
+        self.assertTrue(12 <= len(lines) <= 18 + extra,
+                        f"{len(lines)} lines")
 
     def test_express_frame_locked_out_provider(self):
         # installed but signed out -> "locked out", never offered a route
@@ -2062,6 +2309,16 @@ class LiveTmuxTests(unittest.TestCase):
         self.statedir = tempfile.TemporaryDirectory(prefix="teamctl-live-")
         self.tmp = Path(self.statedir.name) / "state.json"
         os.environ["TEAMCTL_STATE"] = str(self.tmp)
+        # worktree isolation is default-ON in v0.5.0, but these tests
+        # exercise the tmux mechanics from the teamctl checkout itself —
+        # branching the REAL repo per test role would collide across
+        # concurrent suite runs (the same class of bug the per-test temp
+        # state fixed). Worktree behavior has its own suite over scratch
+        # repos: tests/test_worktree.py.
+        self._wt_settings = tc.worktree_settings
+        tc.worktree_settings = lambda: {"enabled": False, "dir": "",
+                                        "branch_prefix": "teamctl/",
+                                        "cleanup": "auto"}
         out = tc.tmux("new-window", "-d", "-n", f"teamctl-tests-{os.getpid()}",
                       "-P", "-F", "#{window_id} #{pane_id}").stdout.split()
         self.window_id, self.lead_pane = out[0], out[1]
@@ -2077,6 +2334,7 @@ class LiveTmuxTests(unittest.TestCase):
         for role in list(tc.load_state()["teammates"]):
             tc.main(["shutdown", role])
         tc.tmux("kill-window", "-t", self.window_id, check=False)
+        tc.worktree_settings = self._wt_settings
         if self._tmux_pane is None:
             os.environ.pop("TMUX_PANE", None)
         else:
@@ -2533,7 +2791,18 @@ class CursesLiveTests(unittest.TestCase):
                f"TEAMCTL_STATE={shlex.quote(str(self.home / 'state.json'))} "
                f"{shlex.quote(sys.executable)} {shlex.quote(str(TEAMCTL))} "
                f"{teamctl_args}; sleep 300")
-        self._tmux("new-session", "-d", "-x", "110", "-y", "35", cmd)
+        # a loaded runner can lose the nested server's start race (observed
+        # on ubuntu CI: 40s of EMPTY captures — the session never existed).
+        # Confirm the session is up before driving it; retry the start.
+        import time as _t
+        for _attempt in range(3):
+            self._tmux("new-session", "-d", "-x", "110", "-y", "35", cmd)
+            deadline = _t.monotonic() + 10
+            while _t.monotonic() < deadline:
+                if self._tmux("has-session").returncode == 0:
+                    return
+                _t.sleep(0.3)
+        self.fail("the nested tmux session never came up")
 
     def test_cockpit_renders_in_tmux_and_writes_config(self):
         # spec §4: screen 1 models -> screen 2 posture -> screen 3 seal
