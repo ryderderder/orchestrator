@@ -99,9 +99,10 @@ without reporting.
 
 ### Lead-agent playbook
 
-If your lead is itself an AI agent (Claude Code, Codex, Grok, …), paste these
-standing rules into its instructions file (`CLAUDE.md`, `AGENTS.md`, or
-equivalent):
+If your lead is itself an AI agent (Claude Code, Codex, Grok, …), give it
+these standing rules. **For Claude Code, `teamctl lead on` automates the
+paste-in** (see [Lead mode](#lead-mode) below); for other CLIs, paste them
+into the agent's instructions file (`AGENTS.md` or equivalent):
 
 ```
 Before spinning up a teammate, planning a multi-agent effort, or dispatching
@@ -121,6 +122,38 @@ anything large:
    user's configured defaults. Shut every teammate down
    (`teamctl shutdown <role>`) the moment its job is done.
 ```
+
+## Lead mode
+
+`teamctl lead on` installs a durable *manager identity* for a Claude Code
+lead agent — the standing rules from the playbook above (stay responsive,
+delegate non-trivial work, decide capacity from `teamctl usage`/`providers`
+live data, one owner per file, zero idle teammates, the user always
+overrides) — in three tiers, from discoverable to unmissable:
+
+1. **Skill** (`~/.claude/skills/teamctl-lead/SKILL.md`) — *discoverable*.
+   Claude Code loads it whenever delegation, teammates, multi-agent
+   planning, or capacity questions come up.
+2. **CLAUDE.md block** — *always on*. A compact, marker-guarded block
+   (`<!-- BEGIN teamctl-lead -->` … `<!-- END teamctl-lead -->`) appended to
+   `~/.claude/CLAUDE.md`, in context from the first prompt of every session.
+3. **Hook** (optional; asked as y/N, default no, or forced with
+   `teamctl lead on --hook`) — *per-prompt, the strongest tier*. A
+   `UserPromptSubmit` hook in `~/.claude/settings.json` that `echo`es a
+   one-line reminder; its stdout is injected into context on **every**
+   prompt, so it keeps working even after context compaction has dropped
+   the CLAUDE.md text from a long session.
+
+Every step is skipped if already present, backed up first if it changes an
+existing file, and printed with its exact revert. `teamctl lead on` refuses
+to touch a `settings.json` it cannot parse.
+
+**The off switch:** `teamctl lead off` removes exactly what `on` installed —
+the skill directory, the marker block (your other CLAUDE.md content is
+preserved byte-for-byte), and the teamctl-lead hook entry (other hooks and
+settings keys untouched) — each with a fresh backup, tolerating partial
+installs, and reports what it removed and what it left alone.
+`teamctl lead status` shows per-tier state at any time.
 
 ## Configuration
 
@@ -153,13 +186,32 @@ preference = ["claude", "codex", "grok"]   # order `route` prefers
 Command-line `--model` / `--effort` always override the config. State lives
 in `~/.local/state/agent-team/state.json` (override with `$TEAMCTL_STATE`).
 
+### Adjusting preferences
+
+You never need to edit the TOML by hand:
+
+```sh
+teamctl config                                  # show current settings as dotted keys
+teamctl config providers.claude.model           # show one value
+teamctl config providers.claude.model sonnet    # set one key (others preserved)
+teamctl config routing.preference "codex,claude"  # comma-separated -> list
+teamctl config --menu                           # numbered menu: pick, edit, repeat
+```
+
+Sets rewrite the file safely: the previous version is backed up to
+`config.toml.bak-teamctl`, all other keys are preserved, and a config that
+fails to parse is refused rather than silently replaced. You can also just
+re-run `teamctl init` any time to redo the whole wizard.
+
 `teamctl init` also offers (default **no**, backups made first):
 
 - a marker-guarded block in `~/.tmux.conf` for the pane-border and status-bar
   `role · model` labels;
 - installing `claude-statusline` (shows `model · effort · ctx N%` in Claude
   Code) and adding the `statusLine` key to `~/.claude/settings.json` — skipped
-  if a `statusLine` key already exists.
+  if a `statusLine` key already exists;
+- installing [lead mode](#lead-mode) for Claude Code (same as
+  `teamctl lead on`).
 
 ## Uninstall
 
@@ -171,6 +223,9 @@ Removes the binaries, removes the tmux marker block (backup made first), and
 removes the `statusLine` settings key if — and only if — it points at this
 tool's script (backup made first). Config and state files are left in place;
 the script prints the one-liner to remove them too.
+
+If you installed [lead mode](#lead-mode), run `teamctl lead off` **before**
+uninstalling (the uninstaller removes the `teamctl` binary itself).
 
 ## Limitations (honest ones)
 

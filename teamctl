@@ -4,6 +4,8 @@
 Usage:
 
     teamctl init [--yes]
+    teamctl lead on|off|status [--hook]
+    teamctl config [<dotted.key> [<value>]] [--menu]
     teamctl spawn <role> [--provider claude|codex|grok|shell] [--prompt TEXT] [--cwd DIR]
     teamctl list
     teamctl send <role> "<instruction>" [--no-enter]
@@ -48,7 +50,7 @@ try:
 except ModuleNotFoundError:  # pragma: no cover
     tomllib = None
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 
 # provider -> launch command (as an argv prefix). A positional prompt is
 # appended when supplied. `shell` is a real provider used for verification:
@@ -86,9 +88,13 @@ AUTH_PATHS = {
 }
 
 
+def config_path() -> Path:
+    return Path.home() / ".config" / "agent-team" / "config.toml"
+
+
 def load_config() -> dict:
     """Preferences written by `teamctl init`; everything works without them."""
-    path = Path.home() / ".config" / "agent-team" / "config.toml"
+    path = config_path()
     if not path.exists() or tomllib is None:
         return {}
     try:
@@ -1031,9 +1037,11 @@ def _input(prompt: str) -> str:
 
 
 def _ask(prompt: str, default: str = "") -> str:
+    # EOFError: real stdin ran dry (non-tty). StopIteration: a scripted
+    # _input (tests) ran out of answers — same meaning, same default.
     try:
         raw = _input(prompt).strip()
-    except EOFError:
+    except (EOFError, StopIteration):
         return default
     return raw or default
 
@@ -1214,12 +1222,599 @@ def cmd_init(args: argparse.Namespace) -> int:
                 print(f"created {settings_path} with a statusLine key")
                 changes.append((f"created {settings_path}", f"rm {settings_path}"))
 
+    # -- optional: lead mode (manager identity for a Claude Code lead) ------
+    want_lead = False if args.yes else _ask_yn(
+        "Install lead mode for Claude Code (teamctl lead on)? [y/N] ")
+    if want_lead:
+        _lead_install_skill(changes)
+        _lead_install_claude_md(changes)
+        if _lead_status()["hook"] == "installed":
+            print("settings.json already has a teamctl-lead hook — skipping.")
+        elif _ask_yn("Also install the per-prompt reminder hook "
+                     "(strongest tier — survives context compaction)? [y/N] "):
+            _lead_install_hook(changes)
+
     print("\nSummary of changes:")
     for what, revert in changes:
         print(f"  * {what}")
         print(f"    revert: {revert}")
     if not changes:
         print("  nothing was changed")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# `teamctl lead` — durable manager identity for a Claude Code lead agent.
+#
+# Three tiers, individually reversible, all marker-guarded or key-guarded:
+#   1. skill      ~/.claude/skills/teamctl-lead/SKILL.md — discoverable; Claude
+#                 loads it when delegation/teammate topics come up.
+#   2. CLAUDE.md  a marker-guarded block — always in context at session start.
+#   3. hook       a UserPromptSubmit echo in ~/.claude/settings.json — the
+#                 strongest tier: its stdout is re-injected into context on
+#                 every prompt, so it survives context compaction (which can
+#                 drop the CLAUDE.md text from a long session).
+# --------------------------------------------------------------------------
+
+LEAD_MD_BEGIN = "<!-- BEGIN teamctl-lead -->"
+LEAD_MD_END = "<!-- END teamctl-lead -->"
+
+LEAD_CLAUDE_BLOCK = LEAD_MD_BEGIN + """
+## teamctl lead mode
+<!-- Added by `teamctl lead on`; remove with `teamctl lead off`. -->
+You are the LEAD of a teamctl agent team (teammates run as tmux panes to
+your right). Keep this chat free and responsive for the user's dynamic
+tasks: delegate all non-trivial work to teammates via `teamctl
+spawn`/`dispatch`/`route`. Before spawning a teammate or planning anything
+large, run `teamctl usage` and `teamctl providers`, then choose
+provider/model/effort from that live data, the user's preferences
+(~/.config/agent-team/config.toml — see `teamctl config`), and task fit.
+Use descriptive role names; never point two teammates at the same file;
+shut each teammate down (`teamctl shutdown <role>`) the moment its job is
+done — zero idle teammates. The user's explicit instructions always
+override these rules.
+""" + LEAD_MD_END + "\n"
+
+LEAD_SKILL_MD = """\
+---
+name: teamctl-lead
+description: Lead-agent discipline for running an agent team with teamctl. Use when delegating work, spawning or shutting down teammates, planning multi-agent or parallel efforts, choosing a provider/model/effort for a task, or checking team capacity, usage, and provider availability.
+---
+
+# teamctl lead mode
+
+You are the LEAD agent of a teamctl agent team. Your pane is the user's
+main chat; teammates are tmux panes tiled to your right.
+
+## Standing rules
+
+1. **Stay responsive.** Keep this main chat free for the user's dynamic
+   tasks. Delegate all non-trivial work to teammates (`teamctl spawn`,
+   `teamctl dispatch`, `teamctl route`); handle only trivial replies and
+   one-line edits yourself.
+2. **Decide capacity from live data, not habit.** Before spawning a
+   teammate, planning a multi-agent effort, or dispatching anything large:
+   run `teamctl usage` (real usage %/reset times where the provider
+   exposes them) and `teamctl providers` (installed / authed / exhausted).
+   Pick the provider, model, and effort from that live data, the user's
+   preferences (`~/.config/agent-team/config.toml`, adjustable via
+   `teamctl config`), and task fit — light/cheap models for mechanical
+   work, heavyweight for hard reasoning. `teamctl route` automates the
+   pick.
+3. **Name teammates by role.** Descriptive role names (`code-reviewer`,
+   `api-researcher`), one clear deliverable each.
+4. **One owner per file.** Never point two teammates at the same file; use
+   extra teammates as reviewers of a single owner's work.
+5. **Zero idle teammates.** Shut each teammate down the moment its job is
+   done (`teamctl shutdown <role>`). No lingering panes.
+6. **The user overrides everything.** The user's explicit instructions
+   always take precedence over these rules.
+
+## Command reference
+
+    teamctl spawn <role> --provider claude|codex|grok [--model M] [--effort E] [--prompt TEXT]
+    teamctl dispatch <role> --provider P --task "…"   # headless, watchable pane
+    teamctl result <role> --wait                      # read the result back
+    teamctl followup <role> --task "…"                # another turn, same session
+    teamctl route <role> --task "…"                   # auto-pick best provider
+    teamctl send <role> "…"                           # type into a live teammate
+    teamctl list / teamctl usage / teamctl providers
+    teamctl shutdown <role>                           # always, as soon as done
+"""
+
+LEAD_HOOK_COMMAND = (
+    "echo '[teamctl-lead] Standing rule: delegate all non-trivial work to "
+    "teamctl teammates - check teamctl usage and teamctl providers before "
+    "spawning, and shut each teammate down the moment it is done.'"
+)
+
+
+def _lead_hook_entry() -> dict:
+    """A fresh UserPromptSubmit hook entry (nested shape per the hooks docs;
+    UserPromptSubmit takes no matcher). Its stdout is added to context."""
+    return {"hooks": [{"type": "command", "command": LEAD_HOOK_COMMAND}]}
+
+
+def _lead_paths() -> dict[str, Path]:
+    home = Path.home()
+    skill_dir = home / ".claude" / "skills" / "teamctl-lead"
+    return {
+        "skill_dir": skill_dir,
+        "skill_md": skill_dir / "SKILL.md",
+        "claude_md": home / ".claude" / "CLAUDE.md",
+        "settings": home / ".claude" / "settings.json",
+    }
+
+
+def _lead_hook_indexes(data: dict) -> list[int]:
+    """Indexes of hooks.UserPromptSubmit entries carrying a teamctl-lead hook."""
+    entries = (data.get("hooks") or {}).get("UserPromptSubmit")
+    if not isinstance(entries, list):
+        return []
+    found = []
+    for i, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            continue
+        hooks = entry.get("hooks")
+        if not isinstance(hooks, list):
+            continue
+        if any(isinstance(h, dict) and "teamctl-lead" in str(h.get("command", ""))
+               for h in hooks):
+            found.append(i)
+    return found
+
+
+def _lead_install_skill(changes: list[tuple[str, str]]) -> None:
+    skill_md = _lead_paths()["skill_md"]
+    if skill_md.exists():
+        if skill_md.read_text() == LEAD_SKILL_MD:
+            print(f"{skill_md} already installed — skipping.")
+            return
+        bak = skill_md.with_name("SKILL.md.bak-teamctl")
+        shutil.copy2(skill_md, bak)
+        skill_md.write_text(LEAD_SKILL_MD)
+        print(f"updated {skill_md} (previous version backed up to {bak})")
+        changes.append((f"updated {skill_md}",
+                        f"restore {bak}, or run `teamctl lead off`"))
+        return
+    skill_md.parent.mkdir(parents=True, exist_ok=True)
+    skill_md.write_text(LEAD_SKILL_MD)
+    print(f"installed skill {skill_md}")
+    changes.append((f"installed {skill_md}", "teamctl lead off"))
+
+
+def _lead_install_claude_md(changes: list[tuple[str, str]]) -> None:
+    cm = _lead_paths()["claude_md"]
+    text = cm.read_text() if cm.exists() else ""
+    if LEAD_MD_BEGIN in text:
+        print(f"{cm} already contains the teamctl-lead block — skipping.")
+        return
+    if cm.exists():
+        bak = Path(str(cm) + ".bak-teamctl")
+        shutil.copy2(cm, bak)
+        print(f"backed up {cm} to {bak}")
+    cm.parent.mkdir(parents=True, exist_ok=True)
+    with open(cm, "a") as fh:
+        if text and not text.endswith("\n"):
+            fh.write("\n")
+        if text:
+            fh.write("\n")
+        fh.write(LEAD_CLAUDE_BLOCK)
+    print(f"appended teamctl-lead block to {cm}")
+    changes.append((
+        f"appended a marker-guarded block to {cm}",
+        f"run `teamctl lead off`, or delete the block between the "
+        f"'{LEAD_MD_BEGIN}' and '{LEAD_MD_END}' lines",
+    ))
+
+
+def _lead_install_hook(changes: list[tuple[str, str]]) -> None:
+    sp = _lead_paths()["settings"]
+    if not sp.exists():
+        sp.parent.mkdir(parents=True, exist_ok=True)
+        sp.write_text(json.dumps(
+            {"hooks": {"UserPromptSubmit": [_lead_hook_entry()]}}, indent=2) + "\n")
+        print(f"created {sp} with a teamctl-lead UserPromptSubmit hook")
+        changes.append((f"created {sp}", f"teamctl lead off  (or rm {sp})"))
+        return
+
+    try:
+        data = json.loads(sp.read_text())
+    except (json.JSONDecodeError, OSError):
+        data = None
+    if not isinstance(data, dict):
+        print(f"could not parse {sp} — leaving it untouched.")
+        print("add this entry yourself under hooks.UserPromptSubmit:  "
+              + json.dumps(_lead_hook_entry()))
+        return
+    if _lead_hook_indexes(data):
+        print(f"{sp} already has a teamctl-lead hook — skipping.")
+        return
+    hooks = data.setdefault("hooks", {})
+    if not isinstance(hooks, dict):
+        print(f"'hooks' in {sp} has an unexpected shape — leaving it untouched.")
+        return
+    ups = hooks.setdefault("UserPromptSubmit", [])
+    if not isinstance(ups, list):
+        print(f"hooks.UserPromptSubmit in {sp} has an unexpected shape — "
+              "leaving it untouched.")
+        return
+    bak = Path(str(sp) + ".bak-teamctl")
+    shutil.copy2(sp, bak)
+    ups.append(_lead_hook_entry())
+    sp.write_text(json.dumps(data, indent=2) + "\n")
+    print(f"added teamctl-lead UserPromptSubmit hook to {sp} (backup: {bak})")
+    changes.append((f"added a teamctl-lead hook to {sp}",
+                    f"restore {bak}, or run `teamctl lead off`"))
+
+
+def _lead_remove_skill(removed: list[str], left: list[str]) -> None:
+    p = _lead_paths()
+    sd = p["skill_dir"]
+    if not sd.exists():
+        left.append(f"skill: {sd} not present")
+        return
+    # Back up OUTSIDE ~/.claude/skills/ so Claude Code never scans the copy.
+    bak = sd.parent.parent / "teamctl-lead-skill.bak-teamctl-off"
+    if bak.exists():
+        shutil.rmtree(bak)
+    shutil.copytree(sd, bak)
+    shutil.rmtree(sd)
+    removed.append(f"skill dir {sd} (backup: {bak})")
+
+
+def _lead_remove_claude_md(removed: list[str], left: list[str]) -> None:
+    cm = _lead_paths()["claude_md"]
+    if not cm.exists():
+        left.append(f"CLAUDE.md: {cm} not present")
+        return
+    text = cm.read_text()
+    if LEAD_MD_BEGIN not in text:
+        left.append(f"CLAUDE.md: no teamctl-lead block in {cm}; left untouched")
+        return
+    bak = Path(str(cm) + ".bak-teamctl-off")
+    shutil.copy2(cm, bak)
+    kept, skip = [], False
+    for line in text.splitlines(keepends=True):
+        if line.strip() == LEAD_MD_BEGIN:
+            skip = True
+            continue
+        if line.strip() == LEAD_MD_END:
+            skip = False
+            continue
+        if not skip:
+            kept.append(line)
+    remainder = "".join(kept)
+    if remainder.strip():
+        cm.write_text(remainder.rstrip("\n") + "\n")
+        removed.append(f"teamctl-lead block from {cm} "
+                       f"(backup: {bak}; other content preserved)")
+    else:
+        cm.unlink()
+        removed.append(f"{cm} (it contained only the teamctl-lead block; "
+                       f"backup: {bak})")
+
+
+def _lead_remove_hook(removed: list[str], left: list[str]) -> None:
+    sp = _lead_paths()["settings"]
+    if not sp.exists():
+        left.append(f"hook: {sp} not present")
+        return
+    try:
+        data = json.loads(sp.read_text())
+    except (json.JSONDecodeError, OSError):
+        data = None
+    if not isinstance(data, dict):
+        left.append(f"hook: could not parse {sp}; left untouched")
+        return
+    idx = _lead_hook_indexes(data)
+    if not idx:
+        left.append(f"hook: no teamctl-lead hook in {sp}; left untouched")
+        return
+    bak = Path(str(sp) + ".bak-teamctl-off")
+    shutil.copy2(sp, bak)
+    ups = data["hooks"]["UserPromptSubmit"]
+    data["hooks"]["UserPromptSubmit"] = [e for i, e in enumerate(ups)
+                                         if i not in idx]
+    if not data["hooks"]["UserPromptSubmit"]:
+        del data["hooks"]["UserPromptSubmit"]
+    if not data["hooks"]:
+        del data["hooks"]
+    sp.write_text(json.dumps(data, indent=2) + "\n")
+    removed.append(f"teamctl-lead hook from {sp} "
+                   f"(backup: {bak}; other settings preserved)")
+
+
+def _lead_status() -> dict[str, str]:
+    p = _lead_paths()
+    skill = "installed" if p["skill_md"].exists() else "not installed"
+    cm = p["claude_md"]
+    try:
+        block_present = cm.exists() and LEAD_MD_BEGIN in cm.read_text()
+    except OSError:
+        block_present = False
+    block = "installed" if block_present else "not installed"
+    sp = p["settings"]
+    if not sp.exists():
+        hook = "not installed"
+    else:
+        try:
+            data = json.loads(sp.read_text())
+        except (json.JSONDecodeError, OSError):
+            data = None
+        if not isinstance(data, dict):
+            hook = "unknown (settings.json is not parseable JSON)"
+        else:
+            hook = "installed" if _lead_hook_indexes(data) else "not installed"
+    return {"skill": skill, "claude_md": block, "hook": hook}
+
+
+def cmd_lead(args: argparse.Namespace) -> int:
+    p = _lead_paths()
+
+    if args.action == "status":
+        st = _lead_status()
+        print("lead mode (Claude Code manager identity) — tier status:")
+        print(f"  skill      {st['skill']:<14}  {p['skill_md']}")
+        print(f"  CLAUDE.md  {st['claude_md']:<14}  marker block in {p['claude_md']}")
+        print(f"  hook       {st['hook']:<14}  UserPromptSubmit in {p['settings']}")
+        return 0
+
+    if args.action == "on":
+        changes: list[tuple[str, str]] = []
+        print("teamctl lead on — install the lead-agent identity for Claude Code.\n")
+        _lead_install_skill(changes)
+        _lead_install_claude_md(changes)
+        if _lead_status()["hook"] == "installed":
+            print(f"{p['settings']} already has a teamctl-lead hook — skipping.")
+            want_hook = False
+        elif args.hook:
+            want_hook = True
+        else:
+            print("\nOptional: a UserPromptSubmit hook echoes a one-line reminder")
+            print("into context on every prompt. It is the strongest tier because")
+            print("it survives context compaction (compaction can drop CLAUDE.md")
+            print("text from a long session; the hook re-injects the rule each turn).")
+            want_hook = _ask_yn("Install the per-prompt reminder hook? [y/N] ")
+        if want_hook:
+            _lead_install_hook(changes)
+
+        print("\nSummary of changes:")
+        for what, revert in changes:
+            print(f"  * {what}")
+            print(f"    revert: {revert}")
+        if not changes:
+            print("  nothing was changed (already installed)")
+        print("undo everything any time with: teamctl lead off")
+        return 0
+
+    # off: remove exactly what `on` installed, tolerating partial installs.
+    removed: list[str] = []
+    left: list[str] = []
+    _lead_remove_skill(removed, left)
+    _lead_remove_claude_md(removed, left)
+    _lead_remove_hook(removed, left)
+    print("teamctl lead off:")
+    for line in removed:
+        print(f"  removed: {line}")
+    for line in left:
+        print(f"  left alone: {line}")
+    if not removed:
+        print("  nothing to remove — lead mode was not installed.")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# `teamctl config` — show and adjust ~/.config/agent-team/config.toml
+# --------------------------------------------------------------------------
+
+_MISSING = object()
+
+CONFIG_HEADER = [
+    "# agent-team configuration (managed by `teamctl init` / `teamctl config`)",
+    "# Delete this file to fall back to each provider CLI's own defaults.",
+]
+
+
+def _toml_value(v) -> str:
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, (int, float)):
+        return str(v)
+    if isinstance(v, list):
+        return "[" + ", ".join(_toml_value(x) for x in v) + "]"
+    return f'"{_toml_escape(str(v))}"'
+
+
+def _toml_key(k: str) -> str:
+    if k and all(c.isalnum() or c in "-_" for c in k):
+        return k
+    return f'"{_toml_escape(k)}"'
+
+
+def _dump_toml(data: dict, prefix: str = "") -> list[str]:
+    """Render a nested dict as TOML lines (strings, numbers, bools, lists)."""
+    lines = []
+    for k, v in data.items():
+        if not isinstance(v, dict):
+            lines.append(f"{_toml_key(k)} = {_toml_value(v)}")
+    for k, v in data.items():
+        if isinstance(v, dict):
+            name = f"{prefix}.{_toml_key(k)}" if prefix else _toml_key(k)
+            # A [header] is only needed when the table holds direct values
+            # (or is empty and would otherwise vanish); a table that only
+            # groups sub-tables is implied by their [a.b] headers.
+            if any(not isinstance(x, dict) for x in v.values()) or not v:
+                lines.append("")
+                lines.append(f"[{name}]")
+            lines.extend(_dump_toml(v, name))
+    return lines
+
+
+def _flatten_config(data: dict, prefix: str = "") -> list[tuple[str, object]]:
+    out = []
+    for k, v in data.items():
+        dk = f"{prefix}.{k}" if prefix else k
+        if isinstance(v, dict):
+            out.extend(_flatten_config(v, dk))
+        else:
+            out.append((dk, v))
+    return out
+
+
+def _get_dotted(data: dict, dotted: str):
+    cur = data
+    for part in dotted.split("."):
+        if not isinstance(cur, dict) or part not in cur:
+            return _MISSING
+        cur = cur[part]
+    return cur
+
+
+def _set_dotted(data: dict, dotted: str, value) -> None:
+    parts = [p for p in dotted.split(".") if p]
+    if not parts:
+        raise TeamctlError("empty config key")
+    cur = data
+    for i, part in enumerate(parts[:-1]):
+        nxt = cur.get(part)
+        if nxt is None:
+            nxt = cur[part] = {}
+        if not isinstance(nxt, dict):
+            raise TeamctlError(
+                f"config key '{'.'.join(parts[:i + 1])}' holds a value, not a "
+                f"table; cannot set '{dotted}' beneath it")
+        cur = nxt
+    leaf = parts[-1]
+    if isinstance(cur.get(leaf), dict):
+        raise TeamctlError(
+            f"'{dotted}' is a table, not a value; set one of its keys instead "
+            f"(e.g. {dotted}.model)")
+    cur[leaf] = value
+
+
+def _parse_config_value(key: str, raw: str):
+    """CLI string -> config value. Comma-separated (or routing.preference)
+    becomes a list of strings; true/false a bool; everything else a string."""
+    raw = raw.strip()
+    if key == "routing.preference" or "," in raw:
+        return [s.strip() for s in raw.split(",") if s.strip()]
+    if raw.lower() in ("true", "false"):
+        return raw.lower() == "true"
+    return raw
+
+
+def _load_config_strict(path: Path) -> dict:
+    """Parse config.toml, refusing (not silently discarding) on bad TOML."""
+    if tomllib is None:
+        raise TeamctlError("config support needs Python 3.11+ (tomllib)")
+    try:
+        return tomllib.loads(path.read_text())
+    except OSError as exc:
+        raise TeamctlError(f"could not read {path}: {exc}")
+    except ValueError as exc:  # tomllib.TOMLDecodeError subclasses ValueError
+        raise TeamctlError(
+            f"could not parse {path}: {exc}. Fix the file or re-run "
+            "`teamctl init` to rewrite it.")
+
+
+def _write_config_file(data: dict) -> Path | None:
+    """Rewrite config.toml from `data`, backing up any existing file first.
+    Returns the backup path, or None if there was nothing to back up."""
+    path = config_path()
+    bak = None
+    if path.exists():
+        bak = path.with_name("config.toml.bak-teamctl")
+        shutil.copy2(path, bak)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    body = "\n".join(CONFIG_HEADER + _dump_toml(data)).rstrip("\n") + "\n"
+    path.write_text(body)
+    return bak
+
+
+def _config_menu() -> int:
+    path = config_path()
+    if not path.exists():
+        print(f"no config at {path} — run `teamctl init` to create one.")
+        return 1
+    data = _load_config_strict(path)
+    dirty = False
+    while True:
+        flat = _flatten_config(data)
+        print(f"\ncurrent settings ({path}):")
+        if not flat:
+            print("  (empty config)")
+        for i, (key, val) in enumerate(flat, 1):
+            print(f"  {i:>2}. {key} = {_toml_value(val)}")
+        raw = _ask("setting to change (number, blank to finish): ")
+        if not raw:
+            break
+        try:
+            n = int(raw)
+            if n < 1:
+                raise IndexError
+            key, cur = flat[n - 1]
+        except (ValueError, IndexError):
+            print(f"  no setting numbered '{raw}'")
+            continue
+        newv = _ask(f"new value for {key} [{_toml_value(cur)}]: ")
+        if not newv:
+            print("  unchanged")
+            continue
+        _set_dotted(data, key, _parse_config_value(key, newv))
+        dirty = True
+    if dirty:
+        bak = _write_config_file(data)
+        print(f"wrote {path}" + (f" (backup: {bak})" if bak else ""))
+    else:
+        print("nothing changed")
+    return 0
+
+
+def cmd_config(args: argparse.Namespace) -> int:
+    path = config_path()
+
+    if args.menu:
+        if args.key or args.value:
+            print("teamctl: --menu takes no key/value arguments.", file=sys.stderr)
+            return 2
+        return _config_menu()
+
+    if args.key is None:  # bare: pretty-print current settings
+        if not path.exists():
+            print(f"no config at {path} — run `teamctl init` to create one.")
+            return 1
+        flat = _flatten_config(_load_config_strict(path))
+        print(f"# {path}")
+        if not flat:
+            print("(empty config)")
+            return 0
+        for key, val in flat:
+            print(f"{key} = {_toml_value(val)}")
+        return 0
+
+    if args.value is None:  # read one key
+        if not path.exists():
+            print(f"no config at {path} — run `teamctl init` to create one.")
+            return 1
+        val = _get_dotted(_load_config_strict(path), args.key)
+        if val is _MISSING:
+            print(f"teamctl: '{args.key}' is not set.", file=sys.stderr)
+            return 1
+        if isinstance(val, dict):
+            for k, v in _flatten_config(val, args.key):
+                print(f"{k} = {_toml_value(v)}")
+        else:
+            print(_toml_value(val))
+        return 0
+
+    # set one key, preserving everything else
+    data = _load_config_strict(path) if path.exists() else {}
+    value = _parse_config_value(args.key, args.value)
+    _set_dotted(data, args.key, value)
+    bak = _write_config_file(data)
+    print(f"set {args.key} = {_toml_value(value)} in {path}"
+          + (f" (backup: {bak})" if bak else ""))
     return 0
 
 
@@ -1232,6 +1827,24 @@ def build_parser() -> argparse.ArgumentParser:
     ip.add_argument("--yes", action="store_true",
                     help="non-interactive: accept defaults, skip optional integrations")
     ip.set_defaults(func=cmd_init)
+
+    lp2 = sub.add_parser(
+        "lead", help="install/remove the lead-agent (manager) identity for Claude Code")
+    lp2.add_argument("action", choices=["on", "off", "status"],
+                     help="on: install skill + CLAUDE.md block (+ optional hook); "
+                          "off: remove exactly what on installed; status: report tiers")
+    lp2.add_argument("--hook", action="store_true",
+                     help="with 'on': install the per-prompt reminder hook without asking")
+    lp2.set_defaults(func=cmd_lead)
+
+    cp = sub.add_parser("config", help="show or change agent-team preferences")
+    cp.add_argument("key", nargs="?", default=None,
+                    help="dotted key, e.g. providers.claude.model")
+    cp.add_argument("value", nargs="?", default=None,
+                    help="new value (comma-separated becomes a list; true/false a bool)")
+    cp.add_argument("--menu", action="store_true",
+                    help="interactive numbered menu of current settings")
+    cp.set_defaults(func=cmd_config)
 
     sp = sub.add_parser("spawn", help="open a teammate in a new tmux pane")
     sp.add_argument("role", help="descriptive role name, e.g. code-reviewer")
