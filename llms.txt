@@ -1,40 +1,37 @@
 # teamctl
 
-> Provider-agnostic AI agent teams on plain tmux: a lead agent manages
-> teammates (Claude Code, Codex, Grok, Gemini — or any CLI via a custom
-> provider block) as panes. Headless dispatch with JSON results,
-> exact-session follow-ups, per-teammate git-worktree isolation with a
-> land step, quota-aware routing, teammate status detection, and a roster
-> that survives reboots. Single-file Python, stdlib only, tmux is the
-> only runtime dependency. Current release: v0.5.0.
+> Provider-agnostic CLI that turns a tmux window into an AI agent team — a
+> lead agent delegates to Claude Code / Codex / Grok / Gemini CLI teammates
+> (or any CLI taught via a [providers.custom.*] config block) as labeled
+> tmux panes — and routes each task to whichever of the user's
+> subscriptions has the most quota left right now (headroom routing).
+> Headless dispatch with JSON results, exact-session follow-ups, a git
+> worktree per teammate with a `land` step to merge work back, teammate
+> busy/needs-input/idle detection, verified teardown, and a roster that
+> survives reboots (`resurrect`). Single-file Python, stdlib only;
+> macOS/Linux (WSL runs as Linux); requires tmux and at least one
+> signed-in provider CLI. Current release: v0.5.0.
 
-Core rule you will meet everywhere: teamctl refuses instead of guessing —
-exact session or refusal, ask instead of silently picking a provider,
-keep-and-report instead of discarding work, "unknown" stated as unknown.
+Key facts: commands exit 0 (success), 1 (operational failure), 2
+(precondition error, e.g. not inside tmux), 3 (internal refusal with a
+reason). Teammate states: active / busy / needs-input / idle (interactive)
+and running / done / failed(N) / died (dispatch). Provider states: ready /
+quiet / locked out / not installed / unknown. `list`, `status`,
+`providers`, `usage`, `worktree list`, `land --dry-run`, and
+`resurrect --dry-run` accept `--json`. Core rule: teamctl refuses instead
+of guessing — exact session or refusal, keep-and-report instead of
+discarding work, unknown stated as unknown. It never reads or stores
+credentials — it drives the official vendor CLIs under the user's own
+logins.
 
 ## Docs
 
-- [README.md](README.md): the full human-facing tour — install, quickstart,
-  worktrees + landing, routing, lead mode, configuration, security notes,
-  honest limitations.
-- [docs/AGENT_GUIDE.md](docs/AGENT_GUIDE.md): the agent-facing operational
-  contract — command reference, every --json surface, the lead playbook,
-  worktree lifecycle, custom-provider schema with a worked example.
-- [docs/INSTALL_PROMPT.md](docs/INSTALL_PROMPT.md): the paste-into-your-agent
-  install prompt (a pointer, not a manual).
+- [Agent operating guide](docs/AGENT_GUIDE.md): canonical machine-oriented reference — exact command syntax, exit codes, state vocabulary, handoff protocol, worktree/land lifecycle, deterministic recovery recipes, custom-provider schema, the lead-agent operating rules verbatim
+- [Agent-driven install prompt](docs/INSTALL_PROMPT.md): the short paste-into-your-agent install flow (verify with `teamctl doctor`)
+- [README](README.md): human-oriented overview, use cases, security posture, honest limitations
+- [Use-case recipes](docs/use-cases.md): worked workflows with exact commands and expected on-screen output
 
-## Install
+## Optional
 
-- One-liner: `curl -fsSL https://raw.githubusercontent.com/ryderderder/teamctl/main/install.sh | bash`
-- Agent-driven: paste docs/INSTALL_PROMPT.md into any AI coding CLI.
-- Verify with `teamctl doctor` (exit 0 ok / 1 warn / 2 fail).
-
-## Source
-
-- [teamctl](teamctl): the entire tool — one Python file. Provider behavior
-  lives in the PROVIDER_SPECS registry near the top; users extend it via
-  [providers.custom.*] config blocks, no code changes.
-- [install.sh](install.sh): installer (records its source so
-  `teamctl update` works; detects WSL and greets it as supported Linux).
-- [tests/](tests/): 419 tests — run `python3 -m unittest discover -s tests`
-  inside a tmux session to include the live pane tier.
+- [Installer/setup design spec](docs/design/installer-spec.md): the express init and custom cockpit UX contract
+- [Recording harness](docs/recordings/README.md): how the README demos are reproducibly re-rendered

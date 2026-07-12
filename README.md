@@ -1,16 +1,272 @@
 # teamctl
 
-**teamctl** turns a tmux window into an AI agent team: a *lead* agent (or you)
-in the left pane manages *teammates* — Claude Code, Codex, Grok, or Gemini
-CLI sessions, or any CLI you teach it via a custom-provider block — as tmux
-panes tiled in a square grid to the right. It spawns interactive teammates,
-dispatches headless tasks and reads their results back as JSON, gives every
-teammate its own **git worktree** (parallel writers physically cannot
-collide) with a one-command **land** step to merge the work back, routes
-work to the subscription with the **most quota left**, detects which
-teammate is busy / blocked on an approval / idle, resurrects the roster
-after a reboot, and tears teammates down cleanly (process-tree-verified, no
-orphans, no stranded work). Single-file Python, stdlib only.
+> **Your AI subscriptions, working as one team.**
+
+You're paying for Claude Code. Maybe Codex. Maybe Grok, maybe Gemini. Each
+one sits in its own terminal, each with its own usage meter, and *you* are
+the integration layer. **teamctl** fixes that: it turns a tmux window into
+an AI agent team — a *lead* (you, or a lead agent) in the left pane, and
+*teammates* — Claude Code, Codex, Grok, or Gemini CLI sessions, or any CLI
+you teach it — tiled as labeled panes to the right — **and routes the
+team's work to whichever subscription has budget right now.** That
+combination is the point: plenty of tools scrape a quota or tile agents in
+tmux; as far as we can tell teamctl is the first **quota-aware router for
+subscription-CLI agent teams** — orchestration that reads your real usage
+meters and steers each dispatch to live capacity. It drives the **official
+vendor CLIs** under your own logins — nothing is impersonated, proxied, or
+reverse-engineered about your subscription access. Single-file Python,
+stdlib only.
+
+<!-- HERO GIF SLOT — the money shot. One real task fanned across three
+     providers: research → grok, implementation → claude, review → codex,
+     three panes visibly working at once, results read back as JSON, FULL
+     three-teammate teardown on camera. Produced per
+     docs/recordings/demo-storyboard.md; swap src to docs/assets/demo-v2.gif
+     when rendered. Until then the previous demo holds the slot. -->
+![One task fanned across providers: the lead checks usage, dispatches teammates as labeled tmux panes, watches them work in parallel, reads JSON results back, and shuts the team down cleanly](docs/assets/demo.gif)
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/ryderderder/teamctl/main/install.sh | bash
+```
+
+One line. The installer copies `teamctl` to `~/.local/bin`, offers to
+install anything missing (always asking first), then drops you into a tmux
+session where the zero-question express setup has already run — providers
+detected, sane defaults written, done in seconds.
+
+[![ci](https://github.com/ryderderder/teamctl/actions/workflows/ci.yml/badge.svg)](https://github.com/ryderderder/teamctl/actions/workflows/ci.yml)
+[![release](https://img.shields.io/github/v/release/ryderderder/teamctl)](https://github.com/ryderderder/teamctl/releases)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
+## Sixty seconds to a working teammate
+
+Copy-paste, top to bottom. Ends with a real agent visibly working in a
+pane beside you:
+
+```sh
+# 1. install — the one-liner above; it lands you inside tmux, configured (~20s)
+
+# 2. your first teammate: a real provider session opens in a labeled pane,
+#    seeded with your prompt (uses your configured/first-detected provider)
+teamctl spawn scout --prompt "Read this directory and tell me what it does."
+
+# 3. it's a real pane — watch it, steer it
+teamctl list
+teamctl send scout "Summarize your findings in 3 bullets."
+
+# 4. clean teardown: process tree killed, verified, pane closed
+teamctl shutdown scout
+```
+
+That's the whole mental model: roles in panes, commands from the lead.
+Everything else (headless dispatch, JSON results, routing, worktrees) is
+the same shape with more leverage — see the [use cases](#use-cases) below
+and the [recipes page](docs/use-cases.md).
+
+---
+
+## Why this exists
+
+- **You already pay for more than one AI.** teamctl makes the subscriptions
+  additive: one task force drawing on every CLI you're signed into, instead
+  of four separate chat windows and a lot of copy-paste.
+- **Capacity is real and it moves.** `teamctl usage` shows real usage
+  percentages and reset times where providers expose them; `teamctl route`
+  sends work to the usable provider with the **most quota left** — so a
+  rate-limited Monday afternoon doesn't stall your work.
+- **Delegation needs plumbing, not vibes.** `dispatch` hands a teammate a
+  task headlessly in a watchable pane; the result lands as JSON in a handoff
+  directory; `result --wait` blocks until it's done and fails fast if the
+  teammate dies. `followup` continues the *exact same provider session* —
+  never a guess at "most recent".
+- **Parallel writers need walls.** Every teammate gets its own git worktree
+  (its own branch, its own directory — collisions are physically
+  impossible), and `teamctl land` merges the work back when you've reviewed
+  it. Nothing is ever silently discarded.
+- **Teams need teardown — and mornings-after.** `shutdown` kills the whole
+  process tree, verifies it, and closes the pane; no orphaned agents
+  pinging away at 3am. And after a reboot, `teamctl resurrect` rebuilds
+  the roster instead of forgetting it.
+- **It's honest about what it can't know.** Usage numbers exist only where
+  providers expose them; teamctl labels stale data and says "unknown"
+  rather than inventing numbers. (See [Limitations](#limitations-honest-ones).)
+
+## What it looks like
+
+Every teammate is a real tmux pane with a sticky border label — `role ·
+model` — that the provider CLI can't overwrite. The lead pane keeps its
+width; teammates tile as a square-ish grid beside it. You can watch every
+teammate think, type into any of them, or ignore them until `result --wait`
+returns.
+
+## What's new in v0.5.0
+
+**More providers, safer parallelism, smarter routing** — and two behavior
+changes worth knowing before you upgrade:
+
+1. **Routing picks by headroom now.** Usable providers are ranked by
+   remaining quota; your preference order breaks ties. Nothing previously
+   excluded can ever be selected — only the order among survivors changes.
+   The old strict-order behavior is one line away:
+   `teamctl config routing.strategy preference`.
+2. **Worktree isolation is ON by default** in git repos (see
+   [Worktrees & landing](#worktrees--landing-parallel-writers-that-cannot-collide)).
+   Opt out per launch with `--no-worktree` or globally with
+   `teamctl config worktree.enabled false`. Disk note: a worktree is a
+   full checkout of *tracked* files; untracked artifacts (node_modules,
+   venvs, build dirs) are per-worktree by design.
+
+Also new: **Gemini CLI as a first-class provider** (with two honest
+caveats — no local usage feed, and upstream resume flake #24808, both
+detailed below), **bring-your-own-CLI** via `[providers.custom.*]`,
+`teamctl status` (busy / needs-input / idle + a `[notify]` hook),
+`teamctl land` / `worktree list|prune`, `teamctl resurrect`, a doctor
+`environment` row (WSL awareness), and `--json` on every new surface.
+
+---
+
+## Use cases
+
+### Accelerating research — parallel researchers across providers
+
+Fan a question out to independent researchers on *different* providers and
+triangulate. Model diversity is a feature: three models make three different
+mistakes, and disagreement is signal — anything all three agree on you can
+trust; anything they split on gets a follow-up. It's also cheap concurrency:
+three subscriptions, three meters, one wall-clock wait instead of three.
+
+```sh
+# Three independent takes on the same question, one per subscription.
+teamctl dispatch researcher-a --provider claude \
+    --task "Survey how mature CLIs shape --json output (gh, docker, jq). Recommend a schema for ours. Return JSON: {shape, rationale}."
+teamctl dispatch researcher-b --provider codex \
+    --task "Same question, independently: recommend a --json output schema for a log-filtering CLI. Return JSON: {shape, rationale}."
+teamctl dispatch researcher-c --provider grok \
+    --task "Same question, independently. Return JSON: {shape, rationale}."
+
+teamctl result researcher-a --wait   # each result is parseable JSON
+teamctl result researcher-b --wait
+teamctl result researcher-c --wait
+
+# Disagreement found? Continue the exact same session — no context lost.
+teamctl followup researcher-b --task "researcher-a proposed X instead. Steelman theirs, then pick one."
+```
+
+Each pane streams the researcher's work live; each `result` is machine-
+readable, so a lead agent can synthesize the three answers automatically.
+
+### Accelerating coding — builder/reviewer separation, competing implementations
+
+The oldest quality trick in software — the person who wrote it doesn't
+review it — works for agents too, and works *better* when the reviewer is a
+different model from a different vendor with different blind spots. And in
+a git repo the builder automatically works in **its own worktree**, so its
+writes can't touch your tree until you land them.
+
+```sh
+# One writes, a different provider reviews. One owner per file, always —
+# and the worktree makes that mechanical, not just polite.
+teamctl spawn builder --provider claude \
+    --prompt "Implement the --json flag per docs/plan.md. You own tinylog.py."
+# ...builder works on branch teamctl/builder in its own directory; then:
+teamctl dispatch reviewer --provider codex \
+    --task "Review the diff on branch teamctl/builder for correctness and edge cases. Return JSON: {verdicts: [{file, line, issue, severity}]}."
+teamctl result reviewer --wait
+
+# Review is clean? Merge the builder's branch back and clean up:
+teamctl land builder --dry-run     # diffstat + counts first
+teamctl land builder
+
+# Or: competing implementations, then judge.
+teamctl dispatch impl-a --provider claude --task "Implement quota tracking per SPEC.md. Print a unified diff." --cwd ~/work/copy-a
+teamctl dispatch impl-b --provider codex  --task "Implement quota tracking per SPEC.md. Print a unified diff." --cwd ~/work/copy-b
+teamctl result impl-a --wait; teamctl result impl-b --wait
+teamctl dispatch judge --provider grok \
+    --task "Two diffs for the same spec are in a.diff and b.diff. Score both for correctness and simplicity; pick a winner. Return JSON."
+```
+
+`spawn` gives you a live interactive session you can steer mid-flight
+(`teamctl send builder "Focus on the error handling in server.py."`);
+`dispatch` is fire-and-collect. Both get a labeled pane you can watch.
+
+### Accelerating agentic ops — long-running dispatch, usage-aware routing
+
+For standing pipelines — nightly audits, doc sweeps, migration batches — the
+question isn't "which model is smartest", it's "which subscription has
+headroom *right now*". teamctl answers from live data:
+
+```sh
+teamctl usage
+# PROVIDER  USAGE
+# claude    5h: 44% used, resets 3:00 PM
+# codex     5h: 0% used, resets 1:39 AM (now)
+# codex     weekly: 73% used, resets 12:41 AM (in 142h13m)
+# grok      weekly: 18% used (probe)
+# gemini    quiet — gemini exposes no local usage feed — it stays quiet
+
+# route sends the job to the usable provider with the most quota left
+# (your preference order breaks ties; anything not installed, not signed
+# in, or known-exhausted is excluded first). --dry-run shows every number
+# the choice used — unknowns as ?%, stale probe data flagged.
+teamctl route auditor --task "Audit this repo's TODOs; rank by effort. JSON." --dry-run
+# route: selected grok (headroom: grok 18% used < claude 44% < codex 73% ·
+#   preference tiebreak claude>codex>grok>gemini; skipped …)
+
+teamctl route auditor --task "Audit this repo's TODOs; rank by effort. JSON."
+teamctl result auditor --wait --timeout 1800     # long jobs: raise the cap
+
+# A dispatched pane closes itself when the task finishes; the teammate stays
+# tracked as `done`, `result` keeps working indefinitely, and `followup`
+# reopens the same provider session for the next batch.
+teamctl followup auditor --task "Now do the same for FIXMEs."
+```
+
+Exhaustion signals auto-expire at the provider's reset time, so routing
+self-heals as quotas refill. Match spend to difficulty per task with
+`--model`/`--effort` — light models for mechanical sweeps, heavyweight for
+hard reasoning.
+
+### A lead *agent* runs all of the above for you
+
+Everything shown is plain CLI, which means an AI agent can drive it.
+`teamctl lead on` installs a manager identity into every detected agent
+CLI's global instructions: check `usage`/`providers` before committing,
+delegate non-trivial work, one owner per file, zero idle teammates, shut
+down what's done. Then you just talk to your lead:
+
+> "Add rate limiting to the API server. Use the team."
+
+…and the lead checks capacity, casts the roles, dispatches, synthesizes,
+lands the work, and cleans up — the demo GIF above is exactly this loop.
+See [Lead mode](#lead-mode).
+
+---
+
+## How it compares
+
+|  | juggling CLIs by hand | Claude Code agent teams (native) | **teamctl** |
+|---|---|---|---|
+| Providers | all of them, in N windows | Claude only | Claude, Codex, Grok, Gemini — equal footing, plus bring-your-own via config |
+| Who integrates results | you, by copy-paste | the lead agent | the lead agent (any provider) |
+| Quota awareness | you, by vibes | — | real usage %/reset times; routing sends work to the most headroom, skips exhausted providers, signals auto-expire |
+| Parallel write safety | you, by discipline | in-session | a git worktree per teammate + `teamctl land` — collisions physically impossible, work always reconciled back |
+| Teammate visibility | N terminals | in-session | labeled tmux panes (`role · model`), watchable + steerable, busy/blocked/idle detection |
+| Machine-readable handoff | no | in-session | `dispatch` → `result --wait` JSON contract, exact-session `followup` |
+| Teardown & recovery | you remember | in-session | `shutdown`: process-tree-verified, no orphans; `resurrect`: the roster survives reboots |
+
+Three lines on the neighbors, since you'll ask: **claude-squad** manages
+multiple agent sessions in tmux — teamctl's center of gravity is
+different: a lead *delegating* through a task/result protocol with
+quota-aware routing across subscriptions. **Tmux-Orchestrator** automates
+Claude-driven tmux workflows — teamctl is provider-neutral plumbing with
+real usage tracking and verified teardown. **Claude Code's native agent
+teams** directly inspired teamctl (see [Credits](#credits)) and remain
+the deepest Claude-native experience; teamctl reimagines the shape on
+plain tmux so any provider's CLI can play — and because teammates are
+ordinary tmux panes, they survive the lead's exit. After a crash or
+reboot, `teamctl resurrect` rebuilds the roster from what teamctl
+recorded — native teams, as of this writing, can't resume teammates
+after one.
 
 ## Install
 
@@ -39,70 +295,22 @@ Or run the one-liner yourself:
 curl -fsSL https://raw.githubusercontent.com/ryderderder/teamctl/main/install.sh | bash
 ```
 
-That one line is the whole setup: the installer copies the tools to
-`~/.local/bin`, offers to install anything missing (tmux — a hard
-requirement — defaults to yes; nothing is ever installed without asking),
-then drops you into a tmux session where the zero-question **express
-setup** has already run — providers detected, sane defaults written, a
-compact summary of what was chosen, done in seconds. Want to pick models,
-routing order, and integrations yourself? `bash -s -- --custom-init` runs
-the rich arrow-key wizard instead, and `teamctl init --custom` opens it
-any time later. Other opt-outs: `--no-init` (skip the setup/tmux
-bootstrap), `--no-deps` (skip dependency offers). Safe to re-run. From a
-checkout:
-`git clone https://github.com/ryderderder/teamctl && cd teamctl && ./install.sh`.
-
-<!-- install.gif lands with the v0.3.0 install-flow re-record (see docs/recordings/README.md):
-![Install: the one-liner installs teamctl, detects dependencies and provider CLIs, then drops you into a tmux session with the express setup already done](docs/assets/install.gif)
+<!-- INSTALL GIF SLOT — cold machine → one-liner → dependency detection →
+     the twelve-line dark room → landed in tmux. Produced per
+     docs/recordings/install-storyboard.md; uncomment when rendered:
+![Install: the one-liner installs teamctl, detects dependencies and provider CLIs, then lands you inside a tmux session with the express setup already done](docs/assets/install.gif)
 -->
 
-Here is the lead-and-teammates workflow — check real usage, see `route` pick a
-provider, spawn and dispatch teammates as labeled tmux panes, read a result
-back, and tear everything down cleanly (recorded with the token-free `shell`
-provider and neutral model labels; the mechanics are identical for real
-providers):
+The installer detects missing dependencies and **offers** to install them
+(tmux — a hard requirement — defaults to yes; nothing is ever installed
+without asking), prints official install one-liners for any provider CLI
+you don't have (never auto-installs them), then drops you into tmux where
+`teamctl init` — the zero-question express setup — has already run.
 
-![Demo: a lead tmux pane runs teamctl usage and route --dry-run, spawns code-reviewer and researcher panes and dispatches an analyst task, each pane labeled with its role and model, then reads the analyst's JSON result back with result --wait and shuts all three down, ending with an empty teammate list](docs/assets/demo.gif)
-
-[![ci](https://github.com/ryderderder/teamctl/actions/workflows/ci.yml/badge.svg)](https://github.com/ryderderder/teamctl/actions/workflows/ci.yml)
-
-## What's new in v0.5.0
-
-**More providers, safer parallelism, smarter routing** — and four
-behavior changes worth knowing before you upgrade:
-
-1. **Routing picks by headroom now.** `route` (and provider defaults)
-   rank the *usable* providers by remaining quota instead of strict list
-   order — your preference order only breaks ties. Nothing previously
-   excluded can ever be selected; only the order among survivors changes.
-   Want the old behavior? One line: `teamctl config routing.strategy
-   preference`.
-2. **Worktree isolation is ON by default.** `spawn`/`dispatch`/`route`
-   inside a git repo now give the teammate its own branch
-   (`teamctl/<role>`) in its own worktree under the state dir. Opt out
-   per-launch with `--no-worktree` or globally with `teamctl config
-   worktree.enabled false`. Outside a git repo nothing changes (one
-   honest note, plain cwd). Disk note: a worktree is a full checkout of
-   *tracked* files; untracked artifacts (node_modules, venvs, build
-   dirs) are per-worktree by design. See
-   [Worktrees & landing](#worktrees--landing-parallel-writers-that-cannot-collide).
-3. **Gemini CLI is a first-class provider** — spawn, headless dispatch,
-   exact-session follow-ups (`--resume <captured-uuid>`), auth
-   detection, lead-mode block in `~/.gemini/GEMINI.md`. Two honest
-   caveats: Gemini exposes **no local usage feed**, so it shows as
-   `quiet` forever (routing treats it as 0% used); and upstream issue
-   #24808 means a resume can intermittently fail — the failure lands
-   verbatim in `error.log` and is re-triable.
-4. **Bring your own CLI**: a `[providers.custom.*]` config block teaches
-   teamctl any provider that speaks `<cmd> [flags] "<prompt>"` — no code
-   changes. See [Custom providers](#custom-providers-bring-your-own-cli).
-
-Also new: `teamctl status` (busy / needs-input / idle per teammate, with
-a `[notify]` hook on transitions — env vars `TEAMCTL_ROLE` /
-`TEAMCTL_MATE_STATE` / `TEAMCTL_PREV_STATE`), `teamctl land` /
-`teamctl worktree list|prune`, `teamctl resurrect` (the roster survives
-reboots), a doctor `environment` row (including WSL awareness), and
-`--json` on every new surface.
+Options: `--custom-init` (the rich arrow-key wizard instead of express),
+`--no-init` (skip the setup/tmux bootstrap), `--no-deps` (skip dependency
+offers). Safe to re-run. From a checkout:
+`git clone https://github.com/ryderderder/teamctl && cd teamctl && ./install.sh`.
 
 ## Updating
 
@@ -213,7 +421,8 @@ provider/model/effort come from your config (`[lead] chat_provider` /
 the only signed-in provider); set them in `teamctl settings`. If nothing's
 signed in, or the chosen provider is locked out, it says so and names the
 fix — never a stack trace. Piped or in CI (no terminal), bare `teamctl`
-prints usage as before.
+prints usage as before. And if a reboot took your roster with it, the
+front door says so and offers `teamctl resurrect`.
 
 ## Quickstart
 
@@ -236,7 +445,7 @@ teamctl dispatch researcher --provider grok \
 # Read the result back (blocks until done; fails fast if the teammate dies).
 teamctl result researcher --wait
 
-# Another turn in the same provider session.
+# Another turn in the exact same provider session.
 teamctl followup researcher --task "Now rank them by effort."
 
 # No --provider? Your configured routing order decides (or the only
@@ -392,6 +601,18 @@ unquoted. A worked real-world example (Google Antigravity's `agy`,
 including its macOS-over-SSH auth caveat) lives in
 [docs/AGENT_GUIDE.md](docs/AGENT_GUIDE.md#custom-providers-providerscustom).
 
+## For AI agents
+
+If you're an agent (or wiring one up): **[docs/AGENT_GUIDE.md](docs/AGENT_GUIDE.md)**
+is the canonical machine-oriented reference — exact syntax for every
+subcommand, the exit-code contract, the full state vocabulary,
+deterministic recovery recipes, and the lead-agent operating rules
+verbatim. [`/llms.txt`](llms.txt) points there. `list`, `status`,
+`providers`, `usage`, `worktree list`, `land --dry-run`, and
+`resurrect --dry-run` all speak `--json`. To have an agent install
+teamctl for a user, hand it
+[docs/INSTALL_PROMPT.md](docs/INSTALL_PROMPT.md).
+
 ## The lead-agent workflow
 
 The intended shape: **you (or a lead AI agent) sit in the left pane; teammates
@@ -438,14 +659,15 @@ anything large:
 2. Run `teamctl providers` — which subscriptions are installed, authed, and
    not currently exhausted (exhaustion signals auto-expire at reset time).
 3. Decide the provider from that live data plus task fit — or use
-   `teamctl route` to auto-pick and dispatch in one step. Capacity changes
-   hour to hour; don't hard-code a choice.
+   `teamctl route` to auto-pick (most headroom wins) and dispatch in one
+   step. Capacity changes hour to hour; don't hard-code a choice.
 4. For a live interactive teammate you can also send `/usage` into its pane
    (`teamctl send <role> "/usage"`, then tmux capture-pane) to read that
    provider's own account numbers.
-5. Match model and effort to the task — light/cheap for mechanical work,
-   heavyweight for hard reasoning — via --model/--effort, honoring the
-   user's configured defaults. Shut every teammate down
+5. Match model and effort to the task — light/cheap models for mechanical
+   work, heavyweight for hard reasoning — via --model/--effort, honoring the
+   user's configured defaults. Land what a writing teammate produced
+   (`teamctl land <role>`), and shut every teammate down
    (`teamctl shutdown <role>`) the moment its job is done.
 ```
 
@@ -524,10 +746,10 @@ Three ways in, same config file every way (canonical design:
 - **`teamctl init` — express (the default).** Zero questions: detects your
   provider CLIs (the [provider state lattice](#provider-states):
   `ready` / `quiet` / `locked out` / `not installed`), locks sane defaults
-  (each CLI's own model, effort `high`, routing in alphabetical order,
-  delegation `ask`, voice `normal`), writes the config, and prints one
-  compact frame. Done in seconds; `--yes` keeps its scripted contract
-  (same writes, no chrome).
+  (each CLI's own model, effort `high` where the CLI supports one, routing
+  in alphabetical order, delegation `ask`, voice `normal`), writes the
+  config, and prints one compact frame. Done in seconds; `--yes` keeps its
+  scripted contract (same writes, no chrome).
 - **`teamctl init --custom` — the cockpit.** A three-screen arrow-key
   terminal UI (stdlib curses, 256-color, designed for a 100×30 tmux
   pane): **models** (per-provider picks from live discovery, plus a
@@ -561,9 +783,9 @@ effort = "high"             # default --effort
 model = ""                  # blank/absent: the CLI's own default
 effort = "high"             # passed as -c model_reasoning_effort=...
 
-[providers.grok]
-effort = "high"             # grok has no persistent effort setting of its
-                            # own; teamctl passes this per invocation
+[providers.gemini]
+model = "gemini-2.5-pro"    # gemini has no effort flag — teamctl never
+                            # writes an effort key for it
 
 [routing]
 preference = ["codex", "claude"]  # YOUR order — express uses the detected
@@ -613,12 +835,13 @@ in `~/.local/state/agent-team/state.json` (override with `$TEAMCTL_STATE`).
 
 **`teamctl settings`** is the human face: a re-runnable dark-room cockpit
 (the same aesthetic as `init --custom`) over the whole config, grouped
-into sections — default chat, routing order, posture, layout, updates, and
-per-provider model/effort. ↑/↓ move, Space or ←/→ cycle a choice
-(delegation, update mode, effort, booleans…), Enter free-edits anything,
-`s` saves (atomic, with a backup), `q` quits with a dirty-state confirm.
-Without a TTY it degrades to printing the current values plus the matching
-`teamctl config` one-liner for each — the scriptable path spelled out.
+into sections — default chat, routing order and strategy, worktrees,
+posture, layout, updates, and per-provider model/effort. ↑/↓ move, Space
+or ←/→ cycle a choice (delegation, update mode, effort, booleans…), Enter
+free-edits anything, `s` saves (atomic, with a backup), `q` quits with a
+dirty-state confirm. Without a TTY it degrades to printing the current
+values plus the matching `teamctl config` one-liner for each — the
+scriptable path spelled out.
 
 For scripting or one-off tweaks, `teamctl config` is the direct path (and
 never needs the TOML edited by hand):
@@ -662,10 +885,11 @@ are cached with a timestamp; plain `teamctl usage` reports them alongside
 the log/statusline-derived data, labels their age, and flags anything
 older than `[usage] probe_stale_minutes` (default 30) as stale. Claude is
 not probed: its statusline cache is the documented, cheaper source.
-Probing is always explicit — teamctl never opens a provider session on its
-own. OBSERVED (not vendor-documented): the usage commands are local UI
-commands and no token spend was observed, but opening a TUI does start a
-provider session.
+Gemini has no probe either: current builds expose no parseable usage in
+their TUI — quiet, honestly. Probing is always explicit — teamctl never
+opens a provider session on its own. OBSERVED (not vendor-documented):
+the usage commands are local UI commands and no token spend was observed,
+but opening a TUI does start a provider session.
 
 Sets rewrite the file safely: the previous version is backed up to
 `config.toml.bak-teamctl`, all other keys are preserved, and a config that
@@ -707,21 +931,101 @@ can't reverse lead mode afterward).
 An agent *team* only works hands-off, which in practice means running the
 provider CLIs in their autonomous modes (Claude Code
 `bypassPermissions`/`--dangerously-skip-permissions`, Codex's `--yolo`/
-full-access sandbox settings, Grok's auto-approve). **teamctl itself never
-sets those flags** — each teammate launches with whatever permission posture
-you have configured for that CLI — but if your defaults are autonomous,
-every teammate is too. All three vendors document autonomous modes as
-intended for isolated environments and warn about prompt injection and
-credential exposure on bare hosts. Run agent teams inside a container/VM
-where possible, and at minimum only against repositories and inputs you
-trust:
+full-access sandbox settings, Grok's auto-approve, Gemini's `--yolo`/
+`--approval-mode`). **teamctl itself never sets those flags** — each
+teammate launches with whatever permission posture you have configured for
+that CLI — but if your defaults are autonomous, every teammate is too. All
+vendors document autonomous modes as intended for isolated environments
+and warn about prompt injection and credential exposure on bare hosts. Run
+agent teams inside a container/VM where possible, and at minimum only
+against repositories and inputs you trust:
 
 - Claude Code: <https://code.claude.com/docs/en/security>
 - Codex CLI: <https://developers.openai.com/codex/security>
 - Grok CLI: <https://docs.x.ai/build/overview>
+- Gemini CLI: <https://geminicli.com/docs>
 
 Also remember `teamctl send` types raw keys into a live agent's terminal —
 anything (or anyone) able to run teamctl can steer every teammate.
+
+**The threat model, named:** every teammate runs a vendor CLI
+autonomously with `teamctl` on its PATH and shared team state — so a
+prompt-injected teammate is not just a bad worker, it's an *actor* that
+could run teamctl against its siblings (spawn, send keys, shut down).
+That's inherent to any hands-off team and acceptable for trusted
+repositories inside a container/VM; it is not acceptable against
+untrusted inputs on a bare host. Isolate accordingly. (Worktree isolation
+narrows the blast radius of a rogue *writer* — its writes stay on its own
+branch until you review and land them — but it is a collision guard, not
+a security boundary.)
+
+**Where teamctl is deliberately boring:** it never reads, stores, or
+transmits credentials — it only checks that each CLI's own auth artifacts
+*exist*. Sign-in happens in the vendor's CLI; your subscription access is
+exactly the official client, nothing wrapped or proxied.
+
+## FAQ
+
+**Will this burn through my subscriptions?**
+Nothing spends without you: `spawn`/`dispatch`/`route` are explicit
+commands, and a lead agent's eagerness is a setting you own
+(`lead.delegation` = `ask` by default — it asks once per session before
+using teams, and a no is final). `teamctl usage` shows real meters before
+you commit; headroom routing spends where the budget actually is; and
+`--model`/`--effort` let you put cheap models on mechanical work. Usage
+probes (`usage --probe`) are always explicit — teamctl never opens a
+provider session on its own.
+
+**What if I want out?**
+`teamctl uninstall` — removes the binary and every integration it added
+(backups first), and prints the one-liner to remove config/state too. If
+you enabled lead mode, `teamctl lead off` first; it removes exactly what
+`on` installed, byte-for-byte preserving your surrounding files.
+
+**Is it safe to let agents run agents?**
+Read [Security](#security) — the honest answer is "as safe as your
+isolation". teamctl adds no autonomous flags itself; each teammate
+launches with whatever permission posture you configured for that CLI.
+Trusted repos, container/VM, and the delegation-consent posture are the
+controls.
+
+**How reliable are the usage numbers?**
+Real where providers expose them, labeled honest where they don't: Codex
+writes rate-limit windows to its session logs (real %/reset times);
+Claude's numbers come from the statusline cache (documented
+`rate_limits` fields, subscribers, present after one Claude Code turn
+with the teamctl statusline); Grok exposes nothing locally (the explicit
+`usage --probe` fills it in); Gemini exposes nothing at all and `usage`
+*says so* rather than inventing numbers. Some parsed formats are
+observed rather than documented (Grok's JSON shape, Codex's log/cache
+locations, probe TUI text) — teamctl parses them defensively and
+degrades to "unknown" instead of crashing, but re-verify after provider
+CLI upgrades. Exhaustion signals are best-effort and auto-expire at
+known reset times.
+
+**Do follow-ups really continue the same session?**
+Yes — `followup` resumes the captured provider session id (claude
+`--resume <id>`, codex `exec resume <id>`, grok `-r <id>`, gemini
+`--resume <uuid>`, all verified against each CLI) and refuses rather
+than guessing "most recent" when no id was captured. One caveat worth
+knowing: gemini's resume has a known upstream flake (issue #24808) — a
+failed resume lands verbatim in `error.log` and is re-triable, never
+silent.
+
+**What happens to a teammate's work if I shut it down mid-task?**
+In a worktree (the default in git repos): nothing is lost, ever.
+Shutdown removes a worktree only when it provably holds no dirty files
+and no un-landed commits; anything else is kept and reported with the
+exact `teamctl land` command to reconcile it — which works even after
+the teammate is gone, and after a reboot.
+
+**Why tmux?**
+Because panes are the UI: every teammate is watchable, steerable, and
+survivable — a teammate pane doesn't die with the lead process, and
+`teamctl resurrect` rebuilds the roster after a reboot. Border labels
+use tmux user options (`@role`/`@model`), not `#()` shell commands, so
+no shell ever runs in your status bar and provider CLIs can't overwrite
+the labels.
 
 ## Limitations (honest ones)
 
@@ -762,7 +1066,7 @@ anything (or anyone) able to run teamctl can steer every teammate.
   output. teamctl parses them all defensively and degrades to "usage
   unknown" / "probe failed" / raw text instead of crashing — but re-verify
   after provider CLI upgrades. (Claude's statusline fields, `codex exec
-  resume`, and `grok models` are documented.)
+  resume`, `gemini --resume`, and `grok models` are documented.)
 - **Follow-ups are exact-session on all providers.** `followup` resumes
   the specific captured session id (claude `--resume <id>`, grok `-r <id>`,
   codex `exec resume <id>`, gemini `--resume <uuid>` — all verified
@@ -803,6 +1107,14 @@ anything (or anyone) able to run teamctl can steer every teammate.
   `GOOGLE_API_KEY`); custom providers use whatever `auth_files` /
   `auth_env` you configure — and with neither, teamctl says "auth not
   probed" instead of guessing.
+
+## Releases
+
+Every release is tagged, with notes, on the
+[Releases page](https://github.com/ryderderder/teamctl/releases) — CI
+(live tmux pane tests on macOS + Linux) must be green before anything
+ships. `teamctl update` brings an install current from its recorded
+source; `teamctl --version` tells you where you are.
 
 ## Credits
 
