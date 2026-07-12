@@ -312,17 +312,58 @@ def live_pane_ids() -> set[str]:
 
 
 def reconcile(state: dict) -> dict:
-    """Drop teammates whose pane is gone so `list` reflects reality."""
+    """Keep tracked teammates honest against the live tmux panes.
+
+    Interactive (spawn-mode) teammates ARE their pane: pane gone means the
+    teammate is gone, so it is dropped.
+
+    Dispatch-mode teammates are different: their pane runs a wrapper that
+    legitimately exits (closing the pane) when the task finishes, while the
+    completed result/session live on in the handoff dir. A dispatch teammate
+    whose pane is gone is therefore FINISHED (or died mid-task), not
+    vanished — it stays tracked, with its stale pane id cleared, until an
+    explicit `teamctl shutdown <role>` removes it. `result` and `followup`
+    keep working from the handoff artifacts indefinitely."""
     live = live_pane_ids()
-    survivors = {
-        role: info
-        for role, info in state["teammates"].items()
-        if info.get("pane_id") in live
-    }
-    if len(survivors) != len(state["teammates"]):
+    survivors: dict[str, dict] = {}
+    changed = False
+    for role, info in state["teammates"].items():
+        pane = info.get("pane_id")
+        if pane and pane in live:
+            survivors[role] = info
+            continue
+        if info.get("mode") == "dispatch":
+            if pane:
+                info = dict(info)
+                info["pane_id"] = ""
+                changed = True
+            survivors[role] = info
+            continue
+        changed = True  # interactive teammate without a pane is gone
+    if changed:
         state["teammates"] = survivors
         save_state(state)
     return state
+
+
+def _mate_state(role: str, info: dict, live: set[str]) -> str:
+    """Human-readable lifecycle state for `list`.
+
+    interactive: active (a dead one is dropped by reconcile).
+    dispatch:    running / done / failed(rc) / died — derived from the pane
+                 and the handoff status file, never stored, so it is always
+                 current."""
+    if info.get("mode") != "dispatch":
+        return "active"
+    hd = Path(info.get("handoff") or handoff_dir(role))
+    status, rc = _read_status(hd)
+    if status == "running":
+        if info.get("pane_id") in live or _teammate_alive(info, hd):
+            return "running"
+        return "died"
+    if rc == 0:
+        return "done"
+    return f"failed({rc if rc is not None else '?'})"
 
 
 def interactive_flags(provider: str, model: str, effort: str) -> list[str]:
@@ -526,18 +567,23 @@ def cmd_list(args: argparse.Namespace) -> int:
     with state_lock():
         state = reconcile(load_state())
     mates = state["teammates"]
+    live = live_pane_ids()
     if args.json:
-        print(json.dumps(mates, indent=2, sort_keys=True))
+        annotated = {role: {**info, "state": _mate_state(role, info, live)}
+                     for role, info in mates.items()}
+        print(json.dumps(annotated, indent=2, sort_keys=True))
         return 0
     if not mates:
         print("no active teammates")
         return 0
     width = max(len(r) for r in mates)
-    print(f"{'ROLE'.ljust(width)}  PROVIDER  PANE     CREATED")
+    print(f"{'ROLE'.ljust(width)}  PROVIDER  PANE     STATE        CREATED")
     for role in sorted(mates):
         i = mates[role]
+        st = _mate_state(role, i, live)
         print(
-            f"{role.ljust(width)}  {i['provider']:<8}  {i['pane_id']:<7}  {i.get('created_at', '')}"
+            f"{role.ljust(width)}  {i['provider']:<8}  "
+            f"{i.get('pane_id') or '-':<7}  {st:<11}  {i.get('created_at', '')}"
         )
     return 0
 
@@ -641,8 +687,8 @@ def cmd_shutdown(args: argparse.Namespace) -> int:
         if not info:
             print(f"teamctl: no active teammate '{args.role}'.", file=sys.stderr)
             return 1
-        pane_id = info["pane_id"]
-        if not _close_pane(pane_id):
+        pane_id = info.get("pane_id") or ""
+        if pane_id and not _close_pane(pane_id):
             print(
                 f"teamctl: failed to close pane {pane_id}; leaving '{args.role}' tracked.",
                 file=sys.stderr,
@@ -651,8 +697,18 @@ def cmd_shutdown(args: argparse.Namespace) -> int:
         del state["teammates"][args.role]
         save_state(state)
 
+    # a dispatch teammate's handoff dir is part of its lifetime: shutdown is
+    # the explicit removal point, so clear the artifacts with the state.
+    if info.get("mode") == "dispatch":
+        hd = Path(info.get("handoff") or handoff_dir(args.role))
+        if hd.is_dir() and hd != state_path().parent:
+            shutil.rmtree(hd, ignore_errors=True)
+
     _enforce_lead_width()
-    print(f"shut down teammate '{args.role}' (pane {pane_id})")
+    if pane_id:
+        print(f"shut down teammate '{args.role}' (pane {pane_id})")
+    else:
+        print(f"cleared finished teammate '{args.role}' (state and handoff)")
     return 0
 
 
@@ -687,24 +743,39 @@ def cmd_send(args: argparse.Namespace) -> int:
 
 def _dispatch_pane(role: str, hd: Path, argv: list[str], cwd: str,
                    provider: str, model: str) -> str:
-    """Run a headless provider in a watchable pane. stdout -> result.json (the
-    parseable source of truth); stderr -> pane AND error.log (watchable); a
-    status file is written on exit. The wrapper's PID is recorded for teardown."""
+    """Run a headless provider in a watchable pane.
+
+    stdout -> result.json (the parseable source of truth). stderr goes
+    STRAIGHT to error.log (durable: no intermediary process that can lose
+    buffered output when the pane closes) and a background `tail -f` mirrors
+    it into the pane so the run stays watchable. The old
+    `2> >(tee error.log >&2)` process substitution was verified to LOSE any
+    stderr written after the pane closed (tmux HUPs the tee), and on a
+    provider killed at exec it left an empty error.log with no explanation.
+
+    The status file records the exit code AND, for rc > 128, the signal name
+    (e.g. `DONE 137 SIGKILL`) so a killed provider is distinguishable from a
+    failed one. The wrapper's PID is recorded for teardown."""
     hcmd = " ".join(shlex.quote(a) for a in argv)
-    pid_f = hd / "pid"
-    res_f = hd / "result.json"
-    err_f = hd / "error.log"
-    sta_f = hd / "status"
+    q = shlex.quote
+    pid_f = q(str(hd / "pid"))
+    res_f = q(str(hd / "result.json"))
+    err_f = q(str(hd / "error.log"))
+    sta_f = q(str(hd / "status"))
     banner = f"[teamctl] {provider} {model or ''} :: {role} — working…"
     script = (
-        f"echo $$ > {shlex.quote(str(pid_f))}; "
-        f"cd {shlex.quote(cwd)} || exit 97; "
-        f"echo {shlex.quote(banner)}; "
-        f"{hcmd} > {shlex.quote(str(res_f))} "
-        f"2> >(tee {shlex.quote(str(err_f))} >&2); "
-        f"rc=${{PIPESTATUS[0]}}; "
-        f"printf 'DONE %s\\n' \"$rc\" > {shlex.quote(str(sta_f))}; "
-        f"echo \"[teamctl] {role} finished rc=$rc\"; sleep 2"
+        f"echo $$ > {pid_f}; "
+        f"cd {q(cwd)} || exit 97; "
+        f"echo {q(banner)}; "
+        f": > {err_f}; "
+        f"tail -f {err_f} >&2 & tailpid=$!; "
+        f"{hcmd} > {res_f} 2> {err_f}; "
+        "rc=$?; cause=''; "
+        "if [ \"$rc\" -gt 128 ]; then "
+        "cause=$(kill -l $((rc-128)) 2>/dev/null); fi; "
+        f"printf 'DONE %s%s\\n' \"$rc\" \"${{cause:+ SIG$cause}}\" > {sta_f}; "
+        f"echo \"[teamctl] {role} finished rc=$rc${{cause:+ (SIG$cause)}}\"; "
+        "sleep 2; kill $tailpid 2>/dev/null"
     )
     outer = "bash -c " + shlex.quote(script)
     existing = [i.get("pane_id", "") for i in load_state()["teammates"].values()]
@@ -737,14 +808,26 @@ def _do_dispatch(role: str, provider: str, task: str, context_file: str,
 
     with state_lock():
         state = reconcile(load_state())
-        if role in state["teammates"]:
-            print(f"teamctl: teammate '{role}' already exists.", file=sys.stderr)
+        existing_info = state["teammates"].get(role)
+        if existing_info:
+            if (existing_info.get("mode") == "dispatch"
+                    and not existing_info.get("pane_id")):
+                print(f"teamctl: finished teammate '{role}' still holds this "
+                      f"role — read it with `teamctl result {role}`, continue "
+                      f"it with `teamctl followup {role}`, or clear it with "
+                      f"`teamctl shutdown {role}`.", file=sys.stderr)
+            else:
+                print(f"teamctl: teammate '{role}' already exists.",
+                      file=sys.stderr)
             return 1
 
         hd = handoff_dir(role)
         hd.mkdir(parents=True, exist_ok=True)
         (hd / "task.md").write_text(task)
-        for stale in ("status", "result.json", "error.log", "pid"):
+        # "session" too: a fresh dispatch is a NEW conversation — a stale
+        # session id from a previous holder of this role must never leak
+        # into this teammate's follow-ups.
+        for stale in ("status", "result.json", "error.log", "pid", "session"):
             (hd / stale).unlink(missing_ok=True)
 
         pane_id = _dispatch_pane(role, hd, argv, cwd, provider, model)
@@ -781,12 +864,23 @@ def _read_status(hd: Path) -> tuple[str, int | None]:
         return "running", None
     raw = sta.read_text().strip()
     parts = raw.split()
-    if len(parts) == 2 and parts[0] == "DONE":
+    # "DONE <rc>" or "DONE <rc> <signal-cause>" (e.g. "DONE 137 SIGKILL")
+    if len(parts) >= 2 and parts[0] == "DONE":
         try:
             return "done", int(parts[1])
         except ValueError:
             pass
     return "done", None
+
+
+def _status_cause(hd: Path) -> str | None:
+    """The signal cause the wrapper recorded (e.g. 'SIGKILL'), if any."""
+    sta = hd / "status"
+    try:
+        parts = sta.read_text().split()
+    except OSError:
+        return None
+    return parts[2] if len(parts) >= 3 else None
 
 
 def _wrapper_pid(hd: Path) -> int | None:
@@ -928,6 +1022,10 @@ def cmd_result(args: argparse.Namespace) -> int:
     _capture_session_id(info, hd)
 
     if status == "running":
+        if not _teammate_alive(info, hd):
+            print(f"{args.role}: failed (teammate died before writing "
+                  "status)", file=sys.stderr)
+            return 1
         print(f"{args.role}: running")
         return 0
 
@@ -951,9 +1049,27 @@ def cmd_result(args: argparse.Namespace) -> int:
             print(f"[teamctl] note: provider signal = {signal}", file=sys.stderr)
         return 0
 
-    print(f"{args.role}: failed (rc={rc}, signal={signal})", file=sys.stderr)
+    cause = _status_cause(hd)
+    print(f"{args.role}: failed (rc={rc}{', ' + cause if cause else ''}, "
+          f"signal={signal})", file=sys.stderr)
     if err_txt.strip():
         print(err_txt.rstrip()[-2000:], file=sys.stderr)
+    elif not result_txt.strip():
+        # nothing on stdout OR stderr: the provider died before producing a
+        # single byte — explain what that shape usually means instead of
+        # leaving the user staring at two empty files.
+        prov = info.get("provider", "the provider")
+        print(
+            f"[teamctl] no output captured: result.json and error.log are "
+            f"both empty — {prov} died before writing anything.", file=sys.stderr)
+        if rc is not None and rc > 128:
+            print(
+                f"[teamctl] rc={rc} means it was killed by a signal"
+                f"{' (' + cause + ')' if cause else ''}. Common causes: an "
+                "out-of-memory kill, or macOS killing a broken/unsigned "
+                f"binary at exec. Check the CLI itself: run `{prov} "
+                f"--version` in a shell, and on macOS "
+                f"`codesign -v \"$(which {prov})\"`.", file=sys.stderr)
     return 1
 
 
@@ -974,6 +1090,14 @@ def cmd_followup(args: argparse.Namespace) -> int:
     effort = info.get("effort") or ""
     hd = Path(info.get("handoff") or handoff_dir(args.role))
     hd.mkdir(parents=True, exist_ok=True)
+
+    # refuse to stack a follow-up on a run that is still in flight: the two
+    # wrappers would race on the same handoff files.
+    status, _ = _read_status(hd)
+    if status == "running" and _teammate_alive(info, hd):
+        print(f"teamctl: '{args.role}' is still running — wait for "
+              f"`teamctl result {args.role} --wait` first.", file=sys.stderr)
+        return 1
 
     # exact-session only: capture the id from the previous turn's artifacts
     # BEFORE they are cleared. Without one, refuse — never resume "the most

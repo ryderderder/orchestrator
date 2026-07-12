@@ -57,6 +57,175 @@ class StateTests(unittest.TestCase):
         self.assertEqual(state["teammates"], {})
 
 
+class ReconcileLifecycleTests(unittest.TestCase):
+    """A dispatch teammate's pane legitimately self-closes when its task
+    finishes; reconcile must KEEP it (result/followup work from the handoff)
+    until an explicit shutdown. Interactive teammates keep the old rule:
+    pane gone = teammate gone."""
+
+    def setUp(self):
+        import tempfile
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmpdir.name)
+        os.environ["TEAMCTL_STATE"] = str(self.dir / "state.json")
+        self._live = tc.live_pane_ids
+        self._pid_alive = tc._pid_alive
+        tc.live_pane_ids = lambda: {"%live"}
+        tc._pid_alive = lambda p: False
+
+    def tearDown(self):
+        tc.live_pane_ids = self._live
+        tc._pid_alive = self._pid_alive
+        os.environ.pop("TEAMCTL_STATE", None)
+        self.tmpdir.cleanup()
+
+    def _mate(self, role, mode, pane, with_status=None):
+        hd = self.dir / role
+        hd.mkdir(exist_ok=True)
+        if with_status is not None:
+            (hd / "status").write_text(with_status)
+        return {"provider": "shell", "pane_id": pane, "mode": mode,
+                "handoff": str(hd), "created_at": "2026-01-01T00:00:00"}
+
+    def test_finished_dispatch_mate_is_kept_with_pane_cleared(self):
+        tc.save_state({"teammates": {
+            "fin": self._mate("fin", "dispatch", "%gone", "DONE 0\n"),
+            "run": self._mate("run", "dispatch", "%live"),
+            "ia": self._mate("ia", "interactive", "%gone"),
+        }})
+        state = tc.reconcile(tc.load_state())
+        self.assertIn("fin", state["teammates"])          # finished: kept
+        self.assertEqual(state["teammates"]["fin"]["pane_id"], "")
+        self.assertIn("run", state["teammates"])          # live pane: as-is
+        self.assertEqual(state["teammates"]["run"]["pane_id"], "%live")
+        self.assertNotIn("ia", state["teammates"])        # interactive: gone
+        # ... and the change was persisted
+        self.assertEqual(tc.load_state()["teammates"]["fin"]["pane_id"], "")
+
+    def test_reconcile_is_idempotent_for_finished_mates(self):
+        tc.save_state({"teammates": {
+            "fin": self._mate("fin", "dispatch", "", "DONE 0\n")}})
+        saves = []
+        original = tc.save_state
+        tc.save_state = lambda s: saves.append(1) or original(s)
+        try:
+            tc.reconcile(tc.load_state())
+        finally:
+            tc.save_state = original
+        self.assertEqual(saves, [])                       # nothing to rewrite
+
+    def test_mate_state_derivations(self):
+        live = {"%live"}
+        cases = [
+            (self._mate("m1", "dispatch", "%live"), "running"),
+            (self._mate("m2", "dispatch", "", "DONE 0\n"), "done"),
+            (self._mate("m3", "dispatch", "", "DONE 3\n"), "failed(3)"),
+            (self._mate("m4", "dispatch", "", "DONE 137 SIGKILL\n"),
+             "failed(137)"),
+            (self._mate("m5", "dispatch", ""), "died"),   # no status, dead
+            (self._mate("m6", "interactive", "%live"), "active"),
+        ]
+        for i, (info, want) in enumerate(cases):
+            self.assertEqual(tc._mate_state(f"m{i + 1}", info, live), want)
+
+    def test_result_reports_death_without_wait(self):
+        # a died mate must not read as "running" forever
+        import contextlib
+        import io
+        hd = self.dir / "dead"
+        hd.mkdir()
+        tc.save_state({"teammates": {
+            "dead": self._mate("dead", "dispatch", "")}})
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(err):
+            rc = tc.main(["result", "dead"])
+        self.assertEqual(rc, 1)
+        self.assertIn("died before writing status", err.getvalue())
+
+
+class StatusCauseTests(unittest.TestCase):
+    """The wrapper records `DONE <rc> [SIG<name>]`; parsing must accept both
+    the old and the new shapes."""
+
+    def setUp(self):
+        import tempfile
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.hd = Path(self.tmpdir.name)
+
+    def tearDown(self):
+        self.tmpdir.cleanup()
+
+    def test_status_with_signal_cause(self):
+        (self.hd / "status").write_text("DONE 137 SIGKILL\n")
+        self.assertEqual(tc._read_status(self.hd), ("done", 137))
+        self.assertEqual(tc._status_cause(self.hd), "SIGKILL")
+
+    def test_status_without_cause(self):
+        (self.hd / "status").write_text("DONE 0\n")
+        self.assertEqual(tc._read_status(self.hd), ("done", 0))
+        self.assertIsNone(tc._status_cause(self.hd))
+
+    def test_missing_status_is_running(self):
+        self.assertEqual(tc._read_status(self.hd), ("running", None))
+        self.assertIsNone(tc._status_cause(self.hd))
+
+
+class ResultDiagnosticsTests(unittest.TestCase):
+    """A signal-killed provider that produced NO output gets an explanation,
+    not two silently empty files (the second-Mac `DONE 137` shape)."""
+
+    def setUp(self):
+        import tempfile
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmpdir.name)
+        os.environ["TEAMCTL_STATE"] = str(self.dir / "state.json")
+        self._live = tc.live_pane_ids
+        self._pid_alive = tc._pid_alive
+        tc.live_pane_ids = lambda: set()
+        tc._pid_alive = lambda p: False
+
+    def tearDown(self):
+        tc.live_pane_ids = self._live
+        tc._pid_alive = self._pid_alive
+        os.environ.pop("TEAMCTL_STATE", None)
+        self.tmpdir.cleanup()
+
+    def _seed(self, status_text, result_text="", err_text=""):
+        hd = self.dir / "codey"
+        hd.mkdir(exist_ok=True)
+        (hd / "status").write_text(status_text)
+        (hd / "result.json").write_text(result_text)
+        (hd / "error.log").write_text(err_text)
+        tc.save_state({"teammates": {"codey": {
+            "provider": "codex", "pane_id": "", "mode": "dispatch",
+            "handoff": str(hd), "created_at": "2026-01-01T00:00:00"}}})
+
+    def _result(self):
+        import contextlib
+        import io
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = tc.main(["result", "codey"])
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_sigkill_with_empty_output_gets_diagnostic_hint(self):
+        self._seed("DONE 137 SIGKILL\n")
+        rc, _, err = self._result()
+        self.assertEqual(rc, 1)
+        self.assertIn("rc=137, SIGKILL", err)
+        self.assertIn("no output captured", err)
+        self.assertIn("killed by a signal", err)
+        self.assertIn("codex --version", err)
+
+    def test_failure_with_stderr_prints_stderr_not_hint(self):
+        self._seed("DONE 1\n", err_text="Error: model not found\n")
+        rc, _, err = self._result()
+        self.assertEqual(rc, 1)
+        self.assertIn("model not found", err)
+        self.assertNotIn("no output captured", err)
+
+
 class ProviderTests(unittest.TestCase):
     def test_all_expected_providers_registered(self):
         for p in ("claude", "codex", "grok", "shell"):
@@ -940,7 +1109,8 @@ class LiveTmuxTests(unittest.TestCase):
 
     def tearDown(self):
         # best-effort cleanup of any pane we left behind
-        for role in ("t_alpha", "t_beta", "rt_mate", "orphan_mate", "kill_mate"):
+        for role in ("t_alpha", "t_beta", "rt_mate", "orphan_mate", "kill_mate",
+                     "d_mate", "sig_mate", "late_mate"):
             tc.main(["shutdown", role])
         tc.tmux("kill-window", "-t", self.window_id, check=False)
         if self._tmux_pane is None:
@@ -1091,6 +1261,114 @@ class LiveTmuxTests(unittest.TestCase):
         self.assertFalse(tc._pid_alive(wrapper_pid), "wrapper survived shutdown")
         for k in kids:
             self.assertFalse(tc._pid_alive(k), f"orphaned child {k} survived shutdown")
+
+    def _wait_pane_gone(self, pane: str, timeout: float = 25.0) -> bool:
+        import time as _t
+        deadline = _t.monotonic() + timeout
+        while _t.monotonic() < deadline:
+            if pane not in tc.live_pane_ids():
+                return True
+            _t.sleep(0.25)
+        return False
+
+    def test_dispatch_lifecycle_survives_pane_selfclose(self):
+        # THE v0.2.0 regression: the wrapper exits when the task finishes,
+        # the pane self-closes, and reconcile used to drop the teammate —
+        # result/followup then failed even though the answer sat on disk.
+        import contextlib
+        import io
+        import json as _json
+
+        task = 'printf %s \'{"phase": 1}\''
+        self.assertEqual(
+            tc.main(["dispatch", "d_mate", "--provider", "shell",
+                     "--task", task]), 0)
+        pane = tc.load_state()["teammates"]["d_mate"]["pane_id"]
+
+        # WAIT for the wrapper to finish and its pane to SELF-close
+        # (the wrapper lingers ~2s after writing status).
+        self.assertTrue(self._wait_pane_gone(pane),
+                        "dispatch pane never self-closed")
+
+        # the teammate must still be tracked, as finished
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(tc.main(["list"]), 0)
+        listing = out.getvalue()
+        self.assertIn("d_mate", listing)
+        self.assertIn("done", listing)
+
+        # `result` works — and keeps working (indefinitely, not just once)
+        for _ in range(2):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(tc.main(["result", "d_mate"]), 0)
+            self.assertIn('"phase": 1', out.getvalue())
+
+        # `followup` opens a fresh pane and completes a second turn
+        self.assertEqual(
+            tc.main(["followup", "d_mate", "--task",
+                     'printf %s \'{"phase": 2}\'']), 0)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(
+                tc.main(["result", "d_mate", "--wait", "--timeout", "30"]), 0)
+        self.assertEqual(
+            _json.loads((tc.handoff_dir("d_mate") / "result.json").read_text()),
+            {"phase": 2})
+
+        # explicit shutdown clears the state AND the handoff artifacts
+        hd = tc.handoff_dir("d_mate")
+        self.assertTrue(hd.exists())
+        self.assertEqual(tc.main(["shutdown", "d_mate"]), 0)
+        self.assertNotIn("d_mate", tc.load_state()["teammates"])
+        self.assertFalse(hd.exists(), "handoff dir survived shutdown")
+
+    def test_dispatch_sigkill_records_cause_and_hints(self):
+        import contextlib
+        import io
+
+        self.assertEqual(
+            tc.main(["dispatch", "sig_mate", "--provider", "shell",
+                     "--task", "kill -9 $$"]), 0)
+        pane = tc.load_state()["teammates"]["sig_mate"]["pane_id"]
+        self.assertTrue(self._wait_pane_gone(pane))
+
+        hd = tc.handoff_dir("sig_mate")
+        self.assertEqual((hd / "status").read_text().strip(),
+                         "DONE 137 SIGKILL")
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(err):
+            rc = tc.main(["result", "sig_mate"])
+        self.assertEqual(rc, 1)
+        self.assertIn("SIGKILL", err.getvalue())
+        self.assertIn("no output captured", err.getvalue())
+
+    def test_dispatch_stderr_durable_after_pane_close(self):
+        # the old `2> >(tee …)` procsub LOST stderr written after the pane
+        # closed (tmux HUPs the tee); plain `2>file` must keep it.
+        import time as _t
+
+        task = ("echo EARLY-MARKER >&2; "
+                "( trap '' HUP; sleep 4; echo LATE-MARKER >&2 ) & "
+                "printf %s '{}'")
+        self.assertEqual(
+            tc.main(["dispatch", "late_mate", "--provider", "shell",
+                     "--task", task]), 0)
+        pane = tc.load_state()["teammates"]["late_mate"]["pane_id"]
+        self.assertTrue(self._wait_pane_gone(pane))
+
+        err_f = tc.handoff_dir("late_mate") / "error.log"
+        self.assertIn("EARLY-MARKER", err_f.read_text())
+        # the HUP-immune child writes ~4s in — after the pane is long gone
+        deadline = _t.monotonic() + 15
+        while _t.monotonic() < deadline:
+            if "LATE-MARKER" in err_f.read_text():
+                break
+            _t.sleep(0.5)
+        self.assertIn("LATE-MARKER", err_f.read_text(),
+                      "stderr written after pane close was lost")
 
     def test_result_wait_fails_when_pane_killed_before_status(self):
         # Kill the dispatch pane mid-run: --wait must fail fast, not hang.
