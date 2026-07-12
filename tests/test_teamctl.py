@@ -2199,6 +2199,21 @@ class LiveTmuxTests(unittest.TestCase):
         self.assertEqual(status, "done")
         self.assertEqual(code, 0)
 
+    def _wait_pid_gone(self, pid: int, timeout: float = 5.0) -> bool:
+        # A just-SIGKILLed process can linger as an unreaped zombie for a
+        # few ms — `os.kill(pid, 0)` (and so `_pid_alive`) still succeeds
+        # until it is reaped. shutdown DID terminate the tree; asserting
+        # death instantly races that reap. Poll instead: a genuine orphan
+        # (the regression this guards) never dies within the window, so
+        # this still fails loudly on a real leak.
+        import time as _t
+        deadline = _t.monotonic() + timeout
+        while _t.monotonic() < deadline:
+            if not tc._pid_alive(pid):
+                return True
+            _t.sleep(0.1)
+        return not tc._pid_alive(pid)
+
     def test_teardown_kills_wrapped_process_no_orphan(self):
         # regression: a dispatched teammate whose provider is a long-lived
         # child process must be fully killed on shutdown, not orphaned.
@@ -2220,10 +2235,13 @@ class LiveTmuxTests(unittest.TestCase):
         self.assertTrue(kids, "expected a live child process under the wrapper")
 
         self.assertEqual(tc.main(["shutdown", "orphan_mate"]), 0)
-        # neither the wrapper nor any descendant may survive
-        self.assertFalse(tc._pid_alive(wrapper_pid), "wrapper survived shutdown")
+        # neither the wrapper nor any descendant may survive (poll for the
+        # kill to settle — see _wait_pid_gone; a real orphan never dies)
+        self.assertTrue(self._wait_pid_gone(wrapper_pid),
+                        "wrapper survived shutdown")
         for k in kids:
-            self.assertFalse(tc._pid_alive(k), f"orphaned child {k} survived shutdown")
+            self.assertTrue(self._wait_pid_gone(k),
+                            f"orphaned child {k} survived shutdown")
 
     def _wait_pane_gone(self, pane: str, timeout: float = 25.0) -> bool:
         import time as _t
