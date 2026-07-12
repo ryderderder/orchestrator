@@ -131,9 +131,11 @@ teamctl shutdown reviewer
 
 The intended shape: **you (or a lead AI agent) sit in the left pane; teammates
 tile as a square grid to the right.** The first teammate takes the right half;
-each further teammate splits the largest teammate pane in whichever direction
-keeps panes square-ish, so four teammates form a 2×2 grid beside the lead. The
-lead pane is never re-split.
+each further teammate splits the largest non-lead pane (teamctl-spawned or
+not) in whichever direction keeps panes square-ish, so four teammates form a
+2×2 grid beside the lead. The lead pane is never re-split, never loses focus
+to a spawn, and keeps its configured share of the window width
+(`[layout] lead_width`, default 50%) across spawns and shutdowns.
 
 Each teammate pane carries sticky `@role` / `@model` tmux user options, so
 with the optional tmux block from `teamctl init` every pane border shows
@@ -234,7 +236,17 @@ effort = "high"             # grok has no persistent effort setting of its
 
 [routing]
 preference = ["claude", "codex", "grok"]   # order `route` prefers
+
+[layout]
+lead_width = 50             # lead pane's share of the window width, in %
+                            # (clamped 20-80; try 33 for a wider team area)
 ```
+
+The lead pane's width is re-pinned to `lead_width` after every spawn and
+shutdown, so re-tiling never eats your main pane. New teammates fold into
+the right-hand grid by splitting the largest non-lead pane in the window —
+including panes teamctl didn't create — instead of carving slivers off the
+lead.
 
 Command-line `--model` / `--effort` always override the config. State lives
 in `~/.local/state/agent-team/state.json` (override with `$TEAMCTL_STATE`).
@@ -267,7 +279,10 @@ re-run `teamctl init` any time to redo the whole wizard.
   `role · model` labels;
 - installing `claude-statusline` (shows `model · effort · ctx N%` in Claude
   Code) and adding the `statusLine` key to `~/.claude/settings.json` — skipped
-  if a `statusLine` key already exists;
+  if a `statusLine` key already exists. The statusline also caches the
+  rate-limit numbers Claude Code pipes to it (documented statusLine JSON:
+  `rate_limits.five_hour/seven_day` — subscribers only), which is what powers
+  `teamctl usage`'s Claude column;
 - installing [lead mode](#lead-mode) for Claude Code (same as
   `teamctl lead on`).
 
@@ -285,14 +300,49 @@ the script prints the one-liner to remove them too.
 If you installed [lead mode](#lead-mode), run `teamctl lead off` **before**
 uninstalling (the uninstaller removes the `teamctl` binary itself).
 
+## Security
+
+An agent *team* only works hands-off, which in practice means running the
+provider CLIs in their autonomous modes (Claude Code
+`bypassPermissions`/`--dangerously-skip-permissions`, Codex's `--yolo`/
+full-access sandbox settings, Grok's auto-approve). **teamctl itself never
+sets those flags** — each teammate launches with whatever permission posture
+you have configured for that CLI — but if your defaults are autonomous,
+every teammate is too. All three vendors document autonomous modes as
+intended for isolated environments and warn about prompt injection and
+credential exposure on bare hosts. Run agent teams inside a container/VM
+where possible, and at minimum only against repositories and inputs you
+trust:
+
+- Claude Code: <https://code.claude.com/docs/en/security>
+- Codex CLI: <https://developers.openai.com/codex/security>
+- Grok CLI: <https://docs.x.ai/build/overview>
+
+Also remember `teamctl send` types raw keys into a live agent's terminal —
+anything (or anyone) able to run teamctl can steer every teammate.
+
 ## Limitations (honest ones)
 
 - **Usage numbers exist only where providers expose them locally.** Codex
   writes rate-limit windows to its session logs, so `teamctl usage` shows real
-  percentages and reset times for it. Claude and Grok don't expose account
-  quota locally — Claude Code shows live context in its own status line
-  (in-TUI `/usage` has more), and `teamctl usage` says "not exposed" rather
-  than inventing numbers.
+  percentages and reset times for it. Claude's 5h/weekly numbers come from
+  the statusline cache (Claude Code pipes documented `rate_limits` fields to
+  the status line for subscribers; ours saves them) — so they exist only
+  after a Claude Code turn has run with the teamctl statusline installed,
+  and `teamctl usage` labels the cache's age. Grok exposes nothing locally,
+  and `teamctl usage` says so rather than inventing numbers.
+- **Some parsed provider formats are observed, not documented.** Grok's JSON
+  output shape (`{text, stopReason, sessionId, …}`) and the location/format
+  of Codex's session-log rate-limit events are reverse-engineered from real
+  output. teamctl parses both defensively and degrades to "usage unknown" /
+  raw text instead of failing — but re-verify after provider CLI upgrades.
+  (Claude's statusline fields and `codex exec resume` are documented.)
+- **`followup` for Codex resumes the most recent session** (`codex exec
+  resume --last`): with several concurrent codex teammates the wrong session
+  could be resumed. Codex documents id-addressed resume (`codex exec resume
+  <SESSION_ID>`), but capturing the id per dispatch would require its
+  `--json` event stream, which changes the captured result shape — so
+  teamctl doesn't do it yet. Keep concurrent codex followups serialized.
 - **Exhaustion signals are best-effort.** `route` skips a provider only after
   its output was seen to contain a limit/auth error, or Codex's own log shows
   100% on the 5h window; signals with a known reset time auto-expire.
