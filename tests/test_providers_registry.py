@@ -440,7 +440,7 @@ session_id_regex = "session:\\\\s*(\\\\S+)"
         self.assertEqual(tc.provider_state("aider")[0], "quiet")
         rc, out, _ = self.run_cli("providers")
         self.assertIn("auth not probed", out)
-        selected, _, exclusions = tc.route_select(["aider"])
+        selected, _, exclusions, _ranking = tc.route_select(["aider"])
         self.assertEqual(selected, "aider")
         self.assertEqual(exclusions, {})
 

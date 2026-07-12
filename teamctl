@@ -1872,6 +1872,32 @@ def _usage_summary(provider: str) -> str:
     return (" · ".join(parts) + " used" + src) if parts else ""
 
 
+def _used_percent(provider: str) -> float | None:
+    """Binding-constraint usage for headroom ranking: the MAX used_percent
+    across the provider's known windows (5h vs weekly — the tighter one
+    governs), native source first, probe cache second — the same
+    precedence _usage_summary uses. None when nothing is known (a 'quiet'
+    provider, or gemini always — it has no usage source)."""
+    wins = _known_windows(provider)
+    if not wins:
+        wins = _probe_windows(provider)
+    pcts = [w.get("used_percent") for w in wins.values()
+            if isinstance(w, dict)
+            and isinstance(w.get("used_percent"), (int, float))]
+    return float(max(pcts)) if pcts else None
+
+
+def _probe_is_stale(provider: str) -> bool:
+    """True when the provider's cached probe result is older than
+    [usage] probe_stale_minutes."""
+    entry = load_probe_cache().get(provider)
+    if not isinstance(entry, dict):
+        return False
+    cap = entry.get("captured_at")
+    return (isinstance(cap, (int, float))
+            and time.time() - cap > probe_stale_minutes() * 60)
+
+
 def provider_state(provider: str) -> tuple[str, str]:
     """(lattice state, note) for one provider — see the map above. An
     'unprobed' custom provider renders as quiet/ready with its "auth not
@@ -2388,14 +2414,33 @@ def _cached_signals() -> dict:
         return {}
 
 
+def routing_strategy() -> str:
+    """[routing] strategy: 'headroom' (default — among usable providers,
+    the one with the most remaining quota wins, preference order breaking
+    ties) or 'preference' (strict order, the v0.4.0 behavior)."""
+    raw = (load_config().get("routing") or {}).get("strategy", "headroom")
+    return raw if raw in ("headroom", "preference") else "headroom"
+
+
+# headroom ranking treats a provider with NO usage data as 0% used
+# (Decision D2: 'quiet' usually means genuinely idle; ranking unknowns
+# last would permanently bury providers with no usage source at all,
+# e.g. gemini). Preference order tie-breaks among unknowns.
+UNKNOWN_USED = 0.0
+
+
 def route_select(requested: list[str] | None = None
-                 ) -> tuple[str | None, list[str], dict[str, str]]:
+                 ) -> tuple[str | None, list[str], dict[str, str],
+                            list[tuple[str, float | None, bool]]]:
     """Pick the best available provider.
 
-    Returns (selected, preference, exclusions) where exclusions maps each
-    rejected candidate to a reason: unknown / not installed / locked out /
-    auth unknown / exhausted / auth-error. selected is None when no
-    candidate survives.
+    Returns (selected, preference, exclusions, ranking). exclusions maps
+    each rejected candidate to a reason: unknown / not installed / locked
+    out / auth unknown / exhausted / auth-error; the exclusion phase is
+    identical under every strategy — ranking only ever reorders the
+    SURVIVORS. ranking is the ranked survivors as (provider, used_percent
+    | None, stale_probe) so the caller can show every number the choice
+    used. selected is None when no candidate survives.
     """
     routable = routable_providers()
     candidates = requested if requested else list(routable)
@@ -2426,12 +2471,26 @@ def route_select(requested: list[str] | None = None
     preference = (load_config().get("routing") or {}).get("preference")
     if not isinstance(preference, list) or not preference:
         preference = list(routable)
-    ranked = sorted(
-        survivors,
-        key=lambda p: (preference.index(p) if p in preference else len(preference),
-                       survivors.index(p)),
-    )
-    return (ranked[0] if ranked else None), preference, exclusions
+
+    def _pref_key(p: str) -> tuple:
+        return (preference.index(p) if p in preference else len(preference),
+                survivors.index(p))
+
+    if routing_strategy() == "headroom":
+        usage = {p: _used_percent(p) for p in survivors}
+        ranked = sorted(
+            survivors,
+            key=lambda p: (usage[p] if usage[p] is not None
+                           else UNKNOWN_USED, *_pref_key(p)))
+    else:                       # strict preference — the v0.4.0 ranking
+        usage = {p: _used_percent(p) for p in survivors}
+        ranked = sorted(survivors, key=_pref_key)
+
+    ranking = [(p, usage[p],
+                usage[p] is not None and not _known_windows(p)
+                and _probe_is_stale(p))
+               for p in ranked]
+    return (ranked[0] if ranked else None), preference, exclusions, ranking
 
 
 def cmd_route(args: argparse.Namespace) -> int:
@@ -2439,7 +2498,7 @@ def cmd_route(args: argparse.Namespace) -> int:
         return 2
     requested = [p.strip() for p in args.providers.split(",") if p.strip()] \
         if args.providers else None
-    selected, preference, exclusions = route_select(requested)
+    selected, preference, exclusions, ranking = route_select(requested)
 
     if selected is None:
         print("teamctl: route found no available provider:", file=sys.stderr)
@@ -2448,10 +2507,21 @@ def cmd_route(args: argparse.Namespace) -> int:
         return 1
 
     configured = (load_config().get("routing") or {}).get("preference")
-    if isinstance(configured, list) and configured:
+    if routing_strategy() == "headroom":
+        # every number the choice used, unknowns as ?%, stale flagged —
+        # the pick must always be auditable
+        rank_txt = " < ".join(
+            f"{p} {f'{u:.0f}%' if u is not None else '?%'}"
+            f"{' (stale probe)' if stale else ''}"
+            for p, u, stale in ranking)
+        reason = (f"headroom: {rank_txt} used · preference tiebreak "
+                  f"{'>'.join(preference)}")
+        if any(stale for _p, _u, stale in ranking):
+            reason += " · refresh stale numbers: teamctl usage --probe"
+    elif isinstance(configured, list) and configured:
         reason = f"first available in your preference {'>'.join(preference)}"
     else:
-        reason = (f"first available in alphabetical order "
+        reason = (f"first available in registry order "
                   f"{'>'.join(preference)} — an arbitrary order, not a "
                   "recommendation; set yours with `teamctl config "
                   "routing.preference ...`")
@@ -2620,6 +2690,9 @@ def _render_config(providers_cfg: dict[str, dict[str, str]], verbosity: str,
             "# your auto-routing order (also the --provider default);",
             "# reorder any time: teamctl config routing.preference \"a,b,c\"",
             f"preference = {_toml_value(list(preference))}",
+            "# strategy: headroom (most remaining quota wins; preference",
+            "# breaks ties) | preference (strict order)",
+            'strategy = "headroom"',
         ]
     for prov, vals in providers_cfg.items():
         lines += ["", f"[providers.{prov}]"]
@@ -4868,6 +4941,7 @@ def _check_config() -> tuple[str, str]:
         (("lead", "delegation"), ("ask", "always", "manual")),
         (("output", "verbosity"), ("normal", "terse", "detailed")),
         (("update", "mode"), ("prompt", "auto", "off")),
+        (("routing", "strategy"), ("headroom", "preference")),
     ]
     for (sec, key), allowed in checks:
         v = (data.get(sec) or {}).get(key)
@@ -5118,6 +5192,7 @@ _MENU_ENUMS: dict[str, tuple[str, ...]] = {
     "lead.delegation": ("ask", "always", "manual"),
     "output.verbosity": ("normal", "terse", "detailed"),
     "update.mode": ("prompt", "auto", "off"),
+    "routing.strategy": ("headroom", "preference"),
 }
 
 
@@ -5354,6 +5429,7 @@ _SETTINGS_DEFAULTS = {
     "lead.chat_provider": "",
     "lead.chat_model": "",
     "lead.chat_effort": "",
+    "routing.strategy": "headroom",
 }
 
 # (key, section, label) for the fixed settings, in display order. Per-
@@ -5365,6 +5441,7 @@ _SETTINGS_ROWS = (
     ("lead.chat_model", "default chat", "model"),
     ("lead.chat_effort", "default chat", "effort"),
     ("routing.preference", "routing", "provider order"),
+    ("routing.strategy", "routing", "strategy (headroom/preference)"),
     ("lead.delegation", "posture", "delegation"),
     ("output.verbosity", "posture", "voice"),
     ("layout.lead_width", "layout", "lead pane width %"),

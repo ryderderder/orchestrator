@@ -885,6 +885,10 @@ class RouteTests(unittest.TestCase):
         self.tmpdir = tempfile.TemporaryDirectory()
         self.dir = Path(self.tmpdir.name)
         os.environ["TEAMCTL_STATE"] = str(self.dir / "state.json")
+        # sandbox HOME too: headroom ranking reads native usage sources
+        # (~/.codex/sessions), which must not leak in from the machine
+        self._home = os.environ.get("HOME")
+        os.environ["HOME"] = str(self.dir)
 
         self._which = tc.shutil.which
         self._auth_state = tc.provider_auth_state
@@ -903,6 +907,8 @@ class RouteTests(unittest.TestCase):
         tc.shutil.which = self._which
         tc.provider_auth_state = self._auth_state
         tc.load_config = self._config
+        if self._home is not None:
+            os.environ["HOME"] = self._home
         os.environ.pop("TEAMCTL_STATE", None)
         self.tmpdir.cleanup()
 
@@ -979,6 +985,159 @@ class RouteTests(unittest.TestCase):
         finally:
             if saved is not None:
                 os.environ["TMUX"] = saved
+
+
+class HeadroomRouteTests(unittest.TestCase):
+    """v0.5.0 route-to-headroom: among the survivors, the provider with
+    the most remaining quota wins; preference order only breaks ties.
+    Exclusion stays a separate phase — an exhausted provider can never be
+    selected however low its recorded usage."""
+
+    def setUp(self):
+        import tempfile
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmpdir.name)
+        os.environ["TEAMCTL_STATE"] = str(self.dir / "state.json")
+        self._home = os.environ.get("HOME")
+        os.environ["HOME"] = str(self.dir)
+        self._which = tc.shutil.which
+        self._auth_state = tc.provider_auth_state
+        self._config = tc.load_config
+        self.installed = {"claude", "codex", "grok"}
+        self.auth = {p: "signed-in" for p in ("claude", "codex", "grok")}
+        tc.shutil.which = lambda name, *a, **k: (
+            f"/fake/bin/{name}" if name in self.installed else None)
+        tc.provider_auth_state = (
+            lambda p: (self.auth.get(p, "signed-out"), ""))
+        tc.load_config = lambda: {}
+
+    def tearDown(self):
+        tc.shutil.which = self._which
+        tc.provider_auth_state = self._auth_state
+        tc.load_config = self._config
+        if self._home is not None:
+            os.environ["HOME"] = self._home
+        os.environ.pop("TEAMCTL_STATE", None)
+        self.tmpdir.cleanup()
+
+    # ---- usage seeding: one real shape per source tier ----
+    def _seed_codex(self, pct: float):
+        import time as _t
+        day = self.dir / ".codex" / "sessions" / "2026" / "07" / "11"
+        day.mkdir(parents=True, exist_ok=True)
+        (day / "rollout-x.jsonl").write_text(json.dumps(
+            {"payload": {"rate_limits": {"primary": {
+                "used_percent": pct,
+                "resets_at": _t.time() + 3600}}}}) + "\n")
+
+    def _seed_claude(self, pct: float):
+        import time as _t
+        (self.dir / "claude-usage.json").write_text(json.dumps(
+            {"captured_at": _t.time(),
+             "rate_limits": {"five_hour": {"used_percentage": pct,
+                                           "resets_at": _t.time() + 3600}}}))
+
+    def _seed_grok_probe(self, pct: float, age_seconds: float = 0.0):
+        import time as _t
+        (self.dir / "probe-usage.json").write_text(json.dumps(
+            {"grok": {"captured_at": _t.time() - age_seconds,
+                      "source": "probe",
+                      "windows": {"weekly": {"used_percent": pct}}}}))
+
+    def _route(self, *extra):
+        import io
+        import contextlib
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = tc.main(["route", "r", "--task", "do it", "--dry-run",
+                          *extra])
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_headroom_prefers_most_remaining_quota(self):
+        self._seed_claude(63.0)
+        self._seed_codex(12.0)
+        self._seed_grok_probe(80.0)
+        rc, out, _ = self._route()
+        self.assertEqual(rc, 0)
+        self.assertIn("route: selected codex", out)
+        # the reason line is auditable: every number it used is shown
+        self.assertIn("codex 12%", out)
+        self.assertIn("claude 63%", out)
+        self.assertIn("grok 80%", out)
+        self.assertIn("headroom:", out)
+
+    def test_unknown_usage_ranks_as_zero_with_preference_tiebreak(self):
+        # grok has NO data -> optimistic 0% (D2), beating codex at 12%;
+        # unknowns print as ?%
+        self._seed_codex(12.0)
+        self._seed_claude(63.0)
+        rc, out, _ = self._route()
+        self.assertEqual(rc, 0)
+        self.assertIn("route: selected grok", out)
+        self.assertIn("grok ?%", out)
+
+    def test_all_unknown_falls_back_to_preference_order(self):
+        # nothing known anywhere -> bit-identical to the v0.4.0 pick
+        rc, out, _ = self._route()
+        self.assertEqual(rc, 0)
+        self.assertIn("route: selected claude", out)
+
+    def test_binding_constraint_is_the_max_window(self):
+        # codex 5h at 10% but weekly at 90% -> ranks as 90 (the tighter
+        # window governs), so claude at 50% wins
+        import time as _t
+        day = self.dir / ".codex" / "sessions" / "2026" / "07" / "11"
+        day.mkdir(parents=True, exist_ok=True)
+        (day / "rollout-x.jsonl").write_text(json.dumps(
+            {"payload": {"rate_limits": {
+                "primary": {"used_percent": 10.0,
+                            "resets_at": _t.time() + 3600},
+                "secondary": {"used_percent": 90.0,
+                              "resets_at": _t.time() + 86400}}}}) + "\n")
+        self._seed_claude(50.0)
+        self._seed_grok_probe(95.0)
+        rc, out, _ = self._route()
+        self.assertEqual(rc, 0)
+        self.assertIn("route: selected claude", out)
+        self.assertIn("codex 90%", out)
+
+    def test_exhausted_is_excluded_before_ranking(self):
+        # codex has the lowest usage but a live exhausted signal — the
+        # exclusion phase runs first, whatever the strategy says
+        import time as _t
+        self._seed_codex(5.0)
+        self._seed_claude(70.0)
+        (self.dir / "providers.json").write_text(json.dumps(
+            {"codex": {"signal": "exhausted", "at": "2026-07-12T00:00:00",
+                       "resets_at": _t.time() + 3600}}))
+        rc, out, _ = self._route()
+        self.assertEqual(rc, 0)
+        self.assertNotIn("selected codex", out)
+        self.assertIn("codex: exhausted", out)
+
+    def test_strategy_preference_is_v040_behavior(self):
+        tc.load_config = lambda: {"routing": {"strategy": "preference"}}
+        self._seed_claude(99.0)          # nearly exhausted, still first
+        self._seed_codex(1.0)
+        rc, out, _ = self._route()
+        self.assertEqual(rc, 0)
+        self.assertIn("route: selected claude", out)
+        self.assertIn("first available in", out)
+
+    def test_bogus_strategy_falls_back_to_headroom(self):
+        tc.load_config = lambda: {"routing": {"strategy": "bogus"}}
+        self.assertEqual(tc.routing_strategy(), "headroom")
+
+    def test_stale_probe_counts_but_is_flagged(self):
+        # probe data older than probe_stale_minutes still ranks (better
+        # than guessing 0%) but the reason line says so
+        self._seed_claude(10.0)
+        self._seed_grok_probe(90.0, age_seconds=7200)
+        rc, out, _ = self._route()
+        self.assertEqual(rc, 0)
+        self.assertIn("route: selected codex", out)      # codex unknown -> 0%
+        self.assertIn("grok 90% (stale probe)", out)
+        self.assertIn("teamctl usage --probe", out)
 
 
 class _LatticeHome(_AuthSandbox, unittest.TestCase):
