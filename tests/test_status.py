@@ -348,27 +348,38 @@ class LiveStatusTests(unittest.TestCase):
             rc = tc.main(["status", role, "--json"])
         return rc, json.loads(out.getvalue())
 
-    def test_busy_then_idle_detected_on_a_real_pane(self):
+    def _wait_state(self, role, want, timeout=25.0):
+        # poll-for-state, never sleep-and-assert: how long a fresh shell
+        # takes to settle (rc files, prompt paint) depends entirely on the
+        # machine's load — the classifier honestly reads 'busy' until the
+        # pane stops changing, and guessing a settle time was observed
+        # flaky under real load. A wrong terminal state still fails: the
+        # classifier can't reach `want` within the window.
         import time as _t
+        deadline = _t.monotonic() + timeout
+        last = None
+        while _t.monotonic() < deadline:
+            _rc, data = self._status_json(role)
+            last = data[role]["state"]
+            if last == want:
+                return last
+            _t.sleep(0.5)
+        return last
+
+    def test_busy_then_idle_detected_on_a_real_pane(self):
         rc = tc.main(["spawn", "st_mate", "--provider", "shell"])
         self.assertEqual(rc, 0)
         pane = tc.load_state()["teammates"]["st_mate"]["pane_id"]
-        _t.sleep(1.0)
-        rc, data = self._status_json("st_mate")
-        self.assertEqual(rc, 0)
-        self.assertEqual(data["st_mate"]["state"], "idle")
+        # a fresh shell settles to idle
+        self.assertEqual(self._wait_state("st_mate", "idle"), "idle")
         # a printing loop makes the pane content move -> busy
         tc.tmux("send-keys", "-t", pane, "-l", "--",
                 "while true; do date; sleep 0.2; done", check=False)
         tc.tmux("send-keys", "-t", pane, "C-m", check=False)
-        _t.sleep(0.8)
-        rc, data = self._status_json("st_mate")
-        self.assertEqual(data["st_mate"]["state"], "busy")
+        self.assertEqual(self._wait_state("st_mate", "busy", 10.0), "busy")
         # stop the loop -> back to a resting prompt
         tc.tmux("send-keys", "-t", pane, "C-c", check=False)
-        _t.sleep(1.2)
-        rc, data = self._status_json("st_mate")
-        self.assertEqual(data["st_mate"]["state"], "idle")
+        self.assertEqual(self._wait_state("st_mate", "idle"), "idle")
 
 
 if __name__ == "__main__":

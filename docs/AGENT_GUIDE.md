@@ -384,6 +384,9 @@ auth_files    = []                  # enables real signed-in/out detection
 login_hint    = ""
 probe_command = ""                  # its TUI usage command
 waiting_patterns = []               # approval-dialog regexes for `status`
+strip_env     = []                  # env vars removed from the TEAMMATE's
+                                    # process (env -u prefix; the user's
+                                    # session env is never touched)
 routable      = true
 ```
 
@@ -409,15 +412,19 @@ session_id_key   = "conversation_id"   # from its (hidden) JSON output mode
 #   session_id_regex = "conversation=([0-9a-f-]{36})"
 model_args    = ["--model", "{model}"] # labels from `agy models`
 auth_env      = "ANTIGRAVITY_TOKEN"    # keyring login also works (unprobed)
+strip_env     = ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"]
 ```
 
-agy caveats, verified live: (1) **macOS over SSH** — agy switches to
-file-based token storage in SSH sessions and ignores the keychain, so
-headless runs fail auth until one interactive OAuth is done in that
-context; start the tmux server from a local/GUI terminal. (2) agy
-**self-updates** (~15-min checker) — its flag surface can drift; unknown
-`--output-format` values silently fall back to plain text, which the
-regex fallback covers.
+agy caveats, verified live: (1) **macOS SSH-marker auth** — agy trusts
+an inherited `SSH_CONNECTION` over the keychain and refuses auth
+whenever it is present; a tmux session created over SSH carries that
+marker for its whole lifetime regardless of where a dispatch later
+runs. teamctl strips it per-provider via `strip_env` (default in the
+block above — an `env -u` prefix on the teammate's own process; nothing
+else's environment changes), which is what makes agy usable from an
+SSH-attached session at all. (2) agy **self-updates** (~15-min checker)
+— its flag surface can drift; unknown `--output-format` values silently
+fall back to plain text, which the regex fallback covers.
 
 ## 9. The lead identity (operating rules, shipped verbatim)
 

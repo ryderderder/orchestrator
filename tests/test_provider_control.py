@@ -275,5 +275,146 @@ headless_args = ["{task}"]
         self.assertTrue(tc.provider_enabled("codex"))
 
 
+class StripEnvTests(_ControlSandbox):
+    """v0.5.3 strip_env: env vars removed from the TEAMMATE's process
+    only (an `env -u` prefix on the command teamctl composes — no tmux
+    environment surgery, nothing else's env changes). Motivating case:
+    agy refuses keychain auth whenever an inherited SSH_CONNECTION is
+    present, and a tmux session created over SSH carries that marker for
+    its whole lifetime."""
+
+    STRIP_BLOCK = """
+[providers.custom.sshy]
+command = "sshy"
+headless_args = ["-p", "{task}"]
+interactive_args = ["--chat"]
+strip_env = ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"]
+"""
+
+    def test_schema_parses_and_validates_names(self):
+        self.write_config(self.STRIP_BLOCK)
+        spec = tc.provider_spec("sshy")
+        self.assertEqual(spec["strip_env"],
+                         ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"])
+        self.assertEqual(tc._strip_env_argv("sshy"),
+                         ["env", "-u", "SSH_CONNECTION", "-u", "SSH_CLIENT",
+                          "-u", "SSH_TTY"])
+        # built-ins don't strip anything
+        for p in ("claude", "codex", "grok", "gemini", "shell"):
+            self.assertEqual(tc._strip_env_argv(p), [], p)
+
+    def test_bad_variable_names_are_dropped_with_a_warning(self):
+        self.write_config("""
+[providers.custom.badvars]
+command = "badvars"
+headless_args = ["{task}"]
+strip_env = ["GOOD_ONE", "bad-dash", "1LEADING", "in valid"]
+""")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            spec = tc.provider_spec("badvars")
+        self.assertEqual(spec["strip_env"], ["GOOD_ONE"])
+        self.assertIn("not a valid variable name", err.getvalue())
+
+    def test_interactive_launch_line_gets_the_prefix(self):
+        self.write_config(self.STRIP_BLOCK)
+        line = tc.build_launch_line("sshy", "hello", "/tmp")
+        self.assertIn("exec env -u SSH_CONNECTION -u SSH_CLIENT "
+                      "-u SSH_TTY sshy --chat hello", line)
+        # ...and a provider without strip_env is untouched
+        self.assertNotIn("env -u",
+                         tc.build_launch_line("claude", "hi", "/tmp"))
+
+    def test_dispatch_wrapper_prefixes_the_provider_only(self):
+        self.write_config(self.STRIP_BLOCK)
+        captured = {}
+        saved_open, saved_load = tc._open_pane, tc.load_state
+        tc._open_pane = (lambda cmd, existing:
+                         captured.setdefault("cmd", cmd) or "%x")
+        tc.load_state = lambda: {"teammates": {}}
+        try:
+            tc._dispatch_pane("r", self.dir / "hd",
+                              ["sshy", "-p", "task"], str(self.dir),
+                              "sshy", "")
+        finally:
+            tc._open_pane, tc.load_state = saved_open, saved_load
+        self.assertIn("env -u SSH_CONNECTION -u SSH_CLIENT -u SSH_TTY "
+                      "sshy -p task", captured["cmd"])
+        # the wrapper machinery itself (pid/status bookkeeping) still runs
+        # OUTSIDE the stripped env — the prefix wraps only the provider
+        self.assertIn("echo $$ >", captured["cmd"])
+
+
+@unittest.skipUnless(os.environ.get("TMUX"), "requires a live tmux session")
+class LiveStripEnvTests(unittest.TestCase):
+    """End-to-end proof in a real pane: a canary variable planted in the
+    tmux session environment reaches an unstripped teammate and does NOT
+    reach a stripped one."""
+
+    def setUp(self):
+        self.statedir = tempfile.TemporaryDirectory(prefix="teamctl-se-")
+        self.dir = Path(self.statedir.name)
+        os.environ["TEAMCTL_STATE"] = str(self.dir / "state.json")
+        self._home = os.environ.get("HOME")
+        os.environ["HOME"] = str(self.dir)
+        cfg = self.dir / ".config" / "agent-team"
+        cfg.mkdir(parents=True)
+        # two sh-backed custom providers: one strips the canary, one not
+        (cfg / "config.toml").write_text("""
+[providers.custom.stripped]
+command = "sh"
+headless_args = ["-c", "{task}"]
+strip_env = ["TEAMCTL_CANARY"]
+
+[providers.custom.plain]
+command = "sh"
+headless_args = ["-c", "{task}"]
+""")
+        self._wt = tc.worktree_settings
+        tc.worktree_settings = lambda: {"enabled": False, "dir": "",
+                                        "branch_prefix": "teamctl/",
+                                        "cleanup": "auto"}
+        out = tc.tmux("new-window", "-d", "-n", f"teamctl-se-{os.getpid()}",
+                      "-P", "-F", "#{window_id} #{pane_id}").stdout.split()
+        self.window_id, self.lead_pane = out[0], out[1]
+        self._tmux_pane = os.environ.get("TMUX_PANE")
+        os.environ["TMUX_PANE"] = self.lead_pane
+        # plant the canary in the SESSION env: new panes inherit it
+        tc.tmux("set-environment", "TEAMCTL_CANARY", "present")
+
+    def tearDown(self):
+        tc.tmux("set-environment", "-u", "TEAMCTL_CANARY", check=False)
+        for role in list(tc.load_state()["teammates"]):
+            tc.main(["shutdown", role])
+        tc.tmux("kill-window", "-t", self.window_id, check=False)
+        tc.worktree_settings = self._wt
+        if self._tmux_pane is None:
+            os.environ.pop("TMUX_PANE", None)
+        else:
+            os.environ["TMUX_PANE"] = self._tmux_pane
+        if self._home is not None:
+            os.environ["HOME"] = self._home
+        os.environ.pop("TEAMCTL_STATE", None)
+        self.statedir.cleanup()
+
+    def _run_task(self, role, provider):
+        rc = tc.main(["dispatch", role, "--provider", provider, "--task",
+                      'echo "CANARY=${TEAMCTL_CANARY:-GONE}"',
+                      "--cwd", str(self.dir)])
+        self.assertEqual(rc, 0)
+        import time as _t
+        hd = Path(tc.load_state()["teammates"][role]["handoff"])
+        deadline = _t.monotonic() + 20
+        while _t.monotonic() < deadline and not (hd / "status").exists():
+            _t.sleep(0.3)
+        return (hd / "result.json").read_text()
+
+    def test_canary_stripped_for_the_configured_provider_only(self):
+        # control first: the canary genuinely reaches an unstripped pane
+        self.assertIn("CANARY=present", self._run_task("ctl", "plain"))
+        # the stripped provider never sees it
+        self.assertIn("CANARY=GONE", self._run_task("exp", "stripped"))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -581,6 +581,10 @@ auth_files    = ["~/.aider/oauth.json"]          # enables signed-out/in
 login_hint    = "aider --login"
 probe_command = ""                               # its TUI usage command
 waiting_patterns = []                            # approval-dialog regexes
+strip_env     = []                               # env vars removed from the
+                                                 # teammate's process only
+                                                 # (e.g. SSH_CONNECTION for
+                                                 # CLIs that mistrust SSH)
 routable      = true
 ```
 

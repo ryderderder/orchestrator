@@ -71,7 +71,7 @@ try:
 except Exception:  # pragma: no cover - platforms without curses
     curses = None
 
-VERSION = "0.5.2"
+VERSION = "0.5.3"
 
 # --------------------------------------------------------------------------
 # the provider-spec registry — every provider, built-in OR user-defined via
@@ -351,6 +351,19 @@ def custom_provider_specs() -> dict[str, dict]:
             else:
                 resume = [command] + resume_args
 
+        strip_env = _str_list(block.get("strip_env", []))
+        if strip_env is None:
+            _warn_custom_once(name, "strip_env must be a list of "
+                                    "environment variable names")
+            continue
+        good_strip = []
+        for var in strip_env:
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", var):
+                good_strip.append(var)
+            else:
+                _warn_custom_once(name, f"strip_env entry {var!r} is not "
+                                        "a valid variable name — dropped")
+
         patterns = _str_list(block.get("waiting_patterns", []))
         if patterns is None:
             _warn_custom_once(name, "waiting_patterns must be a list of "
@@ -386,6 +399,7 @@ def custom_provider_specs() -> dict[str, dict]:
             "probe": ({"argv": [command], "command": probe_command,
                        "extra_enters": 1} if probe_command else None),
             "waiting_patterns": good_patterns,
+            "strip_env": good_strip,
             "routable": routable,
             "custom": True,
         }
@@ -435,6 +449,24 @@ def login_hint(provider: str) -> str:
 
 def provider_supports_effort(name: str) -> bool:
     return bool((provider_spec(name) or {}).get("effort_args"))
+
+
+def _strip_env_argv(provider: str) -> list[str]:
+    """`env -u VAR …` argv prefix for providers whose spec asks teamctl to
+    remove variables from the TEAMMATE's environment (spec field
+    strip_env; exposed to [providers.custom.*] blocks). Child-process
+    level only — the user's session/tmux environment is never mutated.
+    The motivating case: agy trusts an inherited SSH_CONNECTION over the
+    keychain and refuses auth for the whole tmux-session lifetime when
+    the session was created over SSH — stripping it per-provider makes
+    the provider usable without touching anyone else's env."""
+    names = (provider_spec(provider) or {}).get("strip_env") or []
+    if not names:
+        return []
+    out = ["env"]
+    for n in names:
+        out += ["-u", n]
+    return out
 
 
 def _enabled_key(name: str) -> str:
@@ -970,7 +1002,8 @@ def build_launch_line(provider: str, prompt: str, cwd: str,
     spec = provider_spec(provider)
     if spec is None:
         raise TeamctlError(f"unknown provider '{provider}'")
-    launch = list(spec["argv"]) + interactive_flags(provider, model, effort)
+    launch = (_strip_env_argv(provider) + list(spec["argv"])
+              + interactive_flags(provider, model, effort))
     if prompt:
         launch.append(prompt)
     return f"cd {shlex.quote(cwd)} && exec {' '.join(shlex.quote(a) for a in launch)}"
@@ -2100,8 +2133,14 @@ def _dispatch_pane(role: str, hd: Path, argv: list[str], cwd: str,
     on completion: the wrapper prints a completion banner and blocks until
     `teamctl shutdown <role>` tears it down — finished work stays VISIBLE in
     the window, not just tracked in state. keep_finished=false restores the
-    ephemeral behavior (pane closes ~2s after the task ends)."""
-    hcmd = " ".join(shlex.quote(a) for a in argv)
+    ephemeral behavior (pane closes ~2s after the task ends).
+
+    A provider spec's strip_env vars are removed from the provider's own
+    process (an `env -u` prefix on the command — child-process only; the
+    user's session env is untouched, and the wrapper itself still sees
+    the full environment)."""
+    hcmd = " ".join(shlex.quote(a)
+                    for a in _strip_env_argv(provider) + argv)
     q = shlex.quote
     pid_f = q(str(hd / "pid"))
     res_f = q(str(hd / "result.json"))
