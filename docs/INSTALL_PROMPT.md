@@ -38,9 +38,10 @@ following, in order:
 
 5. Report what you did, what you skipped and why, and finish by telling me
    my controls:
-     - from the shell: `teamctl config --menu` to adjust preferences,
-       `teamctl lead on|off|status` for the lead identity,
-       `./uninstall.sh` (or `teamctl lead off` first) to undo everything.
+     - from the shell: `teamctl settings` (or `teamctl config --menu`) to
+       adjust preferences, `teamctl lead on|off|status` for the lead
+       identity, `teamctl uninstall` (`teamctl lead off` first) to undo
+       everything.
      - from a chat: with lead mode on, I can just say "open the teamctl
        menu" to any lead agent and it will present and apply my settings.
 ```

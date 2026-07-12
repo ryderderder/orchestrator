@@ -42,7 +42,7 @@ providers):
 ### Install via your AI agent — paste this prompt
 
 Prefer to have an agent set everything up? Paste this into any AI coding
-CLI (also in [INSTALL_PROMPT.md](INSTALL_PROMPT.md)):
+CLI (also in [docs/INSTALL_PROMPT.md](docs/INSTALL_PROMPT.md)):
 
 ```text
 Install teamctl (https://github.com/ryderderder/teamctl) for me — it manages
@@ -78,9 +78,10 @@ following, in order:
 
 5. Report what you did, what you skipped and why, and finish by telling me
    my controls:
-     - from the shell: `teamctl config --menu` to adjust preferences,
-       `teamctl lead on|off|status` for the lead identity,
-       `./uninstall.sh` (or `teamctl lead off` first) to undo everything.
+     - from the shell: `teamctl settings` (or `teamctl config --menu`) to
+       adjust preferences, `teamctl lead on|off|status` for the lead
+       identity, `teamctl uninstall` (run `teamctl lead off` first) to
+       undo everything.
      - from a chat: with lead mode on, I can just say "open the teamctl
        menu" to any lead agent and it will present and apply my settings.
 ```
@@ -91,7 +92,7 @@ following, in order:
 
 ```sh
 teamctl update --check     # installed vs latest, from your install source
-teamctl update             # replace ~/.local/bin/teamctl + claude-statusline
+teamctl update             # replace ~/.local/bin/teamctl
 ```
 
 The installer records where teamctl came from (`install-meta.json` in the
@@ -459,28 +460,31 @@ re-run `teamctl init` any time to redo the whole wizard.
 
 - a marker-guarded block in `~/.tmux.conf` for the pane-border and status-bar
   `role · model` labels;
-- installing `claude-statusline` (shows `model · effort · ctx N%` in Claude
-  Code) and adding the `statusLine` key to `~/.claude/settings.json` — skipped
-  if a `statusLine` key already exists. The statusline also caches the
-  rate-limit numbers Claude Code pipes to it (documented statusLine JSON:
-  `rate_limits.five_hour/seven_day` — subscribers only), which is what powers
-  `teamctl usage`'s Claude column;
+- wiring Claude Code's `statusLine` in `~/.claude/settings.json` to
+  `teamctl statusline` (shows `model · effort · ctx N%`) — skipped if a
+  non-teamctl `statusLine` key already exists, and a pre-v0.4.0
+  `claude-statusline` wiring is migrated automatically. The statusline
+  also caches the rate-limit numbers Claude Code pipes to it (documented
+  statusLine JSON: `rate_limits.five_hour/seven_day` — subscribers only),
+  which is what powers `teamctl usage`'s Claude column;
 - installing [lead mode](#lead-mode) for your detected agent CLIs (same as
   `teamctl lead on`).
 
 ## Uninstall
 
 ```sh
-./uninstall.sh
+teamctl uninstall     # add --yes to skip the confirm
 ```
 
-Removes the binaries, removes the tmux marker block (backup made first), and
-removes the `statusLine` settings key if — and only if — it points at this
-tool's script (backup made first). Config and state files are left in place;
-the script prints the one-liner to remove them too.
+Removes the `teamctl` binary (and any pre-v0.4.0 `claude-statusline`
+companion), the `~/.tmux.conf` marker block, the `statusLine` settings key
+if — and only if — it points at teamctl, and the install/update metadata —
+each with a backup first. Config and state files are left in place; the
+one-liner to remove them too is printed.
 
 If you installed [lead mode](#lead-mode), run `teamctl lead off` **before**
-uninstalling (the uninstaller removes the `teamctl` binary itself).
+uninstalling (the uninstaller removes the `teamctl` binary itself, so it
+can't reverse lead mode afterward).
 
 ## Security
 

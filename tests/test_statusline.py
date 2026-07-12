@@ -1,9 +1,10 @@
-"""Tests for the claude-statusline rate-limit cache and `teamctl usage`'s
-Claude reporting.
+"""Tests for `teamctl statusline` (the folded-in statusLine command, its
+rate-limit cache) and `teamctl usage`'s Claude reporting.
 
-The statusline is exercised as a real subprocess against a throwaway HOME;
-the usage command reads its cache from the (TEAMCTL_STATE-overridden) state
-dir. Nothing here touches the real ~/.local/state or ~/.claude.
+The statusline is exercised as a real subprocess (`teamctl statusline`)
+against a throwaway HOME; the usage command reads its cache from the
+(TEAMCTL_STATE-overridden) state dir. Nothing here touches the real
+~/.local/state or ~/.claude.
 
 Run with:  python3 -m unittest discover -s tests
 """
@@ -22,7 +23,6 @@ from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-STATUSLINE = HERE.parent / "claude-statusline"
 TEAMCTL = HERE.parent / "teamctl"
 
 loader = SourceFileLoader("teamctl", str(TEAMCTL))
@@ -52,7 +52,8 @@ class StatuslineTests(unittest.TestCase):
     def run_sl(self, payload: str):
         env = dict(os.environ)
         env["HOME"] = str(self.home)
-        return subprocess.run([sys.executable, str(STATUSLINE)],
+        env.pop("TEAMCTL_STATE", None)   # exercise the real state-dir path
+        return subprocess.run([sys.executable, str(TEAMCTL), "statusline"],
                               input=payload, capture_output=True,
                               text=True, env=env, timeout=30)
 
@@ -103,6 +104,29 @@ class StatuslineTests(unittest.TestCase):
         r = self.run_sl(json.dumps(FULL_PAYLOAD))
         self.assertEqual(r.returncode, 0)
         self.assertEqual(r.stdout.strip(), "Opus · high · ctx 8%")
+
+    def test_effort_absent_shows_question_mark(self):
+        payload = {k: v for k, v in FULL_PAYLOAD.items() if k != "effort"}
+        r = self.run_sl(json.dumps(payload))
+        self.assertEqual(r.returncode, 0)
+        self.assertEqual(r.stdout.strip(), "Opus · ? · ctx 8%")
+
+    def test_null_context_omits_the_segment(self):
+        payload = dict(FULL_PAYLOAD)
+        payload["context_window"] = {"used_percentage": None}
+        r = self.run_sl(json.dumps(payload))
+        self.assertEqual(r.returncode, 0)
+        self.assertEqual(r.stdout.strip(), "Opus · high")   # no invented ctx
+
+    def test_statusline_hot_path_skips_argparse(self):
+        # the fold's premise: `statusline` dispatches before build_parser().
+        # a real subprocess proves the whole path works end to end.
+        r = self.run_sl(json.dumps(FULL_PAYLOAD))
+        self.assertEqual(r.stdout.strip(), "Opus · high · ctx 8%")
+        # and it is fast enough for an every-render hook (generous bound)
+        t0 = time.monotonic()
+        self.run_sl(json.dumps(FULL_PAYLOAD))
+        self.assertLess(time.monotonic() - t0, 2.0)
 
 
 class UsageClaudeCacheTests(unittest.TestCase):

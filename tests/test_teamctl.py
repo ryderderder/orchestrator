@@ -1240,13 +1240,11 @@ class UpdateMachineryTests(_LatticeHome):
         bin_dir.mkdir(exist_ok=True)
         (bin_dir / "teamctl").write_text(
             f'#!/usr/bin/env python3\nVERSION = "{version}"\n')
-        (bin_dir / "claude-statusline").write_text(
-            "#!/usr/bin/env python3\n# old statusline\n")
         return bin_dir
 
-    def _mock_fetch(self, teamctl_text, statusline_text="# new statusline\n"):
-        files = {"teamctl": teamctl_text,
-                 "claude-statusline": statusline_text}
+    def _mock_fetch(self, teamctl_text):
+        # one artifact since the v0.4.0 statusline fold
+        files = {"teamctl": teamctl_text}
         self._orig_fetch = tc._fetch_from_source
         tc._fetch_from_source = lambda meta, names: (
             {n: files[n] for n in names}, "mock", [])
@@ -1291,14 +1289,12 @@ class UpdateMachineryTests(_LatticeHome):
         cfg.mkdir(parents=True)
         (cfg / "config.toml").write_text('[output]\nverbosity = "terse"\n')
         new_teamctl = '#!/usr/bin/env python3\nVERSION = "0.5.0"\n'
-        self._mock_fetch(new_teamctl, "# new statusline\n")
+        self._mock_fetch(new_teamctl)
         rc, out, _ = self._run("update")
         self.assertEqual(rc, 0)
         self.assertIn("updated teamctl 0.4.0", out)
         self.assertIn("0.5.0", out)
         self.assertEqual((bin_dir / "teamctl").read_text(), new_teamctl)
-        self.assertEqual((bin_dir / "claude-statusline").read_text(),
-                         "# new statusline\n")
         self.assertTrue(os.access(bin_dir / "teamctl", os.X_OK))
         # user config byte-for-byte untouched
         self.assertEqual((cfg / "config.toml").read_text(),
@@ -1673,8 +1669,7 @@ class InitTests(_AuthSandbox, unittest.TestCase):
         self.assertEqual(rc, 0)
         # the trailing y answers must never reach integration prompts
         self.assertFalse((self.home / ".tmux.conf").exists())
-        self.assertFalse(
-            (self.home / ".local" / "bin" / "claude-statusline").exists())
+        self.assertFalse((self.home / ".claude" / "settings.json").exists())
         self.assertIn("extras", out)                    # pointer printed
 
     def test_tmux_block_appended_once_and_backed_up(self):
@@ -1698,6 +1693,8 @@ class InitTests(_AuthSandbox, unittest.TestCase):
         self.assertIn("skipping", out)
 
     def test_statusline_settings_added_minimally_and_skipped_if_present(self):
+        # v0.4.0: the statusLine now runs `teamctl statusline` — there is
+        # no separate script to install, only the settings.json wiring
         settings = self.home / ".claude" / "settings.json"
         settings.parent.mkdir(parents=True)
         settings.write_text(json.dumps({"model": "opus"}, indent=2))
@@ -1707,17 +1704,15 @@ class InitTests(_AuthSandbox, unittest.TestCase):
         data = json.loads(settings.read_text())
         self.assertEqual(data["model"], "opus")          # existing keys untouched
         self.assertEqual(data["statusLine"]["type"], "command")
-        self.assertIn("claude-statusline", data["statusLine"]["command"])
-        self.assertTrue(
-            (self.home / ".local" / "bin" / "claude-statusline").exists())
+        self.assertIn("teamctl statusline", data["statusLine"]["command"])
         self.assertTrue(Path(str(settings) + ".bak-teamctl").exists())
-        # second run: key already present -> settings must be left alone
+        # second run: our own wiring is recognized and left alone
         before = settings.read_text()
         rc, out = self._run_init_extras(
             ["", "", "", "", "y", "n", "y", "n"], "--custom")
         self.assertEqual(rc, 0)
         self.assertEqual(settings.read_text(), before)
-        self.assertIn("already has a statusLine key", out)
+        self.assertIn("already runs `teamctl statusline`", out)
 
     def test_statusline_creates_settings_when_absent(self):
         rc, _ = self._run_init_extras(
@@ -1726,7 +1721,26 @@ class InitTests(_AuthSandbox, unittest.TestCase):
         settings = self.home / ".claude" / "settings.json"
         data = json.loads(settings.read_text())
         self.assertEqual(data["statusLine"]["command"],
-                         "~/.local/bin/claude-statusline")
+                         "~/.local/bin/teamctl statusline")
+
+    def test_update_migrates_legacy_statusline_wiring_and_script(self):
+        # a pre-v0.4.0 install: separate script + old settings.json command
+        settings = self.home / ".claude" / "settings.json"
+        settings.parent.mkdir(parents=True)
+        settings.write_text(json.dumps(
+            {"statusLine": {"type": "command",
+                            "command": "~/.local/bin/claude-statusline"}}))
+        legacy = self.home / ".local" / "bin" / "claude-statusline"
+        legacy.parent.mkdir(parents=True)
+        legacy.write_text("# old script\n")
+        notes = tc._migrate_legacy_statusline(legacy.parent)
+        self.assertTrue(any("teamctl statusline" in n for n in notes))
+        data = json.loads(settings.read_text())
+        self.assertEqual(data["statusLine"]["command"],
+                         "~/.local/bin/teamctl statusline")
+        self.assertFalse(legacy.exists())               # orphan removed
+        # idempotent: a second pass finds nothing to migrate
+        self.assertEqual(tc._migrate_legacy_statusline(legacy.parent), [])
 
     def test_teamctl_ui_plain_forces_line_fallback(self):
         # even if stdio looked like a tty, TEAMCTL_UI=plain must force the

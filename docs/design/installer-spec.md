@@ -510,7 +510,7 @@ If extras installed, append one line each, still terse:
 
 ```text
   + tmux block     source: tmux source-file ~/.tmux.conf
-  + statusline     ~/.local/bin/claude-statusline
+  + statusline     teamctl statusline (Claude Code)
   + lead mode      teamctl lead status
 ```
 

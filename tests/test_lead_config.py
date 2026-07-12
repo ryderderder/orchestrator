@@ -222,6 +222,83 @@ class LeadOffTests(ThrowawayHomeTestCase):
         self.assertFalse((self.home / ".claude" / "skills" / "teamctl-lead").exists())
 
 
+class UninstallTests(ThrowawayHomeTestCase):
+    """`teamctl uninstall` reverses install.sh + init, backups first,
+    leaving config/state and lead mode alone (all against a throwaway
+    HOME; no real files touched)."""
+
+    def setUp(self):
+        super().setUp()
+        os.environ["TEAMCTL_STATE"] = str(
+            self.home / ".local" / "state" / "agent-team" / "state.json")
+
+    def tearDown(self):
+        os.environ.pop("TEAMCTL_STATE", None)
+        super().tearDown()
+
+    def _seed_install(self, statusline_cmd="~/.local/bin/teamctl statusline"):
+        bin_dir = self.home / ".local" / "bin"
+        bin_dir.mkdir(parents=True)
+        (bin_dir / "teamctl").write_text("#!/usr/bin/env python3\n")
+        state = self.home / ".local" / "state" / "agent-team"
+        state.mkdir(parents=True, exist_ok=True)
+        (state / "install-meta.json").write_text(json.dumps(
+            {"source": "curl", "bin_dir": str(bin_dir)}))
+        tmux = self.home / ".tmux.conf"
+        tmux.write_text("set -g mouse on\n\n" + tc.TMUX_BLOCK)
+        settings = self.home / ".claude" / "settings.json"
+        settings.parent.mkdir(parents=True, exist_ok=True)
+        settings.write_text(json.dumps(
+            {"model": "opus",
+             "statusLine": {"type": "command", "command": statusline_cmd}}))
+        return bin_dir, tmux, settings
+
+    def test_uninstall_reverses_install_and_keeps_user_content(self):
+        bin_dir, tmux, settings = self._seed_install()
+        rc, out, _ = self.run_cli(["uninstall", "--yes"])
+        self.assertEqual(rc, 0)
+        self.assertFalse((bin_dir / "teamctl").exists())
+        # tmux block gone, the user's own line preserved
+        text = tmux.read_text()
+        self.assertNotIn(tc.TMUX_MARKER_BEGIN, text)
+        self.assertIn("set -g mouse on", text)
+        # statusLine key removed, other settings kept
+        data = json.loads(settings.read_text())
+        self.assertNotIn("statusLine", data)
+        self.assertEqual(data["model"], "opus")
+        # metadata cleared; per-user data pointer printed
+        self.assertFalse(
+            (self.home / ".local" / "state" / "agent-team"
+             / "install-meta.json").exists())
+        self.assertIn("rm -rf ~/.config/agent-team", out)
+        self.assertIn("teamctl lead off", out)
+
+    def test_uninstall_removes_legacy_statusline_wiring_too(self):
+        bin_dir, _tmux, settings = self._seed_install(
+            statusline_cmd="~/.local/bin/claude-statusline")
+        (bin_dir / "claude-statusline").write_text("# legacy\n")
+        rc, _, _ = self.run_cli(["uninstall", "--yes"])
+        self.assertEqual(rc, 0)
+        self.assertFalse((bin_dir / "claude-statusline").exists())
+        self.assertNotIn("statusLine", json.loads(settings.read_text()))
+
+    def test_uninstall_leaves_foreign_statusline_alone(self):
+        bin_dir, _tmux, settings = self._seed_install(
+            statusline_cmd="/opt/other/statusline")
+        rc, out, _ = self.run_cli(["uninstall", "--yes"])
+        self.assertEqual(rc, 0)
+        self.assertIn("statusLine",
+                      json.loads(settings.read_text()))     # not ours: kept
+        self.assertIn("not teamctl's", out)
+
+    def test_uninstall_declined_without_yes(self):
+        bin_dir, _t, _s = self._seed_install()
+        rc, out, _ = self.run_cli(["uninstall"], answers=["n"])
+        self.assertEqual(rc, 0)
+        self.assertIn("nothing removed", out)
+        self.assertTrue((bin_dir / "teamctl").exists())
+
+
 class LeadHookTests(ThrowawayHomeTestCase):
     def _hook_entries(self):
         data = json.loads(self.settings.read_text())

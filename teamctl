@@ -2065,7 +2065,59 @@ if-shell -F '#{?@teamctl_status_added,0,1}' {
 }
 """ + TMUX_MARKER_END + "\n"
 
-STATUSLINE_ENTRY = {"type": "command", "command": "~/.local/bin/claude-statusline"}
+STATUSLINE_ENTRY = {"type": "command",
+                    "command": "~/.local/bin/teamctl statusline"}
+
+
+def _legacy_statusline_commands() -> tuple[str, ...]:
+    """statusLine commands written by pre-v0.4.0 installs (the separate
+    claude-statusline script), in both tilde and expanded forms."""
+    return ("~/.local/bin/claude-statusline",
+            str(Path.home() / ".local" / "bin" / "claude-statusline"))
+
+
+def _our_statusline_commands() -> set[str]:
+    """Every statusLine command teamctl has ever written (for uninstall
+    and migration matching)."""
+    return set(_legacy_statusline_commands()) | {
+        STATUSLINE_ENTRY["command"],
+        str(Path.home() / ".local" / "bin" / "teamctl") + " statusline",
+    }
+
+
+def _migrate_legacy_statusline(bin_dir: Path | None = None) -> list[str]:
+    """v0.4.0 fold: the statusline became `teamctl statusline`. Rewrite an
+    old claude-statusline wiring in settings.json and remove the orphaned
+    script. Best-effort; returns human-readable notes ([] = nothing)."""
+    notes: list[str] = []
+    sp = Path.home() / ".claude" / "settings.json"
+    try:
+        data = json.loads(sp.read_text()) if sp.exists() else None
+    except (json.JSONDecodeError, OSError):
+        data = None
+    if isinstance(data, dict):
+        sl = data.get("statusLine")
+        if isinstance(sl, dict) \
+                and sl.get("command") in _legacy_statusline_commands():
+            bak = Path(str(sp) + ".bak-teamctl")
+            try:
+                shutil.copy2(sp, bak)
+                data["statusLine"] = dict(STATUSLINE_ENTRY)
+                sp.write_text(json.dumps(data, indent=2) + "\n")
+                notes.append(f"statusLine in {sp} now runs `teamctl "
+                             f"statusline` (backup: {bak})")
+            except OSError:
+                pass
+    legacy = Path(bin_dir or Path.home() / ".local" / "bin") \
+        / "claude-statusline"
+    try:
+        if legacy.exists():
+            legacy.unlink()
+            notes.append(f"removed the orphaned {legacy} (its job moved "
+                         "into `teamctl statusline`)")
+    except OSError:
+        pass
+    return notes
 
 
 def _input(prompt: str) -> str:
@@ -2692,7 +2744,7 @@ def _apply_cockpit(state: dict, ready: list[str]) -> int:
         print("    " + _fg("primary", cmd_line))
     installed = [("tmux block", "source: tmux source-file ~/.tmux.conf")
                  if ex["tmux"] else None,
-                 ("statusline", "~/.local/bin/claude-statusline")
+                 ("statusline", "teamctl statusline (Claude Code)")
                  if ex["statusline"] else None,
                  ("lead mode", "teamctl lead status")
                  if ex["lead"] else None]
@@ -2926,24 +2978,14 @@ def _install_tmux_block(changes: list[tuple[str, str]]) -> None:
 
 
 def _install_statusline(changes: list[tuple[str, str]]) -> None:
-    home = Path.home()
-    dest = home / ".local" / "bin" / "claude-statusline"
-    src: Path | None = Path(__file__).resolve().parent / "claude-statusline"
-    if not src.exists():
-        found = shutil.which("claude-statusline")
-        src = Path(found) if found else None
-    if src is None:
-        print("could not find claude-statusline next to teamctl or on PATH — "
-              "skipping this step.")
-        return
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    if src.resolve() != dest.resolve():
-        shutil.copy2(src, dest)
-    os.chmod(dest, 0o755)
-    print(f"installed {dest}")
-    changes.append((f"installed {dest}", f"rm {dest}"))
+    """Wire Claude Code's statusLine to `teamctl statusline` (since the
+    v0.4.0 fold there is no separate file to copy — the statusline is a
+    teamctl subcommand). Legacy wirings/files are migrated first."""
+    for note in _migrate_legacy_statusline():
+        print(note)
+        changes.append((note, "restore the .bak-teamctl backup"))
 
-    settings_path = home / ".claude" / "settings.json"
+    settings_path = Path.home() / ".claude" / "settings.json"
     if settings_path.exists():
         try:
             data = json.loads(settings_path.read_text())
@@ -2953,9 +2995,14 @@ def _install_statusline(changes: list[tuple[str, str]]) -> None:
             print(f"could not parse {settings_path} — leaving it untouched.")
             print('add this key yourself:  "statusLine": '
                   + json.dumps(STATUSLINE_ENTRY))
+        elif isinstance(data.get("statusLine"), dict) \
+                and data["statusLine"].get("command") \
+                in _our_statusline_commands():
+            print(f"{settings_path} statusLine already runs "
+                  "`teamctl statusline` — nothing to do.")
         elif "statusLine" in data:
-            print(f"{settings_path} already has a statusLine key — "
-                  "leaving it as is.")
+            print(f"{settings_path} already has a (non-teamctl) statusLine "
+                  "key — leaving it as is.")
         else:
             bak = Path(str(settings_path) + ".bak-teamctl")
             shutil.copy2(settings_path, bak)
@@ -3518,6 +3565,70 @@ def cmd_lead(args: argparse.Namespace) -> int:
 
 
 # --------------------------------------------------------------------------
+# `teamctl statusline` — the Claude Code statusLine command. Folded into
+# teamctl in v0.4.0 (previously the separate claude-statusline script):
+# one binary to install, update, and uninstall. Reads the session JSON
+# Claude Code pipes to stdin and prints `model · effort · ctx N%`; the
+# stdin JSON also carries rate_limits.five_hour/seven_day (documented
+# statusLine fields), which are cached for `teamctl usage`. This runs on
+# every Claude Code render, so main() dispatches it BEFORE argparse is
+# even built (~46ms end-to-end, interpreter included — measured).
+# --------------------------------------------------------------------------
+
+def _statusline_dump_usage(data: dict) -> None:
+    """Best-effort cache of rate_limits for `teamctl usage`. Never raises."""
+    try:
+        rl = data.get("rate_limits")
+        if not isinstance(rl, dict):
+            return
+        windows = {}
+        for win in ("five_hour", "seven_day"):
+            w = rl.get(win)
+            if isinstance(w, dict):
+                windows[win] = {"used_percentage": w.get("used_percentage"),
+                                "resets_at": w.get("resets_at")}
+        if not windows:
+            return
+        d = state_path().parent
+        d.mkdir(parents=True, exist_ok=True)
+        path = d / "claude-usage.json"
+        tmp = Path(f"{path}.tmp{os.getpid()}")
+        tmp.write_text(json.dumps({"captured_at": time.time(),
+                                   "rate_limits": windows}))
+        tmp.replace(path)  # atomic: readers never see a partial file
+    except Exception:
+        pass  # the status line must never break over caching
+
+
+def cmd_statusline() -> int:
+    """Print the status line from Claude Code's session JSON on stdin.
+
+    Field sources (documented statusLine JSON): model.display_name;
+    effort.level (the whole object is absent when the model has no effort
+    parameter — "?" is shown); context_window.used_percentage (null early
+    in a session or right after /compact — the segment is omitted rather
+    than a number invented). Never raises."""
+    try:
+        data = json.load(sys.stdin)
+    except Exception:
+        print("claude · ? · ?")
+        return 0
+    if not isinstance(data, dict):
+        print("claude · ? · ?")
+        return 0
+    model = (data.get("model") or {}).get("display_name") or "?"
+    effort = (data.get("effort") or {}).get("level")
+    parts = [model, effort or "?"]
+    pct = (data.get("context_window") or {}).get("used_percentage")
+    if isinstance(pct, (int, float)):
+        parts.append(f"ctx {int(pct)}%")
+    # else: genuinely unknown — do not fabricate a number.
+    print(" · ".join(parts))
+    _statusline_dump_usage(data)
+    return 0
+
+
+# --------------------------------------------------------------------------
 # `teamctl update` — self-update from the recorded install source.
 #
 # install.sh records where this copy came from (install-meta.json in the
@@ -3537,7 +3648,7 @@ def cmd_lead(args: argparse.Namespace) -> int:
 # hang or a stack trace.
 # --------------------------------------------------------------------------
 
-UPDATE_FILES = ("teamctl", "claude-statusline")
+UPDATE_FILES = ("teamctl",)   # one binary since the v0.4.0 statusline fold
 
 UPDATE_CHECK_SECONDS = 24 * 3600      # background check: at most once a day
 
@@ -3728,6 +3839,10 @@ def _apply_update(meta: dict, files: dict[str, str]) -> Path:
     mp = install_meta_path()
     mp.parent.mkdir(parents=True, exist_ok=True)
     mp.write_text(json.dumps(meta, indent=2, sort_keys=True) + "\n")
+    # migrate anything a pre-fold install left behind (old statusline
+    # wiring + orphaned script) — updating IS the migration moment
+    for note in _migrate_legacy_statusline(bin_dir):
+        print(note)
     return bin_dir
 
 
@@ -3918,6 +4033,108 @@ def cmd_update(args: argparse.Namespace) -> int:
           f"in {bin_dir} (via {via})")
     print("config and state untouched (~/.config/agent-team, "
           "~/.local/state/agent-team)")
+    return 0
+
+
+def cmd_uninstall(args: argparse.Namespace) -> int:
+    """Reverse what install.sh and `teamctl init` set up: the installed
+    binary (plus a legacy claude-statusline), the ~/.tmux.conf marker
+    block, our statusLine wiring, and the install/update metadata —
+    backups first, exactly like the installer made them. Config, state,
+    and lead mode are left in place, with their removal commands printed
+    (`teamctl lead off` reverses lead mode on its own)."""
+    meta = load_install_meta() or {}
+    bin_dir = Path(str(meta.get("bin_dir") or "~/.local/bin")).expanduser()
+    if not getattr(args, "yes", False):
+        if not _ask_yn(f"remove teamctl from {bin_dir}? [y/N] "):
+            print("nothing removed.")
+            return 0
+
+    removed: list[str] = []
+    left: list[str] = []
+
+    # 1. binaries (claude-statusline is the pre-v0.4.0 companion script)
+    for name in ("teamctl", "claude-statusline"):
+        p = bin_dir / name
+        try:
+            if p.exists():
+                p.unlink()
+                removed.append(str(p))
+        except OSError as exc:
+            left.append(f"{p}: {exc}")
+
+    # 2. tmux marker block
+    conf = Path.home() / ".tmux.conf"
+    try:
+        text = conf.read_text() if conf.exists() else ""
+    except OSError:
+        text = ""
+    if TMUX_MARKER_BEGIN in text:
+        bak = Path(str(conf) + ".bak-teamctl-uninstall")
+        shutil.copy2(conf, bak)
+        kept, skip = [], False
+        for line in text.splitlines(keepends=True):
+            if line.strip() == TMUX_MARKER_BEGIN:
+                skip = True
+                continue
+            if line.strip() == TMUX_MARKER_END:
+                skip = False
+                continue
+            if not skip:
+                kept.append(line)
+        conf.write_text("".join(kept))
+        removed.append(f"teamctl block from {conf} (backup: {bak})")
+        print("if tmux is running, reload the config and reset the options "
+              "the block set:")
+        print("  tmux source-file ~/.tmux.conf")
+        print("  tmux set-option -gu pane-border-status; "
+              "tmux set-option -gu pane-border-format")
+        print("  tmux set-option -gu status-right; "
+              "tmux set-option -gu @teamctl_status_added")
+
+    # 3. statusLine key — only if it points at teamctl (any era)
+    sp = Path.home() / ".claude" / "settings.json"
+    if sp.exists():
+        try:
+            data = json.loads(sp.read_text())
+        except (json.JSONDecodeError, OSError):
+            data = None
+        if not isinstance(data, dict):
+            left.append(f"could not parse {sp}; left untouched")
+        else:
+            sl = data.get("statusLine")
+            if isinstance(sl, dict) \
+                    and sl.get("command") in _our_statusline_commands():
+                bak = Path(str(sp) + ".bak-teamctl-uninstall")
+                shutil.copy2(sp, bak)
+                del data["statusLine"]
+                sp.write_text(json.dumps(data, indent=2) + "\n")
+                removed.append(f"statusLine key from {sp} (backup: {bak})")
+            elif "statusLine" in data:
+                left.append(f"statusLine in {sp} is not teamctl's; "
+                            "left untouched")
+
+    # 4. install/update metadata (written by install.sh / the update check)
+    for p in (install_meta_path(), update_cache_path()):
+        try:
+            if p.exists():
+                p.unlink()
+                removed.append(str(p))
+        except OSError as exc:
+            left.append(f"{p}: {exc}")
+
+    print("teamctl uninstall:")
+    for line in removed:
+        print(f"  removed: {line}")
+    for line in left:
+        print(f"  left alone: {line}")
+    if not removed:
+        print("  nothing to remove.")
+    print("note: lead mode (if installed) reverses with `teamctl lead off` "
+          "— run it BEFORE deleting the binary next time, or remove the "
+          "marker blocks by hand.")
+    print("note: per-user data was left in place; remove it with:")
+    print("  rm -rf ~/.config/agent-team ~/.local/state/agent-team")
     return 0
 
 
@@ -4409,10 +4626,30 @@ def build_parser() -> argparse.ArgumentParser:
                     help="claude|codex|grok (default: all)")
     mo.set_defaults(func=cmd_models)
 
+    slp = sub.add_parser(
+        "statusline",
+        help="Claude Code statusLine command: reads session JSON on stdin, "
+             "prints 'model · effort · ctx N%%' (wired by `teamctl init`)")
+    slp.set_defaults(func=lambda _a: cmd_statusline())
+
+    unp = sub.add_parser(
+        "uninstall",
+        help="remove teamctl's binary, tmux block, statusLine wiring and "
+             "metadata (config/state kept; lead mode via `teamctl lead off`)")
+    unp.add_argument("--yes", action="store_true",
+                     help="do not ask for confirmation")
+    unp.set_defaults(func=cmd_uninstall)
+
     return p
 
 
 def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv[1:]) if argv is None else list(argv)
+    # hot path: the statusline runs on every Claude Code render — skip
+    # argparse construction entirely (it exists as a subparser only so
+    # `--help` documents it)
+    if argv[:1] == ["statusline"]:
+        return cmd_statusline()
     args = build_parser().parse_args(argv)
     try:
         return args.func(args)

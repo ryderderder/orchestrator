@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# teamctl installer — installs `teamctl` and `claude-statusline` into
-# ~/.local/bin (override with TEAMCTL_BIN_DIR). Safe to re-run.
+# teamctl installer — installs `teamctl` into ~/.local/bin (override with
+# TEAMCTL_BIN_DIR). Safe to re-run. Since v0.4.0 the statusline is a
+# `teamctl statusline` subcommand, not a separate script.
 #
 # From a checkout:   ./install.sh
 # One-liner:         curl -fsSL https://raw.githubusercontent.com/ryderderder/teamctl/main/install.sh | bash
@@ -23,7 +24,9 @@ set -euo pipefail
 
 BIN_DIR="${TEAMCTL_BIN_DIR:-$HOME/.local/bin}"
 RAW_BASE="${TEAMCTL_RAW_BASE:-https://raw.githubusercontent.com/ryderderder/teamctl/main}"
-FILES=(teamctl claude-statusline)
+# One binary since v0.4.0: the statusline is a `teamctl statusline`
+# subcommand, not a separate script.
+FILES=(teamctl)
 UNAME_S="$(uname -s 2>/dev/null || echo unknown)"
 
 # ---- native Windows: not supported (teamctl needs tmux) -------------------
@@ -103,6 +106,11 @@ for f in "${FILES[@]}"; do
   fi
   chmod +x "$BIN_DIR/$f"
 done
+
+# A pre-v0.4.0 install may have left a separate claude-statusline script;
+# `teamctl init` / `teamctl update` migrate the settings.json wiring and
+# remove the orphan, but drop the stale binary here too so the fold is clean.
+rm -f "$BIN_DIR/claude-statusline" 2>/dev/null || true
 
 # ---- record the install source so `teamctl update` knows where to pull ----
 # source=git-clone (checkout with a git remote) | local-copy (plain dir) |
