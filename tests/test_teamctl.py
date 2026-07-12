@@ -2460,7 +2460,10 @@ class CursesLiveTests(unittest.TestCase):
     def _capture(self) -> str:
         return self._tmux("capture-pane", "-p").stdout
 
-    def _wait_for(self, needle: str, timeout: float = 20.0) -> str:
+    def _wait_for(self, needle: str, timeout: float = 40.0) -> str:
+        # generous: a cold CI runner can be slow to first-paint a curses UI,
+        # and each test does several of these in sequence (bumped from 20s
+        # after an intermittent ubuntu-runner 'never saw ...' flake).
         import time as _t
         deadline = _t.monotonic() + timeout
         while _t.monotonic() < deadline:
@@ -2472,13 +2475,17 @@ class CursesLiveTests(unittest.TestCase):
 
     def _start(self, teamctl_args: str) -> None:
         # TEAMCTL_NO_KEYCHAIN: the keychain probe reads the *user's*
-        # keychain regardless of HOME — keep the host's real login out
+        # keychain regardless of HOME — keep the host's real login out.
+        # `sleep 300` keeps the session alive well past the multi-step
+        # interaction even on a heavily loaded runner (was `sleep 30`, which
+        # a slow ubuntu runner could outlast mid-test → session died before
+        # the final assertion).
         cmd = (f"env HOME={shlex.quote(str(self.home))} "
                f"PATH={shlex.quote(self.path)} "
                f"TEAMCTL_NO_KEYCHAIN=1 "
                f"TEAMCTL_STATE={shlex.quote(str(self.home / 'state.json'))} "
                f"{shlex.quote(sys.executable)} {shlex.quote(str(TEAMCTL))} "
-               f"{teamctl_args}; sleep 30")
+               f"{teamctl_args}; sleep 300")
         self._tmux("new-session", "-d", "-x", "110", "-y", "35", cmd)
 
     def test_cockpit_renders_in_tmux_and_writes_config(self):
