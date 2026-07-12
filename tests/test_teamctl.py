@@ -1213,13 +1213,21 @@ class LiveTmuxTests(unittest.TestCase):
     treats the window's own first pane as the lead (via TMUX_PANE). This
     keeps test panes out of the user's real window and gives them a
     predictably roomy layout — in a crowded real window, test panes came up
-    tiny and wrapped output made pane-content assertions flaky."""
+    tiny and wrapped output made pane-content assertions flaky.
+
+    State lives in a per-test TEMP DIR, never a fixed path: two suite runs
+    on the same machine used to share tests/.test-live-state.json and the
+    same role names, so one run's tearDown shut down the other run's
+    teammates mid-test (observed live: concurrent agent runs of this suite
+    made each other flaky). Handoff dirs land in the temp dir too, so
+    nothing litters tests/ anymore."""
 
     def setUp(self):
-        self.tmp = HERE / ".test-live-state.json"
+        import tempfile
+        self.statedir = tempfile.TemporaryDirectory(prefix="teamctl-live-")
+        self.tmp = Path(self.statedir.name) / "state.json"
         os.environ["TEAMCTL_STATE"] = str(self.tmp)
-        self.tmp.unlink(missing_ok=True)
-        out = tc.tmux("new-window", "-d", "-n", "teamctl-tests",
+        out = tc.tmux("new-window", "-d", "-n", f"teamctl-tests-{os.getpid()}",
                       "-P", "-F", "#{window_id} #{pane_id}").stdout.split()
         self.window_id, self.lead_pane = out[0], out[1]
         # as generous a canvas as the tmux build allows (no-op pre-2.9)
@@ -1229,18 +1237,17 @@ class LiveTmuxTests(unittest.TestCase):
         os.environ["TMUX_PANE"] = self.lead_pane
 
     def tearDown(self):
-        # best-effort cleanup of any pane we left behind
-        for role in ("t_alpha", "t_beta", "rt_mate", "orphan_mate", "kill_mate",
-                     "d_mate", "sig_mate", "late_mate"):
+        # best-effort cleanup of any pane we left behind (only OUR panes:
+        # the state file is private to this test, so no cross-run damage)
+        for role in list(tc.load_state()["teammates"]):
             tc.main(["shutdown", role])
         tc.tmux("kill-window", "-t", self.window_id, check=False)
         if self._tmux_pane is None:
             os.environ.pop("TMUX_PANE", None)
         else:
             os.environ["TMUX_PANE"] = self._tmux_pane
-        self.tmp.unlink(missing_ok=True)
-        Path(str(self.tmp) + ".tmp").unlink(missing_ok=True)
         os.environ.pop("TEAMCTL_STATE", None)
+        self.statedir.cleanup()
 
     def _active_pane(self) -> str:
         # the ACTIVE pane of the throwaway window (display-message with no -t
