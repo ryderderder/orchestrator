@@ -2716,7 +2716,18 @@ class CursesLiveTests(unittest.TestCase):
                f"TEAMCTL_STATE={shlex.quote(str(self.home / 'state.json'))} "
                f"{shlex.quote(sys.executable)} {shlex.quote(str(TEAMCTL))} "
                f"{teamctl_args}; sleep 300")
-        self._tmux("new-session", "-d", "-x", "110", "-y", "35", cmd)
+        # a loaded runner can lose the nested server's start race (observed
+        # on ubuntu CI: 40s of EMPTY captures — the session never existed).
+        # Confirm the session is up before driving it; retry the start.
+        import time as _t
+        for _attempt in range(3):
+            self._tmux("new-session", "-d", "-x", "110", "-y", "35", cmd)
+            deadline = _t.monotonic() + 10
+            while _t.monotonic() < deadline:
+                if self._tmux("has-session").returncode == 0:
+                    return
+                _t.sleep(0.3)
+        self.fail("the nested tmux session never came up")
 
     def test_cockpit_renders_in_tmux_and_writes_config(self):
         # spec §4: screen 1 models -> screen 2 posture -> screen 3 seal
