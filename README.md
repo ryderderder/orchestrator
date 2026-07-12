@@ -97,6 +97,31 @@ task to a per-teammate handoff directory
 `result --wait` reliable — including failing fast when a teammate dies
 without reporting.
 
+### Lead-agent playbook
+
+If your lead is itself an AI agent (Claude Code, Codex, Grok, …), paste these
+standing rules into its instructions file (`CLAUDE.md`, `AGENTS.md`, or
+equivalent):
+
+```
+Before spinning up a teammate, planning a multi-agent effort, or dispatching
+anything large:
+1. Run `teamctl usage` — real usage %/reset times where the provider exposes
+   them (it also refreshes availability signals as a side effect).
+2. Run `teamctl providers` — which subscriptions are installed, authed, and
+   not currently exhausted (exhaustion signals auto-expire at reset time).
+3. Decide the provider from that live data plus task fit — or use
+   `teamctl route` to auto-pick and dispatch in one step. Capacity changes
+   hour to hour; don't hard-code a choice.
+4. For a live interactive teammate you can also send `/usage` into its pane
+   (`teamctl send <role> "/usage"`, then tmux capture-pane) to read that
+   provider's own account numbers.
+5. Match model and effort to the task — light/cheap for mechanical work,
+   heavyweight for hard reasoning — via --model/--effort, honoring the
+   user's configured defaults. Shut every teammate down
+   (`teamctl shutdown <role>`) the moment its job is done.
+```
+
 ## Configuration
 
 `teamctl init` walks you through everything below, shows exactly what it
