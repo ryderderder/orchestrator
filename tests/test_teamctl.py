@@ -2457,13 +2457,14 @@ class LiveTmuxTests(unittest.TestCase):
         self.assertEqual(status, "done")
         self.assertEqual(code, 0)
 
-    def _wait_pid_gone(self, pid: int, timeout: float = 5.0) -> bool:
+    def _wait_pid_gone(self, pid: int, timeout: float = 15.0) -> bool:
         # A just-SIGKILLed process can linger as an unreaped zombie for a
-        # few ms — `os.kill(pid, 0)` (and so `_pid_alive`) still succeeds
-        # until it is reaped. shutdown DID terminate the tree; asserting
-        # death instantly races that reap. Poll instead: a genuine orphan
-        # (the regression this guards) never dies within the window, so
-        # this still fails loudly on a real leak.
+        # while — `os.kill(pid, 0)` (and so `_pid_alive`) still succeeds
+        # until it is reaped, and a degraded CI runner was observed taking
+        # >5s to reap (teamctl itself had already verified the kill).
+        # Poll generously instead: a genuine orphan (the regression this
+        # guards) never dies within the window, so this still fails
+        # loudly on a real leak — only the failure path waits long.
         import time as _t
         deadline = _t.monotonic() + timeout
         while _t.monotonic() < deadline:
