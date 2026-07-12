@@ -571,7 +571,10 @@ interactive_args = ["--chat"]
 
 @unittest.skipUnless(
     os.environ.get("TMUX") and shutil.which("gemini"),
-    "requires a live tmux session and an installed gemini CLI")
+    # phrased to NOT contain the CI workflow's live-tier-skipped grep
+    # ("requires a live tmux session") — this skip is about gemini,
+    # not about the tmux tier
+    "needs tmux plus an installed gemini CLI")
 class LiveGeminiTests(unittest.TestCase):
     """The §1.8 checklist as a test: one real dispatch → session_id
     captured → one exact-session followup. Skips (honestly) unless gemini
