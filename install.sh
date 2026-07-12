@@ -45,6 +45,18 @@ EOF
     ;;
 esac
 
+# ---- WSL: presents as Linux and is fully supported — say so ---------------
+# (the native-Windows refusal above does NOT catch WSL: uname is Linux.
+# Pure-bash, bash-3.2-safe check — no external tools, so it works however
+# minimal the PATH. TEAMCTL_PROC_VERSION is a test seam only.)
+_pv=""
+{ IFS= read -r _pv || true; } < "${TEAMCTL_PROC_VERSION:-/proc/version}" 2>/dev/null || true
+case "$_pv" in
+  *[Mm]icrosoft*)
+    echo "detected WSL${WSL_DISTRO_NAME:+ ($WSL_DISTRO_NAME)} — proceeding as Linux (supported)."
+    ;;
+esac
+
 RUN_INIT="yes"
 INIT_ARGS=""
 SKIP_DEPS=0

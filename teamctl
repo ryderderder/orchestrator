@@ -332,8 +332,12 @@ def custom_provider_specs() -> dict[str, dict]:
                                         "disabled")
                 sid_regex = ""
             if sid_regex:
+                # a custom text-only CLI may print its id to stdout OR
+                # stderr — scan both artifacts (stderr first)
                 session_source = {"type": "stderr-regex",
-                                  "pattern": sid_regex}
+                                  "pattern": sid_regex,
+                                  "artifacts": ["error.log",
+                                                "result.json"]}
         resume = None
         if resume_args:
             if not any("{session_id}" in t for t in resume_args):
@@ -608,8 +612,16 @@ def provider_auth_state(provider: str) -> tuple[str, str]:
     files = [Path(os.path.expanduser(p))
              for p in (spec.get("auth_files") or [])]
     if not files:
+        # for a CUSTOM provider an env key is a POSITIVE-only signal: its
+        # absence proves nothing (the CLI may hold its own login — a
+        # keyring, its own token store). Only auth_files can prove
+        # signed-out. Stated, never guessed.
+        if env_keys and spec.get("custom"):
+            return "unprobed", (f"auth not probed ({env_keys[0]} not set; "
+                                "the CLI may hold its own login — set "
+                                "auth_files to enable detection)")
         if env_keys:
-            return "signed-out", ""   # its key exists as a signal; unset
+            return "signed-out", ""   # built-in with env-only detection
         note = "auth not probed"
         if spec.get("custom"):
             note += (" (custom provider — set auth_files/auth_env to "
@@ -2272,11 +2284,17 @@ def _extract_session_id(provider: str, hd: Path,
         return None
 
     if src.get("type") == "stderr-regex":
-        m = re.search(src["pattern"], _read("error.log"))
-        if m:
-            sid = (m.group(1) or "").strip()
-            if sid and (not src.get("uuid") or _UUID_RE.fullmatch(sid)):
-                return sid
+        # which artifacts the pattern scans is part of the source spec:
+        # codex deliberately scans ONLY error.log (its banner is the CLI's
+        # own stderr; scanning the model's stdout could capture a merely
+        # quoted id — a guess). Custom text-only providers that print the
+        # id to stdout opt into ["error.log", "result.json"].
+        for artifact in src.get("artifacts") or ("error.log",):
+            m = re.search(src["pattern"], _read(artifact))
+            if m:
+                sid = (m.group(1) or "").strip()
+                if sid and (not src.get("uuid") or _UUID_RE.fullmatch(sid)):
+                    return sid
         if src.get("fallback") == "codex-rollout-glob":
             return _codex_rollout_glob(since)
         return None
@@ -5841,6 +5859,44 @@ def cmd_launch(args: argparse.Namespace) -> int:
 # a sandboxed HOME + monkeypatched `which`.
 # --------------------------------------------------------------------------
 
+def wsl_environment(osrelease: str = "/proc/sys/kernel/osrelease",
+                    version: str = "/proc/version") -> str | None:
+    """'WSL2 (Ubuntu)' / 'WSL (Ubuntu)' / 'WSL2' / None.
+
+    WSL presents as Linux and teamctl is SUPPORTED there — this is
+    awareness (doctor's environment line, the installer's greeting),
+    never gating. Signal: /proc/sys/kernel/osrelease and /proc/version
+    carry 'microsoft' ('…-microsoft-standard-WSL2' on WSL2,
+    '…-Microsoft' on WSL1 — the documented kernel strings).
+    WSL_DISTRO_NAME only NAMES the distro; a stray env var alone must
+    never claim WSL. The paths are parameters purely as a test seam."""
+    text = ""
+    for p in (osrelease, version):
+        try:
+            text += Path(p).read_text()
+        except OSError:
+            continue
+    low = text.lower()
+    if "microsoft" not in low:
+        return None
+    tag = "WSL2" if "wsl2" in low else "WSL"
+    distro = os.environ.get("WSL_DISTRO_NAME", "").strip()
+    return f"{tag} ({distro})" if distro else tag
+
+
+def _check_environment() -> tuple[str, str]:
+    """Where teamctl is running. WSL runs as Linux and is supported; its
+    one genuine rough edge — provider browser sign-ins from a GUI-less
+    shell — gets pre-empted here."""
+    wsl = wsl_environment()
+    if wsl:
+        return "ok", (f"{wsl} — supported, runs as Linux. Provider "
+                      "browser sign-ins open via Windows interop; if one "
+                      "stalls, copy the printed URL into a Windows "
+                      "browser yourself")
+    return "ok", sys.platform
+
+
 def _tmux_version() -> str | None:
     if shutil.which("tmux") is None:
         return None
@@ -5997,6 +6053,7 @@ def _check_state_dir() -> tuple[str, str]:
 
 
 _DOCTOR_CHECKS = (
+    ("environment", _check_environment),
     ("python", _check_python),
     ("tmux", _check_tmux),
     ("providers", _check_providers),

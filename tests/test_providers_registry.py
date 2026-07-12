@@ -467,6 +467,103 @@ session_id_regex = "session:\\\\s*(\\\\S+)"
         self.assertIsNotNone(tc.provider_spec("aider"))
 
 
+# The real-world stress test for the schema: a text-only CLI verified
+# live on 2026-07-12 (Google Antigravity's `agy` 1.1.1) — fixed extra
+# flags beyond the prompt, plain-text output with the id printed rather
+# than structured, exact resume via `--conversation <id>`, env-or-keyring
+# auth, optional model. NOT a shipped preset — a schema-coverage proof.
+TEXT_CLI_BLOCK = """
+[providers.custom.textcli]
+command = "textcli"
+headless_args = ["-p", "{task}", "--dangerously-skip-permissions",
+                 "--print-timeout", "300s"]
+resume_args = ["--conversation", "{session_id}", "-p", "{task}",
+               "--dangerously-skip-permissions", "--print-timeout", "300s"]
+session_id_regex = "conversation=([0-9a-f-]{36})"
+model_args = ["--model", "{model}"]
+auth_env = "TEXTCLI_TOKEN"
+"""
+
+TEXT_SID = "0f0e0d0c-0b0a-0908-0706-050403020100"
+
+
+class TextOnlyProviderShapeTests(_SandboxHome):
+    """The five schema requirements a text-only, resume-by-id CLI needs:
+    fixed extra flags, non-JSON output, resume-by-id, flexible id
+    capture (incl. from STDOUT text), positive-only env auth."""
+
+    INSTALLED = ("textcli",)
+
+    def test_fixed_extra_flags_ride_along(self):
+        self.write_config(TEXT_CLI_BLOCK)
+        a = tc.headless_argv("textcli", TASK, "", "")
+        self.assertEqual(a, ["textcli", "-p", TASK,
+                             "--dangerously-skip-permissions",
+                             "--print-timeout", "300s"])
+
+    def test_resume_by_id_flag(self):
+        self.write_config(TEXT_CLI_BLOCK)
+        a = tc.resume_argv("textcli", TASK, "", "", TEXT_SID)
+        self.assertEqual(a[:2], ["textcli", "--conversation"])
+        self.assertEqual(a[2], TEXT_SID)
+
+    def test_id_captured_from_plain_stdout_text(self):
+        # no JSON anywhere: the id appears inside plain stdout text
+        self.write_config(TEXT_CLI_BLOCK)
+        hd = self.home / "mate"
+        hd.mkdir()
+        (hd / "result.json").write_text(
+            f"Print mode: conversation={TEXT_SID}, sending message\n"
+            "the actual reply text\n")
+        (hd / "error.log").write_text("")
+        self.assertEqual(tc._extract_session_id("textcli", hd), TEXT_SID)
+
+    def test_id_captured_from_stderr_still_wins_first(self):
+        self.write_config(TEXT_CLI_BLOCK)
+        hd = self.home / "mate2"
+        hd.mkdir()
+        (hd / "error.log").write_text(f"conversation={TEXT_SID}, go\n")
+        self.assertEqual(tc._extract_session_id("textcli", hd), TEXT_SID)
+
+    def test_env_auth_is_positive_only_for_customs(self):
+        self.write_config(TEXT_CLI_BLOCK)
+        # unset env: the CLI may hold its own login (keyring) — teamctl
+        # says 'unprobed', keeps it routable (D9), never claims signed-out
+        state, note = tc.provider_auth_state("textcli")
+        self.assertEqual(state, "unprobed")
+        self.assertIn("TEXTCLI_TOKEN not set", note)
+        selected, _, exclusions, _ = tc.route_select(["textcli"])
+        self.assertEqual(selected, "textcli")
+        # set env: positive signal — signed in
+        os.environ["TEXTCLI_TOKEN"] = "tok"
+        try:
+            self.assertEqual(tc.provider_auth_state("textcli")[0],
+                             "signed-in")
+        finally:
+            os.environ.pop("TEXTCLI_TOKEN")
+
+    def test_model_is_optional(self):
+        self.write_config(TEXT_CLI_BLOCK)
+        a = tc.headless_argv("textcli", TASK, "Gemini 3.5 Flash (Low)", "")
+        self.assertEqual(a[-2:], ["--model", "Gemini 3.5 Flash (Low)"])
+        # and a block WITHOUT model_args just ignores the model
+        self.write_config(TEXT_CLI_BLOCK.replace(
+            'model_args = ["--model", "{model}"]\n', ""))
+        tc._warned_custom_blocks.clear()
+        a = tc.headless_argv("textcli", TASK, "whatever", "")
+        self.assertNotIn("whatever", a)
+
+    def test_codex_id_capture_still_stderr_only(self):
+        # the generalized artifact list must NOT loosen codex: an id-like
+        # string in the model's own stdout is a quote, not a session id
+        hd = self.home / "codexmate"
+        hd.mkdir()
+        (hd / "result.json").write_text(
+            f"my session id: {TEXT_SID} — just quoting it\n")
+        (hd / "error.log").write_text("no banner\n")
+        self.assertIsNone(tc._extract_session_id("codex", hd))
+
+
 class CustomProviderValidationTests(_SandboxHome):
     """Malformed blocks are skipped with one honest warning — and can
     never take the built-ins down. Unique names per test: warnings are

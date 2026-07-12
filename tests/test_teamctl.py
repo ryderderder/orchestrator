@@ -987,6 +987,81 @@ class RouteTests(unittest.TestCase):
                 os.environ["TMUX"] = saved
 
 
+class WslDetectionTests(unittest.TestCase):
+    """WSL awareness (never gating): detection off the documented kernel
+    strings, with WSL_DISTRO_NAME as a name refinement only. Honest
+    limitation, recorded: this logic is unit-tested against FAKED /proc
+    fixtures — not field-tested on a real WSL box."""
+
+    WSL2 = "5.15.167.4-microsoft-standard-WSL2\n"
+    WSL1 = "4.4.0-19041-Microsoft\n"
+    PLAIN = "6.8.0-45-generic\n"
+
+    def setUp(self):
+        import tempfile
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmpdir.name)
+        self._distro = os.environ.pop("WSL_DISTRO_NAME", None)
+
+    def tearDown(self):
+        if self._distro is not None:
+            os.environ["WSL_DISTRO_NAME"] = self._distro
+        else:
+            os.environ.pop("WSL_DISTRO_NAME", None)
+        self.tmpdir.cleanup()
+
+    def _probe(self, osrelease=None, version=None):
+        op = self.dir / "osrelease"
+        vp = self.dir / "version"
+        if osrelease is not None:
+            op.write_text(osrelease)
+        if version is not None:
+            vp.write_text(version)
+        return tc.wsl_environment(str(op), str(vp))
+
+    def test_wsl2_detected_with_distro_name(self):
+        os.environ["WSL_DISTRO_NAME"] = "Ubuntu"
+        self.assertEqual(self._probe(osrelease=self.WSL2), "WSL2 (Ubuntu)")
+
+    def test_wsl1_detected(self):
+        self.assertEqual(self._probe(osrelease=self.WSL1), "WSL")
+
+    def test_plain_linux_is_not_wsl(self):
+        self.assertIsNone(self._probe(osrelease=self.PLAIN,
+                                      version="Linux version "
+                                              + self.PLAIN))
+
+    def test_env_var_alone_never_claims_wsl(self):
+        # a stray WSL_DISTRO_NAME (e.g. leaked through ssh) must not
+        # claim WSL without the kernel marker
+        os.environ["WSL_DISTRO_NAME"] = "Ubuntu"
+        self.assertIsNone(self._probe(osrelease=self.PLAIN))
+
+    def test_missing_proc_files_mean_not_wsl(self):
+        self.assertIsNone(self._probe())          # e.g. macOS
+
+    def test_version_file_alone_suffices(self):
+        cap = self._probe(version="Linux version " + self.WSL2)
+        self.assertEqual(cap, "WSL2")
+
+    def test_doctor_environment_line(self):
+        saved = tc.wsl_environment
+        tc.wsl_environment = lambda *a, **k: "WSL2 (Ubuntu)"
+        try:
+            status, detail = tc._check_environment()
+        finally:
+            tc.wsl_environment = saved
+        self.assertEqual(status, "ok")            # supported, not a warn
+        self.assertIn("WSL2 (Ubuntu)", detail)
+        self.assertIn("Windows browser", detail)  # the sign-in pre-empt
+        tc.wsl_environment = lambda *a, **k: None
+        try:
+            status, detail = tc._check_environment()
+        finally:
+            tc.wsl_environment = saved
+        self.assertEqual((status, detail), ("ok", tc.sys.platform))
+
+
 class HeadroomRouteTests(unittest.TestCase):
     """v0.5.0 route-to-headroom: among the survivors, the provider with
     the most remaining quota wins; preference order only breaks ties.
