@@ -503,7 +503,7 @@ On successful write, tear down curses and print a **short post-frame** (reuse Ex
   from here
     teamctl providers
     teamctl spawn reviewer --provider codex
-    teamctl config --menu
+    teamctl settings
 ```
 
 If extras installed, append one line each, still terse:

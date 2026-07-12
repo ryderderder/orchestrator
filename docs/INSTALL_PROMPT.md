@@ -33,8 +33,9 @@ following, in order:
    Code — mechanisms the other CLIs don't have), all reversible with
    `teamctl lead off`. Run it if I say yes.
 
-4. Verify your work: run `teamctl --version`, `teamctl providers`, and
-   `teamctl models`, and show me the output.
+4. Verify your work: run `teamctl doctor` (a health check — python, tmux,
+   provider sign-in states, config, statusline, install source), plus
+   `teamctl --version` and `teamctl providers`, and show me the output.
 
 5. Report what you did, what you skipped and why, and finish by telling me
    my controls:

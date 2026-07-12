@@ -63,7 +63,7 @@ following, in order:
    it detects providers, writes sane defaults, and prints a compact
    summary). Show me that summary, and tell me I can run
    `teamctl init --custom` (rich arrow-key wizard) or
-   `teamctl config --menu` any time to change it. Express uses the
+   `teamctl settings` any time to change it. Express uses the
    detected provider order for routing; if I want a different order, set
    it with `teamctl config routing.preference ...` — never pick it for me.
 

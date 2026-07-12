@@ -3,7 +3,10 @@
 
 Usage:
 
+    teamctl                      # bare: open the default lead session
     teamctl init [--custom] [--yes]
+    teamctl settings
+    teamctl doctor
     teamctl lead on|off|status [--hook] [--cli claude|codex|grok|all]
     teamctl config [<dotted.key> [<value>]] [--menu]
     teamctl models [provider]
@@ -17,6 +20,7 @@ Usage:
     teamctl providers
     teamctl usage [--json] [--probe [provider|all]]
     teamctl update [--check]
+    teamctl uninstall [--yes]
     teamctl shutdown <role>
     teamctl --version
 
@@ -1390,7 +1394,7 @@ def _fmt_age(seconds: float) -> str:
 
 
 def claude_usage() -> dict | None:
-    """Claude 5h/weekly windows, cached by the teamctl claude-statusline.
+    """Claude 5h/weekly windows, cached by `teamctl statusline`.
 
     Claude Code pipes `rate_limits.five_hour/seven_day` (used_percentage,
     resets_at — documented statusLine fields, present for subscribers after
@@ -3684,8 +3688,8 @@ def cmd_statusline() -> int:
 #
 # install.sh records where this copy came from (install-meta.json in the
 # state dir: source, repo, ref, src_dir, bin_dir, version). `update`
-# re-fetches teamctl + claude-statusline from that source and atomically
-# replaces the installed copies; user config (~/.config/agent-team/) and
+# re-fetches teamctl from that source and atomically replaces the
+# installed copy; user config (~/.config/agent-team/) and
 # state are never touched. Reachability degrades honestly, route by route:
 #
 #   git    fetch inside the original checkout, then read the files out of
