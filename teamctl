@@ -1399,14 +1399,17 @@ def _kill_tree(pid: int) -> bool:
         if not any(_pid_alive(p) for p in pids):
             return True
         time.sleep(0.15)
-    # escalate
+    # escalate — and give the reap time to settle: a just-KILLed process
+    # lingers as a zombie (os.kill(pid, 0) still succeeds) until its
+    # parent reaps it, which a loaded machine can take seconds to do.
+    # Success returns early; only the true-failure path waits this long.
     for p in pids:
         if _pid_alive(p):
             try:
                 os.kill(p, 9)
             except (ProcessLookupError, PermissionError):
                 pass
-    for _ in range(4):
+    for _ in range(20):
         if not any(_pid_alive(p) for p in pids):
             return True
         time.sleep(0.15)
@@ -1440,10 +1443,11 @@ def _close_pane(pane_id: str) -> bool:
     if pid is not None and _pid_alive(pid):
         if not _kill_tree(pid):
             return False
-    # now close the (possibly still-open) pane
+    # now close the (possibly still-open) pane; the poll is generous for
+    # the same zombie-reap reason as _kill_tree — success returns early
     if pane_id in live_pane_ids():
         tmux("kill-pane", "-t", pane_id, check=False)
-    for _ in range(4):
+    for _ in range(20):
         pane_gone = pane_id not in live_pane_ids()
         proc_gone = pid is None or not _pid_alive(pid)
         if pane_gone and proc_gone:

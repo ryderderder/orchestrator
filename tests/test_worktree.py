@@ -507,8 +507,8 @@ class WorktreeLiveTests(_WorktreeSandbox):
         # the write landed in the WORKTREE, not the repo
         self.assertTrue((Path(wt["path"]) / "artifact.txt").exists())
         self.assertFalse((self.repo / "artifact.txt").exists())
-        rc, out, _ = self.run_cli("shutdown", "wt_writer")
-        self.assertEqual(rc, 0)
+        rc, out, err = self.run_cli("shutdown", "wt_writer")
+        self.assertEqual(rc, 0, out + err)
         self.assertIn("kept worktree with un-landed work", out)
         rc, out, _ = self.run_cli("land", "wt_writer", "--yes")
         self.assertEqual(rc, 0, out)
