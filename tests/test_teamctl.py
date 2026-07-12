@@ -2875,15 +2875,26 @@ class CursesLiveTests(unittest.TestCase):
         self.assertIn("default chat", cap)              # section headers
         self.assertIn("updates", cap)
         self.assertIn("update mode", cap)
-        # jump to the last row (update mode) and cycle it prompt -> auto
-        for _ in range(14):
+        # jump to the update-mode row (last fixed row, index 13 — the
+        # per-provider rows follow it) and cycle it prompt -> auto
+        for _ in range(13):
             self._tmux("send-keys", "Down")
         self._tmux("send-keys", "Right")
         self._wait_for('"auto"')
+        # v0.5.2: continue into the per-provider rows (the view scrolls to
+        # follow focus) and flip claude's enabled toggle off
+        self._tmux("send-keys", "Down")                 # claude · enabled
+        cap = self._wait_for("enabled")
+        self.assertIn("claude", cap)                    # provider section
+        self._tmux("send-keys", "Right")
+        self._wait_for("false")
         self._tmux("send-keys", "s")                    # save
         self._wait_for("wrote")
-        self.assertIn('mode = "auto"', cfg.read_text())
-        self.assertIn('verbosity = "normal"', cfg.read_text())
+        text = cfg.read_text()
+        self.assertIn('mode = "auto"', text)
+        self.assertIn('verbosity = "normal"', text)
+        self.assertIn("enabled = false", text)          # the toggle landed
+        self.assertIn("[providers.claude]", text)
 
     def test_config_menu_curses_cycles_and_saves(self):
         cfg = self.home / ".config" / "agent-team" / "config.toml"

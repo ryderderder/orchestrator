@@ -71,7 +71,7 @@ try:
 except Exception:  # pragma: no cover - platforms without curses
     curses = None
 
-VERSION = "0.5.1"
+VERSION = "0.5.2"
 
 # --------------------------------------------------------------------------
 # the provider-spec registry — every provider, built-in OR user-defined via
@@ -437,6 +437,30 @@ def provider_supports_effort(name: str) -> bool:
     return bool((provider_spec(name) or {}).get("effort_args"))
 
 
+def _enabled_key(name: str) -> str:
+    return f"providers.{name}.enabled"
+
+
+def provider_enabled(name: str) -> bool:
+    """[providers.<p>] enabled (default TRUE) — the user's kill switch per
+    provider, living beside the model/effort prefs (for a custom provider
+    too: [providers.custom.<n>] DEFINES it, [providers.<n>] holds its
+    runtime prefs). Disabled means: excluded from routing and from
+    --provider defaults, refused when named explicitly (with the
+    re-enable command), but still SHOWN in the providers/usage tables
+    (hiding a configured provider would be dishonest) and its
+    model/effort config preserved."""
+    block = (load_config().get("providers") or {}).get(name) or {}
+    raw = block.get("enabled", True) if isinstance(block, dict) else True
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() not in ("false", "0", "no", "off")
+
+
+def _disabled_hint(name: str) -> str:
+    return (f"re-enable: teamctl config {_enabled_key(name)} true")
+
+
 class TeamctlError(Exception):
     """A user-facing failure; main() renders it to stderr with a clean exit."""
 
@@ -667,9 +691,10 @@ def provider_defaults(provider: str) -> tuple[str | None, str | None]:
 
 
 def available_providers() -> list[str]:
-    """Installed AND logged-in routable providers, in registry order."""
+    """Enabled, installed AND logged-in routable providers, registry order."""
     return [p for p in routable_providers()
-            if provider_installed(p) and provider_authed(p)]
+            if provider_enabled(p) and provider_installed(p)
+            and provider_authed(p)]
 
 
 def default_provider() -> str | None:
@@ -679,7 +704,10 @@ def default_provider() -> str | None:
     several (or none), there is NO default — the caller must ask the user."""
     pref = (load_config().get("routing") or {}).get("preference")
     if isinstance(pref, list) and pref:
-        return str(pref[0])
+        for p in pref:
+            if provider_enabled(str(p)):
+                return str(p)
+        return None    # every preferred provider is disabled — the caller asks
     avail = available_providers()
     if len(avail) == 1:
         return avail[0]
@@ -693,6 +721,12 @@ def _provider_or_fail(requested: str) -> str | None:
         if provider_spec(requested) is None:
             print(f"teamctl: unknown provider '{requested}' (known: "
                   f"{', '.join(known_provider_names())}).", file=sys.stderr)
+            return None
+        if not provider_enabled(requested):
+            # refuse, don't guess: disabling was the user's own choice and
+            # the undo is one flip away
+            print(f"teamctl: provider '{requested}' is disabled in your "
+                  f"config — {_disabled_hint(requested)}.", file=sys.stderr)
             return None
         return requested
     prov = default_provider()
@@ -3215,7 +3249,9 @@ def cmd_usage(args: argparse.Namespace) -> int:
             return rc
     now = time.time()
 
-    states = {prov: provider_state(prov) for prov in routable_providers()}
+    states = {prov: (("disabled", _disabled_hint(prov))
+                     if not provider_enabled(prov) else provider_state(prov))
+              for prov in routable_providers()}
     live = {prov for prov, (st, _n) in states.items()
             if st in ("ready", "quiet")}
 
@@ -3267,6 +3303,9 @@ def cmd_usage(args: argparse.Namespace) -> int:
     print(f"{'PROVIDER'.ljust(width)}  USAGE")
     for prov in states:
         state, note = states[prov]
+        if state == "disabled":
+            print(f"{prov.ljust(width)}  disabled — {note}")
+            continue
         if state == "not installed":
             print(f"{prov.ljust(width)}  not installed"
                   + (f" — {note}" if note else ""))
@@ -3334,6 +3373,9 @@ def cmd_providers(args: argparse.Namespace) -> int:
 
     rows: list[tuple[str, str, str]] = []
     for prov in routable_providers():
+        if not provider_enabled(prov):
+            rows.append((prov, "disabled", _disabled_hint(prov)))
+            continue
         state, note = provider_state(prov)
         details: list[str] = []
         if state == "quiet" and note.startswith("auth not probed"):
@@ -3420,6 +3462,9 @@ def route_select(requested: list[str] | None = None
     for prov in candidates:
         if prov not in routable:
             exclusions[prov] = "unknown"
+            continue
+        if not provider_enabled(prov):
+            exclusions[prov] = "disabled"
             continue
         if not provider_installed(prov):
             exclusions[prov] = "not installed"
@@ -3697,6 +3742,53 @@ def _render_config(providers_cfg: dict[str, dict[str, str]], verbosity: str,
 CLAUDE_MODEL_ALIASES = ("sonnet", "opus", "haiku", "fable")
 
 EFFORT_CHOICES = ("low", "medium", "high", "xhigh")
+
+# claude's accepted --effort values, VERIFIED from the installed CLI's own
+# --help ("Effort level for the current session (low, medium, high,
+# xhigh, max)", 2026-07-12)
+CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+
+
+def _codex_effort_choices(model: str = "") -> list[str]:
+    """Effort levels codex actually supports, from its models cache: the
+    configured model's own list when known, else the union across cached
+    models, else the generic suggestions. Free text always remains open
+    (Enter in the cockpit) — the CLI stays the validator."""
+    cached = _codex_models_cache()
+    if not cached:
+        return list(EFFORT_CHOICES)
+    models, _fetched = cached
+    if model:
+        for m in models:
+            if m.get("slug") == model:
+                levels = [str(lv["effort"]) for lv in
+                          (m.get("supported_reasoning_levels") or [])
+                          if isinstance(lv, dict) and lv.get("effort")]
+                if levels:
+                    return levels
+    seen: list[str] = []
+    for m in models:
+        for lv in (m.get("supported_reasoning_levels") or []):
+            if isinstance(lv, dict) and lv.get("effort") \
+                    and str(lv["effort"]) not in seen:
+                seen.append(str(lv["effort"]))
+    return seen or list(EFFORT_CHOICES)
+
+
+def _effort_choices_for(provider: str, model: str = "") -> list[str] | None:
+    """Cycle choices for a provider's effort setting — only values the CLI
+    is known to accept (claude: enumerated in its --help; codex: from its
+    models cache, per-model when possible). Providers whose accepted set
+    is NOT enumerated anywhere (grok — its help documents the flag but no
+    values) get the generic suggestions; the cockpit's Enter key is
+    always the free-text escape. None = no effort control at all."""
+    if not provider_supports_effort(provider):
+        return None
+    if provider == "claude":
+        return list(CLAUDE_EFFORTS)
+    if provider == "codex":
+        return _codex_effort_choices(model)
+    return list(EFFORT_CHOICES)
 
 VOICE_CHOICES = ("terse", "normal", "detailed")
 
@@ -5740,6 +5832,11 @@ def _resolve_chat() -> tuple[str | None, str, str, str]:
                               "not a known provider — fix it with `teamctl "
                               "settings` or `teamctl config lead.chat_provider "
                               f"{'|'.join(routable_providers())}`.")
+    if prov and not provider_enabled(prov):
+        return None, "", "", (f"[lead] chat_provider '{prov}' is disabled in "
+                              f"your config — {_disabled_hint(prov)}, or pick "
+                              "another with `teamctl config "
+                              "lead.chat_provider <name>`.")
     if not prov:
         prov = default_provider()
     if prov is None:
@@ -5947,7 +6044,9 @@ def _check_tmux() -> tuple[str, str]:
 
 
 def _check_providers() -> tuple[str, str]:
-    states = {p: provider_state(p)[0] for p in routable_providers()}
+    states = {p: ("disabled" if not provider_enabled(p)
+                  else provider_state(p)[0])
+              for p in routable_providers()}
     usable = [p for p, s in states.items() if s in ("ready", "quiet")]
     locked = [p for p, s in states.items() if s == "locked out"]
     if usable:
@@ -6267,11 +6366,21 @@ _MENU_ENUMS: dict[str, tuple[str, ...]] = {
 
 
 def _menu_choices(key: str, val) -> list | None:
-    """Cycle options for a config key, or None for free-text editing."""
+    """Cycle options for a config key, or None for free-text editing.
+    Provider model/effort keys offer only what the CLI is known to accept
+    (live discovery / verified enumerations); Enter remains the free-text
+    escape hatch everywhere — the provider CLI stays the validator."""
     if key in _MENU_ENUMS:
         return list(_MENU_ENUMS[key])
-    if key.startswith("providers.") and key.endswith(".effort"):
-        return list(EFFORT_CHOICES)
+    parts = key.split(".")
+    if len(parts) == 3 and parts[0] == "providers":
+        prov = parts[1]
+        if parts[2] == "effort":
+            model = (provider_defaults(prov)[0] or "")
+            return _effort_choices_for(prov, model) or list(EFFORT_CHOICES)
+        if parts[2] == "model":
+            found = _model_choices(prov)
+            return ["", *found] if found else None   # "" = the CLI's default
     if key == "routing.preference" and isinstance(val, list) \
             and 1 < len(val) <= 3:
         return [list(p) for p in itertools.permutations(val)]
@@ -6528,12 +6637,15 @@ _SETTINGS_ROWS = (
 
 def _settings_value(data: dict, key: str):
     """Effective value for a key: the configured value, else its default.
-    Per-provider model/effort default to '' (the CLI's own default)."""
+    Per-provider model/effort default to '' (the CLI's own default);
+    per-provider enabled defaults to True."""
     v = _get_dotted(data, key)
     if v is not _MISSING:
         return v
     if key in _SETTINGS_DEFAULTS:
         return _SETTINGS_DEFAULTS[key]
+    if key.startswith("providers.") and key.endswith(".enabled"):
+        return True
     return ""   # per-provider model/effort: unset means the CLI's default
 
 
@@ -6546,14 +6658,20 @@ def settings_catalog(data: dict) -> list[dict]:
         val = _settings_value(data, key)
         rows.append({"key": key, "section": section, "label": label,
                      "value": val, "choices": _menu_choices(key, val)})
-    # per-provider model + effort, only for providers the user actually has
-    # configured (init writes a [providers.<p>] block per ready provider).
-    # "custom" is the [providers.custom.*] table, not a provider itself;
-    # an effort row is omitted when the CLI has no effort control.
-    for prov in sorted((data.get("providers") or {})):
-        if prov == "custom":
-            continue
-        for leaf, lbl in (("model", "model"), ("effort", "effort")):
+    # per-provider control for EVERY routable provider (v0.5.2): enabled
+    # toggle, model pick (live discovery + free-text escape), and an
+    # effort pick only where the CLI genuinely has effort control —
+    # values restricted to what each CLI is known to accept. Providers
+    # present in config but no longer routable stay visible too (their
+    # prefs must remain editable). "custom" is the [providers.custom.*]
+    # definition table, not a provider itself.
+    provs = list(routable_providers())
+    for extra in sorted((data.get("providers") or {})):
+        if extra != "custom" and extra not in provs:
+            provs.append(extra)
+    for prov in provs:
+        for leaf, lbl in (("enabled", "enabled"), ("model", "model"),
+                          ("effort", "effort")):
             if leaf == "effort" and not provider_supports_effort(prov):
                 continue
             key = f"providers.{prov}.{leaf}"
@@ -6612,6 +6730,7 @@ def _settings_curses(data: dict) -> int | None:
         _curses_colors()
         g = _ui_glyphs()
         sel = 0
+        scroll = [0]
         while True:
             catalog = settings_catalog(data)
             sel = max(0, min(sel, len(catalog) - 1))
@@ -6625,15 +6744,30 @@ def _settings_curses(data: dict) -> int | None:
                     render.append(("header", row["section"]))
                 render.append(("item", i, row))
             h, w = stdscr.getmaxyx()
-            if h < len(render) + 5 or w < 64:
+            if h < 12 or w < 64:
                 raise _RichUnusable("terminal too small for settings")
+            # the catalog grew per-provider rows in v0.5.2 — the view
+            # SCROLLS instead of demanding a tall terminal: a viewport of
+            # render rows that follows the focused item, with more-above/
+            # more-below markers.
+            body_h = h - 4
+            fidx = next(i for i, r in enumerate(render)
+                        if r[0] == "item" and r[1] == sel)
+            if fidx < scroll[0]:
+                scroll[0] = max(0, fidx - 1)
+            if fidx >= scroll[0] + body_h:
+                scroll[0] = fidx - body_h + 1
+            scroll[0] = max(0, min(scroll[0], max(0, len(render) - body_h)))
             stdscr.erase()
             _addstr(stdscr, 0, 1, "teamctl", _cattr("primary") | curses.A_BOLD)
             _addstr(stdscr, 0, 9, f"{g['dot']}  settings", _cattr("accent"))
             _addstr(stdscr, 1, 1, str(config_path()), _cattr("dim"))
+            if scroll[0] > 0:
+                _addstr(stdscr, 1, w - 10, f"{g['more']} above",
+                        _cattr("dim"))
             y = 3
             bar_w = min(w - 4, 84)
-            for r in render:
+            for r in render[scroll[0]:scroll[0] + body_h]:
                 if r[0] == "header":
                     _addstr(stdscr, y, 1, r[1], _cattr("soft") | curses.A_BOLD)
                     y += 1
@@ -6655,6 +6789,8 @@ def _settings_curses(data: dict) -> int | None:
                     + ("←/→ or space cycle   " if cyc else "space toggle   ")
                     + "enter edit   s save   q quit"
                     + ("   (unsaved)" if dirty[0] else ""))
+            if scroll[0] + body_h < len(render):
+                foot += f"   {g['more']} below"
             _addstr(stdscr, h - 1, 1, foot, _cattr("dim"))
             stdscr.refresh()
 

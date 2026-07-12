@@ -344,6 +344,7 @@ No id captured → `followup` refuses. That is correct behavior; see R11.
 |---|---|---|
 | `routing.preference` | comma list, e.g. `codex,claude` | headroom tiebreak (default strategy) / the whole ranking (`strategy = preference`); bare spawn/dispatch use the first entry |
 | `routing.strategy` | `headroom` \| `preference` | how survivors are ranked (default `headroom`) |
+| `providers.<p>.enabled` | bool (default `true`) | false = out of routing/defaults, refused even when named (with the re-enable command); tables still show it; prefs preserved |
 | `providers.<p>.model` | id or empty | default `--model` (empty = CLI's own default) |
 | `providers.<p>.effort` | e.g. `high` | default `--effort` (never written for effort-less CLIs) |
 | `providers.custom.<name>.*` | see §8 | bring-your-own-CLI block |

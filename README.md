@@ -770,6 +770,9 @@ delegation = "ask"          # ask | always | manual — how eagerly a lead
                             # agent hands work to teammates (see Lead mode)
 
 [providers.claude]
+enabled = true              # false: out of routing and defaults (refused
+                            # even when named, with the re-enable command;
+                            # still shown in the tables; prefs preserved)
 model = "opus"              # default --model for claude teammates
 effort = "high"             # default --effort
 
@@ -830,9 +833,16 @@ in `~/.local/state/agent-team/state.json` (override with `$TEAMCTL_STATE`).
 **`teamctl settings`** is the human face: a re-runnable dark-room cockpit
 (the same aesthetic as `init --custom`) over the whole config, grouped
 into sections — default chat, routing order and strategy, worktrees,
-posture, layout, updates, and per-provider model/effort. ↑/↓ move, Space
-or ←/→ cycle a choice (delegation, update mode, effort, booleans…), Enter
-free-edits anything, `s` saves (atomic, with a backup), `q` quits with a
+posture, layout, updates, and **per-provider control for every routable
+provider**: an enable/disable toggle (disabled = out of routing and
+defaults, refused even when named — with the re-enable command — but
+still shown honestly in the tables, prefs preserved), a model pick fed
+by live discovery, and an effort pick offering only the values each CLI
+is known to accept (claude's five documented levels; codex's per-model
+list from its cache; suggestions for grok; nothing for gemini, which has
+no effort flag). ↑/↓ move (the view scrolls), Space or ←/→ cycle a
+choice, Enter free-edits anything (the model escape hatch — ids pass
+through verbatim), `s` saves (atomic, with a backup), `q` quits with a
 dirty-state confirm. Without a TTY it degrades to printing the current
 values plus the matching `teamctl config` one-liner for each — the
 scriptable path spelled out.
