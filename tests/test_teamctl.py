@@ -271,6 +271,154 @@ class LayoutTests(unittest.TestCase):
                          [("resize-pane", "-t", "%5", "-x", "33%")])
 
 
+class ParseProbeTests(unittest.TestCase):
+    """Defensive scraping of observed-only TUI usage text."""
+
+    def test_parse_grok_like_output(self):
+        text = ("some ui chrome\nWeekly limit: 18%\n"
+                "Session (5h) limit: 40.5% used\n"
+                "Next reset: July 13, 11:33 PT\n")
+        r = tc.parse_probe_text(text)
+        self.assertEqual(r["windows"]["weekly"]["used_percent"], 18.0)
+        self.assertEqual(r["windows"]["5h"]["used_percent"], 40.5)
+        self.assertTrue(any("July 13" in n for n in r["reset_notes"]))
+
+    def test_parse_ignores_unrelated_percentages_and_garbage(self):
+        self.assertEqual(tc.parse_probe_text("")["windows"], {})
+        self.assertEqual(tc.parse_probe_text("progress: 50%")["windows"], {})
+        r = tc.parse_probe_text("token usage garbage\n7-day limit: 73%\n")
+        self.assertEqual(r["windows"]["weekly"]["used_percent"], 73.0)
+
+    def test_parse_codex_like_percent_left_is_inverted(self):
+        # codex /status phrases windows as remaining, e.g. "27% left"
+        # (live-verified: complementary to its session-log used_percent)
+        text = "5h limit: 100% left\nWeekly limit: 27% left (resets 00:41)\n"
+        r = tc.parse_probe_text(text)
+        self.assertEqual(r["windows"]["5h"]["used_percent"], 0.0)
+        self.assertEqual(r["windows"]["weekly"]["used_percent"], 73.0)
+
+
+class ProbeRunTests(unittest.TestCase):
+    """`usage --probe` orchestration with the probe itself stubbed out."""
+
+    def setUp(self):
+        import tempfile
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmpdir.name)
+        os.environ["TEAMCTL_STATE"] = str(self.dir / "state.json")
+        self._probes = tc.PROBES
+        self._probe = tc.probe_provider
+        self._which = tc.shutil.which
+        tc.PROBES = {"fakeprov": {"argv": ["fakeprov"], "command": "/usage"}}
+        tc.shutil.which = lambda name, *a, **k: (
+            "/fake/bin/fakeprov" if name == "fakeprov" else None)
+
+    def tearDown(self):
+        tc.PROBES = self._probes
+        tc.probe_provider = self._probe
+        tc.shutil.which = self._which
+        os.environ.pop("TEAMCTL_STATE", None)
+        self.tmpdir.cleanup()
+
+    def _usage(self, *extra):
+        import contextlib
+        import io
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = tc.main(["usage", *extra])
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_probe_all_saves_and_reports_with_freshness(self):
+        tc.probe_provider = lambda prov, spec, timeout=40.0: (
+            {"windows": {"weekly": {"used_percent": 18.0}},
+             "reset_notes": ["Next reset: July 13, 11:33 PT"]}, "")
+        rc, out, _ = self._usage("--probe")
+        self.assertEqual(rc, 0)
+        self.assertIn("probing fakeprov", out)
+        self.assertIn("probe ok — weekly 18%", out)
+        self.assertIn("weekly: 18% used", out)              # reported below
+        self.assertIn("July 13", out)
+        cache = json.loads((self.dir / "probe-usage.json").read_text())
+        self.assertEqual(cache["fakeprov"]["source"], "probe")
+        self.assertEqual(
+            cache["fakeprov"]["windows"]["weekly"]["used_percent"], 18.0)
+
+    def test_probe_failure_degrades(self):
+        tc.probe_provider = lambda prov, spec, timeout=40.0: (
+            None, "the TUI never settled")
+        rc, out, _ = self._usage("--probe", "fakeprov")
+        self.assertEqual(rc, 0)
+        self.assertIn("probe failed (the TUI never settled)", out)
+        self.assertFalse((self.dir / "probe-usage.json").exists())
+
+    def test_probe_claude_is_skipped_with_pointer(self):
+        rc, out, _ = self._usage("--probe", "claude")
+        self.assertEqual(rc, 0)
+        self.assertIn("statusline cache", out)
+
+    def test_probe_unknown_provider_rejected(self):
+        rc, _, err = self._usage("--probe", "nope")
+        self.assertEqual(rc, 2)
+        self.assertIn("no probe defined", err)
+
+    def test_stale_probe_data_flagged(self):
+        import time as _t
+        (self.dir / "probe-usage.json").write_text(json.dumps({
+            "fakeprov": {"captured_at": _t.time() - 7200, "source": "probe",
+                         "windows": {"weekly": {"used_percent": 9}},
+                         "reset_notes": []}}))
+        rc, out, _ = self._usage()
+        self.assertEqual(rc, 0)
+        self.assertIn("stale, consider `teamctl usage --probe`", out)
+
+
+@unittest.skipUnless(os.environ.get("TMUX"), "requires a live tmux session")
+class LiveProbeTests(unittest.TestCase):
+    """A real hidden probe against a scripted fake TUI in the detached
+    teamctl-probe session — settle-wait, capture-parse, verified teardown."""
+
+    def setUp(self):
+        import tempfile
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmpdir.name)
+        os.environ["TEAMCTL_STATE"] = str(self.dir / "state.json")
+        self.tui = self.dir / "fake-tui.sh"
+        self.tui.write_text(
+            '#!/bin/bash\n'
+            'echo "FakeTUI ready"\n'
+            'while IFS= read -r line; do\n'
+            '  if [ "$line" = "/usage" ]; then\n'
+            '    echo "Weekly limit: 18% used"\n'
+            '    echo "5h limit: 3% used"\n'
+            '    echo "Next reset: July 13, 11:33 PT"\n'
+            '  fi\n'
+            'done\n')
+        self.tui.chmod(0o755)
+
+    def tearDown(self):
+        tc.tmux("kill-session", "-t", f"={tc.PROBE_SESSION}", check=False)
+        os.environ.pop("TEAMCTL_STATE", None)
+        self.tmpdir.cleanup()
+
+    def test_probe_roundtrip_and_verified_teardown(self):
+        spec = {"argv": ["/bin/bash", str(self.tui)],
+                "command": "/usage", "extra_enters": 1}
+        result, err = tc.probe_provider("fake", spec, timeout=30.0)
+        self.assertEqual(err, "")
+        self.assertEqual(result["windows"]["weekly"]["used_percent"], 18.0)
+        self.assertEqual(result["windows"]["5h"]["used_percent"], 3.0)
+        self.assertTrue(any("July 13" in n for n in result["reset_notes"]))
+        # the hidden session died with its only window — verified teardown
+        self.assertFalse(tc._probe_session_exists())
+
+    def test_probe_failure_when_tui_dies_instantly(self):
+        spec = {"argv": ["/bin/bash", "-c", "exit 0"], "command": "/usage"}
+        result, err = tc.probe_provider("fake", spec, timeout=8.0)
+        self.assertIsNone(result)
+        self.assertTrue(err)
+        self.assertFalse(tc._probe_session_exists())
+
+
 class TmuxMissingTests(unittest.TestCase):
     def test_clean_error_when_tmux_absent(self):
         original = tc.subprocess.run

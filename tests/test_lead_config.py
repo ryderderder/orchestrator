@@ -35,8 +35,15 @@ class ThrowawayHomeTestCase(unittest.TestCase):
         self._home_env = os.environ.get("HOME")
         os.environ["HOME"] = str(self.home)
         self._input = tc._input
+        # pin CLI detection: all three "installed", regardless of the machine
+        # (lead's default --cli set and provider detection read shutil.which)
+        self._which = tc.shutil.which
+        tc.shutil.which = lambda name, *a, **k: (
+            f"/fake/bin/{name}" if name in ("claude", "codex", "grok")
+            else self._which(name))
 
     def tearDown(self):
+        tc.shutil.which = self._which
         tc._input = self._input
         if self._home_env is not None:
             os.environ["HOME"] = self._home_env
@@ -263,7 +270,8 @@ class LeadStatusTests(ThrowawayHomeTestCase):
     def test_status_tracks_each_tier(self):
         rc, out, _ = self.run_cli(["lead", "status"])
         self.assertEqual(rc, 0)
-        self.assertEqual(out.count("not installed"), 3)
+        # skill + three CLI blocks + hook
+        self.assertEqual(out.count("not installed"), 5)
         self.assertIn("Controls", out)                      # discoverability footer
 
         self.assertEqual(self.run_cli(["lead", "on"], answers=["n"])[0], 0)
@@ -271,17 +279,23 @@ class LeadStatusTests(ThrowawayHomeTestCase):
         self.assertEqual(rc, 0)
         st = tc._lead_status()
         self.assertEqual(st, {"skill": "installed",
-                              "claude_md": "installed",
+                              "blocks": {"claude": "installed",
+                                         "codex": "installed",
+                                         "grok": "installed"},
                               "hook": "not installed"})
         self.assertEqual(out.count("not installed"), 1)
 
         self.assertEqual(self.run_cli(["lead", "on", "--hook"])[0], 0)
         st = tc._lead_status()
-        self.assertEqual(set(st.values()), {"installed"})
+        self.assertEqual(st["hook"], "installed")
+        self.assertEqual(st["skill"], "installed")
+        self.assertEqual(set(st["blocks"].values()), {"installed"})
 
         self.assertEqual(self.run_cli(["lead", "off"])[0], 0)
         st = tc._lead_status()
-        self.assertEqual(set(st.values()), {"not installed"})
+        self.assertEqual(st["hook"], "not installed")
+        self.assertEqual(st["skill"], "not installed")
+        self.assertEqual(set(st["blocks"].values()), {"not installed"})
 
     def test_status_reports_unparseable_settings(self):
         self.settings.parent.mkdir(parents=True)
@@ -330,6 +344,213 @@ class InitLeadOfferTests(ThrowawayHomeTestCase):
         self.assertIn(tc.LEAD_MD_BEGIN, self.claude_md.read_text())
         self.assertFalse(self.settings.exists())            # hook declined
         self.assertIn("Summary of changes", out)
+
+
+class LeadMultiCliTests(ThrowawayHomeTestCase):
+    """lead --cli: blocks for codex (~/.codex/AGENTS.md) and grok
+    (~/.grok/AGENTS.md) — both documented global-instructions paths."""
+
+    def test_on_installs_blocks_for_all_detected_clis(self):
+        rc, _, _ = self.run_cli(["lead", "on"], answers=["n"])
+        self.assertEqual(rc, 0)
+        for d, name in ((".claude", "CLAUDE.md"), (".codex", "AGENTS.md"),
+                        (".grok", "AGENTS.md")):
+            text = (self.home / d / name).read_text()
+            self.assertEqual(text.count(tc.LEAD_MD_BEGIN), 1, f"{d}/{name}")
+
+    def test_cli_flag_limits_scope_and_notes_claude_only_tiers(self):
+        # pre-existing codex instructions must survive
+        (self.home / ".codex").mkdir()
+        (self.home / ".codex" / "AGENTS.md").write_text("# my codex rules\n")
+        rc, out, _ = self.run_cli(["lead", "on", "--cli", "codex"])
+        self.assertEqual(rc, 0)
+        codex_md = (self.home / ".codex" / "AGENTS.md").read_text()
+        self.assertIn("# my codex rules", codex_md)
+        self.assertIn(tc.LEAD_MD_BEGIN, codex_md)
+        self.assertFalse(self.claude_md.exists())
+        self.assertFalse(self.skill_md.exists())        # skill is Claude-only
+        self.assertFalse(self.settings.exists())        # hook is Claude-only
+        self.assertIn("Claude Code mechanisms", out)
+        # off --cli grok must not touch the codex block
+        (self.home / ".grok").mkdir()
+        (self.home / ".grok" / "AGENTS.md").write_text(tc.LEAD_CLAUDE_BLOCK)
+        rc, _, _ = self.run_cli(["lead", "off", "--cli", "grok"])
+        self.assertEqual(rc, 0)
+        self.assertFalse((self.home / ".grok" / "AGENTS.md").exists())
+        self.assertIn(tc.LEAD_MD_BEGIN,
+                      (self.home / ".codex" / "AGENTS.md").read_text())
+
+    def test_off_default_cleans_every_cli(self):
+        self.assertEqual(self.run_cli(["lead", "on"], answers=["y"])[0], 0)
+        rc, _, _ = self.run_cli(["lead", "off"])
+        self.assertEqual(rc, 0)
+        for d, name in ((".claude", "CLAUDE.md"), (".codex", "AGENTS.md"),
+                        (".grok", "AGENTS.md")):
+            self.assertFalse((self.home / d / name).exists())
+        self.assertFalse(self.skill_md.parent.exists())
+        self.assertEqual(json.loads(self.settings.read_text()), {})
+
+
+class DefaultProviderTests(ThrowawayHomeTestCase):
+    """--provider is never silently defaulted among several providers."""
+
+    def setUp(self):
+        super().setUp()
+        self._auth = tc.AUTH_PATHS
+        tc.AUTH_PATHS = {p: self.home / f"auth-{p}"
+                         for p in ("claude", "codex", "grok")}
+
+    def tearDown(self):
+        tc.AUTH_PATHS = self._auth
+        super().tearDown()
+
+    def _auth_up(self, *provs):
+        for p in provs:
+            tc.AUTH_PATHS[p].write_text("x")
+
+    def test_config_preference_first_entry_wins(self):
+        self._auth_up("claude", "codex", "grok")
+        self.cfg.parent.mkdir(parents=True)
+        self.cfg.write_text('[routing]\npreference = ["grok", "codex"]\n')
+        rc, out, _ = self.run_cli(["spawn", "r", "--dry-run"])
+        self.assertEqual(rc, 0)
+        self.assertIn("exec grok", out)
+
+    def test_single_available_provider_is_the_default(self):
+        self._auth_up("codex")
+        rc, out, _ = self.run_cli(["spawn", "r", "--dry-run"])
+        self.assertEqual(rc, 0)
+        self.assertIn("exec codex", out)
+
+    def test_multiple_available_means_no_silent_default(self):
+        self._auth_up("claude", "grok")
+        rc, _, err = self.run_cli(["spawn", "r", "--dry-run"])
+        self.assertEqual(rc, 2)
+        self.assertIn("detected: claude, grok", err)
+        self.assertIn("routing.preference", err)
+        rc, _, err = self.run_cli(["dispatch", "r", "--task", "t"])
+        self.assertEqual(rc, 2)
+        self.assertIn("no --provider given", err)
+
+    def test_none_available_says_so(self):
+        rc, _, err = self.run_cli(["spawn", "r", "--dry-run"])
+        self.assertEqual(rc, 2)
+        self.assertIn("detected: none", err)
+
+    def test_bogus_preference_entry_is_reported(self):
+        self._auth_up("claude", "codex")
+        self.cfg.parent.mkdir(parents=True)
+        self.cfg.write_text('[routing]\npreference = ["bogus"]\n')
+        rc, _, err = self.run_cli(["spawn", "r", "--dry-run"])
+        self.assertEqual(rc, 2)
+        self.assertIn("unknown provider", err)
+
+
+class InitRoutingOrderTests(ThrowawayHomeTestCase):
+    """The wizard asks the USER for the auto-routing order."""
+
+    def setUp(self):
+        super().setUp()
+        self._auth = tc.AUTH_PATHS
+        auth_c, auth_x = self.home / "auth-claude", self.home / "auth-codex"
+        auth_c.write_text("x")
+        auth_x.write_text("x")
+        tc.AUTH_PATHS = {"claude": auth_c, "codex": auth_x,
+                         "grok": self.home / "no-grok-auth"}
+
+    def tearDown(self):
+        tc.AUTH_PATHS = self._auth
+        super().tearDown()
+
+    def _config(self):
+        return tomllib.loads(self.cfg.read_text())
+
+    def test_wizard_writes_users_order(self):
+        # claude model/effort, codex model/effort, ROUTING ORDER, verbosity,
+        # tmux n, statusline n, lead default-no (answers exhausted)
+        rc, _, _ = self.run_cli(
+            ["init"], answers=["", "", "", "", "codex, claude", "", "n", "n"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(self._config()["routing"]["preference"],
+                         ["codex", "claude"])
+
+    def test_wizard_drops_unknown_entries(self):
+        rc, out, _ = self.run_cli(
+            ["init"], answers=["", "", "", "", "gpt, codex", "", "n", "n"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(self._config()["routing"]["preference"], ["codex"])
+        self.assertIn("ignoring unknown", out)
+
+    def test_blank_order_falls_back_to_documented_alphabetical(self):
+        rc, out, _ = self.run_cli(
+            ["init"], answers=["", "", "", "", "", "", "n", "n"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(self._config()["routing"]["preference"],
+                         ["claude", "codex"])
+        self.assertIn("arbitrary", out)
+
+    def test_yes_writes_alphabetical_preference(self):
+        rc, _, _ = self.run_cli(["init", "--yes"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(self._config()["routing"]["preference"],
+                         ["claude", "codex"])
+
+
+class ModelsTests(ThrowawayHomeTestCase):
+    def test_codex_models_from_observed_cache(self):
+        cache = self.home / ".codex" / "models_cache.json"
+        cache.parent.mkdir(parents=True)
+        cache.write_text(json.dumps({"fetched_at": "2026-07-12", "models": [
+            {"slug": "gpt-9", "display_name": "GPT-9",
+             "supported_reasoning_levels": [{"effort": "low"},
+                                            {"effort": "high"}]},
+            {"slug": "gpt-9-mini"},
+            "garbage", {"noslug": 1}]}))
+        rc, out, _ = self.run_cli(["models", "codex"])
+        self.assertEqual(rc, 0)
+        self.assertIn("gpt-9  (GPT-9, efforts: low/high)", out)
+        self.assertIn("gpt-9-mini", out)
+        self.assertIn("observed cache", out)
+        self.assertIn("pass through", out)
+        self.assertEqual(tc.discover_models("codex"), ["gpt-9", "gpt-9-mini"])
+
+    def test_codex_without_cache_degrades(self):
+        rc, out, _ = self.run_cli(["models", "codex"])
+        self.assertEqual(rc, 0)
+        self.assertIn("any model id is accepted", out)
+
+    def test_grok_models_passed_through_and_parsed(self):
+        original = tc._grok_models_output
+        tc._grok_models_output = lambda: (
+            "Available models:\n  * grok-4.5 (default)\n  - grok-mini\n")
+        try:
+            rc, out, _ = self.run_cli(["models", "grok"])
+            self.assertEqual(rc, 0)
+            self.assertIn("grok-4.5", out)
+            self.assertIn("passed through", out)
+            self.assertEqual(tc.discover_models("grok"),
+                             ["grok-4.5", "grok-mini"])
+        finally:
+            tc._grok_models_output = original
+
+    def test_grok_models_failure_degrades(self):
+        original = tc._grok_models_output
+        tc._grok_models_output = lambda: None
+        try:
+            rc, out, _ = self.run_cli(["models", "grok"])
+            self.assertEqual(rc, 0)
+            self.assertIn("could not run", out)
+        finally:
+            tc._grok_models_output = original
+
+    def test_claude_models_note_and_unknown_provider(self):
+        rc, out, _ = self.run_cli(["models", "claude"])
+        self.assertEqual(rc, 0)
+        self.assertIn("no model-listing command", out)
+        self.assertIn("sonnet", out)
+        rc, _, err = self.run_cli(["models", "gpt"])
+        self.assertEqual(rc, 2)
+        self.assertIn("unknown provider", err)
 
 
 class ConfigShowSetTests(ThrowawayHomeTestCase):

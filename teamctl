@@ -4,8 +4,9 @@
 Usage:
 
     teamctl init [--yes]
-    teamctl lead on|off|status [--hook]
+    teamctl lead on|off|status [--hook] [--cli claude|codex|grok|all]
     teamctl config [<dotted.key> [<value>]] [--menu]
+    teamctl models [provider]
     teamctl spawn <role> [--provider claude|codex|grok|shell] [--prompt TEXT] [--cwd DIR]
     teamctl list
     teamctl send <role> "<instruction>" [--no-enter]
@@ -14,7 +15,7 @@ Usage:
     teamctl followup <role> --task "…"
     teamctl route <role> --task "…" [--providers claude,codex,grok] [--dry-run]
     teamctl providers
-    teamctl usage
+    teamctl usage [--json] [--probe [provider|all]]
     teamctl shutdown <role>
     teamctl --version
 
@@ -37,6 +38,7 @@ import argparse
 import fcntl
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -106,6 +108,51 @@ def load_config() -> dict:
 def provider_defaults(provider: str) -> tuple[str | None, str | None]:
     prov = (load_config().get("providers") or {}).get(provider) or {}
     return prov.get("model"), prov.get("effort")
+
+
+def available_providers() -> list[str]:
+    """Installed AND logged-in providers, in (arbitrary) alphabetical order."""
+    return [p for p in ROUTABLE
+            if shutil.which(p) is not None and AUTH_PATHS[p].exists()]
+
+
+def default_provider() -> str | None:
+    """Provider used when --provider is omitted. teamctl has no opinion of
+    its own: the first entry of the user's [routing] preference wins; with
+    no preference configured, the single available provider is used; with
+    several (or none), there is NO default — the caller must ask the user."""
+    pref = (load_config().get("routing") or {}).get("preference")
+    if isinstance(pref, list) and pref:
+        return str(pref[0])
+    avail = available_providers()
+    if len(avail) == 1:
+        return avail[0]
+    return None
+
+
+def _provider_or_fail(requested: str) -> str | None:
+    """--provider value -> provider, or None after printing why (exit 2).
+    Never silently picks among several providers: that choice is the user's."""
+    if requested:
+        if requested not in PROVIDERS:
+            print(f"teamctl: unknown provider '{requested}'.", file=sys.stderr)
+            return None
+        return requested
+    prov = default_provider()
+    if prov is not None:
+        if prov not in PROVIDERS:
+            print(f"teamctl: routing.preference starts with unknown provider "
+                  f"'{prov}' — fix it with `teamctl config routing.preference "
+                  "...`.", file=sys.stderr)
+            return None
+        return prov
+    avail = available_providers()
+    print("teamctl: no --provider given and no default is configured "
+          f"(detected: {', '.join(avail) if avail else 'none'}). "
+          "Pass --provider, or set your order once with: "
+          'teamctl config routing.preference "<first>,<second>,..."',
+          file=sys.stderr)
+    return None
 
 
 def headless_argv(provider: str, task: str, model: str, effort: str) -> list[str]:
@@ -386,9 +433,10 @@ def _set_pane_title(pane_id: str, role: str, model: str = "") -> None:
 
 
 def cmd_spawn(args: argparse.Namespace) -> int:
-    if args.provider not in PROVIDERS:
-        print(f"teamctl: unknown provider '{args.provider}'.", file=sys.stderr)
+    provider = _provider_or_fail(args.provider)
+    if provider is None:
         return 2
+    args.provider = provider
 
     cwd = os.path.abspath(os.path.expanduser(args.cwd)) if args.cwd else os.getcwd()
     d_model, d_effort = provider_defaults(args.provider)
@@ -683,10 +731,10 @@ def _do_dispatch(role: str, provider: str, task: str, context_file: str,
 
 
 def cmd_dispatch(args: argparse.Namespace) -> int:
-    if args.provider not in PROVIDERS:
-        print(f"teamctl: unknown provider '{args.provider}'.", file=sys.stderr)
+    provider = _provider_or_fail(args.provider)
+    if provider is None:
         return 2
-    return _do_dispatch(args.role, args.provider, args.task, args.context_file,
+    return _do_dispatch(args.role, provider, args.task, args.context_file,
                         args.model, args.effort, args.cwd)
 
 
@@ -932,10 +980,312 @@ def claude_usage() -> dict | None:
     return data
 
 
+# --------------------------------------------------------------------------
+# `teamctl models` — best-effort model discovery. Model ids always pass
+# through to the provider CLI verbatim (the CLI is the validator), so new
+# models work without updating teamctl; discovery only powers suggestions.
+# --------------------------------------------------------------------------
+
+def _grok_models_output() -> str | None:
+    """Output of `grok models` (a documented subcommand; its output format is
+    not documented, so it is passed through rather than parsed strictly)."""
+    if shutil.which("grok") is None:
+        return None
+    try:
+        res = subprocess.run(["grok", "models"], capture_output=True,
+                             text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if res.returncode != 0:
+        return None
+    return res.stdout
+
+
+def _codex_models_cache() -> tuple[list[dict], str] | None:
+    """(models, fetched_at) from ~/.codex/models_cache.json. OBSERVED-ONLY:
+    the shape ({'fetched_at', 'models': [{'slug', 'display_name',
+    'supported_reasoning_levels': [{'effort', ...}]}]}) was seen in codex
+    0.144 and is not a documented interface — parsed defensively."""
+    path = Path.home() / ".codex" / "models_cache.json"
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    models = data.get("models") if isinstance(data, dict) else None
+    if not isinstance(models, list):
+        return None
+    return ([m for m in models if isinstance(m, dict)],
+            str(data.get("fetched_at") or "?"))
+
+
+def discover_models(provider: str) -> list[str]:
+    """Best-effort model ids for suggestions; [] whenever unknown."""
+    if provider == "codex":
+        cached = _codex_models_cache()
+        if cached:
+            return [str(m["slug"]) for m in cached[0] if m.get("slug")]
+    if provider == "grok":
+        out = _grok_models_output()
+        if out:
+            ids = []
+            for line in out.splitlines():
+                line = line.strip()
+                if line.startswith(("*", "-")):
+                    parts = line.lstrip("*- ").split()
+                    if parts:
+                        ids.append(parts[0])
+            return ids
+    return []
+
+
+def cmd_models(args: argparse.Namespace) -> int:
+    providers = [args.provider] if args.provider else list(ROUTABLE)
+    for prov in providers:
+        if prov not in ROUTABLE:
+            print(f"teamctl: unknown provider '{prov}'.", file=sys.stderr)
+            return 2
+    for prov in providers:
+        print(f"{prov}:")
+        if prov == "grok":
+            out = _grok_models_output()
+            if out:
+                for line in out.rstrip().splitlines():
+                    print(f"  {line}")
+                print("  (source: `grok models` — documented command, output "
+                      "passed through)")
+            else:
+                print("  could not run `grok models` (not installed, not "
+                      "logged in, or the command failed)")
+        elif prov == "codex":
+            cached = _codex_models_cache()
+            if cached:
+                models, fetched = cached
+                for m in models:
+                    slug = m.get("slug") or "?"
+                    efforts = "/".join(
+                        str(lv["effort"])
+                        for lv in (m.get("supported_reasoning_levels") or [])
+                        if isinstance(lv, dict) and lv.get("effort"))
+                    extra = ", ".join(x for x in (
+                        str(m.get("display_name") or ""),
+                        f"efforts: {efforts}" if efforts else "") if x)
+                    print(f"  {slug}" + (f"  ({extra})" if extra else ""))
+                print(f"  (source: ~/.codex/models_cache.json, fetched "
+                      f"{fetched} — an observed cache, not a documented "
+                      "interface)")
+            else:
+                print("  no local model list found; any model id is accepted "
+                      "(the codex CLI validates it)")
+        elif prov == "claude":
+            print("  the claude CLI has no model-listing command; --model "
+                  "takes a documented")
+            print("  alias (sonnet, opus, haiku, fable) or a full model name. "
+                  "Inside a session,")
+            print("  /model opens the interactive picker.")
+        print()
+    print("model ids pass through to the provider CLI verbatim — new models "
+          "work without updating teamctl.")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# hidden usage probes — run a provider TUI's own usage command inside a
+# detached background tmux session (never the user's window) and scrape the
+# numbers. TUI output is OBSERVED-ONLY text: parse defensively, degrade
+# gracefully, and tear the TUI down with the same process-tree-verified kill
+# used for teammates.
+# --------------------------------------------------------------------------
+
+PROBE_SESSION = "teamctl-probe"
+
+# provider -> how to ask its TUI for usage. claude is deliberately absent:
+# its statusline rate_limits feed (claude-usage.json) is the documented and
+# cheaper source. `command` is typed into the TUI followed by Enter;
+# extra_enters presses Enter again if no numbers appear (menu confirmation).
+PROBES: dict[str, dict] = {
+    "grok": {"argv": ["grok"], "command": "/usage", "extra_enters": 1},
+    "codex": {"argv": ["codex"], "command": "/status", "extra_enters": 1},
+}
+
+
+def _capture_pane(pane_id: str) -> str:
+    try:
+        return tmux("capture-pane", "-p", "-t", pane_id).stdout
+    except subprocess.CalledProcessError:
+        return ""
+
+
+def _probe_session_exists() -> bool:
+    return tmux("has-session", "-t", f"={PROBE_SESSION}",
+                check=False).returncode == 0
+
+
+def _open_probe_pane(launch_line: str) -> str:
+    """A window inside the detached probe session (created on demand):
+    nothing ever appears in the user's own session or window."""
+    if _probe_session_exists():
+        return tmux("new-window", "-d", "-t", PROBE_SESSION, "-P", "-F",
+                    "#{pane_id}", launch_line).stdout.strip()
+    return tmux("new-session", "-d", "-s", PROBE_SESSION, "-x", "220",
+                "-y", "50", "-P", "-F", "#{pane_id}",
+                launch_line).stdout.strip()
+
+
+def _wait_settled(pane_id: str, timeout: float) -> bool:
+    """True once the pane shows non-empty content stable across two polls."""
+    prev = None
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        cur = _capture_pane(pane_id).strip()
+        if cur and cur == prev:
+            return True
+        prev = cur
+        time.sleep(0.4)
+    return False
+
+
+def parse_probe_text(text: str) -> dict:
+    """Scrape usage numbers out of TUI text. Formats are OBSERVED-ONLY (e.g.
+    grok: 'Weekly limit: 18%', 'Next reset: July 13, 11:33 PT'; codex
+    /status output is explicitly unstable), so every field is optional:
+    percentage lines become windows, reset-ish lines are kept verbatim."""
+    windows: dict[str, dict] = {}
+    notes: list[str] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        low = line.lower()
+        m = re.search(r"(\d{1,3}(?:\.\d+)?)\s*%", line)
+        if m and any(k in low for k in ("limit", "usage", "used", "quota")):
+            pct = float(m.group(1))
+            # codex /status phrases these as "N% left" (remaining, not used)
+            if "left" in low or "remaining" in low:
+                pct = max(0.0, 100.0 - pct)
+            if any(k in low for k in ("week", "7d", "7-day", "seven")):
+                label = "weekly"
+            elif any(k in low for k in ("5h", "5-hour", "session", "hour")):
+                label = "5h"
+            else:
+                label = (low.split(":", 1)[0].strip()[:24] or "usage")
+            windows.setdefault(label, {"used_percent": pct})
+        elif "reset" in low and ":" in line:
+            notes.append(line)
+    return {"windows": windows, "reset_notes": notes[:4]}
+
+
+def probe_provider(provider: str, spec: dict, timeout: float = 40.0
+                   ) -> tuple[dict | None, str]:
+    """Run one hidden probe; returns (result, "") or (None, reason). The
+    probe pane is always torn down, verified, before returning."""
+    pane_id = ""
+    try:
+        launch = " ".join(shlex.quote(a) for a in spec["argv"])
+        pane_id = _open_probe_pane(launch)
+        if not pane_id:
+            return None, "could not open a probe pane"
+        if not _wait_settled(pane_id, timeout / 2):
+            return None, "the TUI never settled"
+        tmux("send-keys", "-t", pane_id, "-l", "--", spec["command"],
+             check=False)
+        tmux("send-keys", "-t", pane_id, "C-m", check=False)
+        enters_left = int(spec.get("extra_enters", 0))
+        deadline = time.monotonic() + timeout / 2
+        while time.monotonic() < deadline:
+            time.sleep(1.0)
+            parsed = parse_probe_text(_capture_pane(pane_id))
+            if parsed["windows"]:
+                return parsed, ""
+            if enters_left > 0:  # e.g. a menu needing a confirming Enter
+                tmux("send-keys", "-t", pane_id, "C-m", check=False)
+                enters_left -= 1
+        return None, "no usage numbers appeared before the timeout"
+    except TeamctlError as exc:
+        return None, str(exc)
+    finally:
+        # verified teardown; tmux removes the probe session automatically
+        # once its last window dies.
+        if pane_id and not _close_pane(pane_id):
+            print(f"teamctl: warning: probe pane {pane_id} did not shut "
+                  "down cleanly", file=sys.stderr)
+
+
+def _save_probe_result(provider: str, result: dict) -> None:
+    cache = state_path().parent / "probe-usage.json"
+    try:
+        data = json.loads(cache.read_text()) if cache.exists() else {}
+    except (OSError, json.JSONDecodeError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    entry = {"captured_at": time.time(), "source": "probe"}
+    entry.update(result)
+    data[provider] = entry
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    tmp = cache.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, indent=2))
+    tmp.replace(cache)
+
+
+def load_probe_cache() -> dict:
+    cache = state_path().parent / "probe-usage.json"
+    try:
+        data = json.loads(cache.read_text()) if cache.exists() else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def probe_stale_minutes() -> int:
+    raw = (load_config().get("usage") or {}).get("probe_stale_minutes", 30)
+    try:
+        val = int(raw)
+    except (TypeError, ValueError):
+        val = 30
+    return max(1, val)
+
+
+def _run_probes(which: str) -> int:
+    """Handle `usage --probe [provider|all]`. Returns 2 on a bad target."""
+    if which == "claude":
+        print("claude: probe skipped — the statusline cache is the "
+              "documented, cheaper source (install it via `teamctl init`).")
+        return 0
+    if which == "all":
+        targets = [p for p in PROBES if shutil.which(p)]
+        if not targets:
+            print("no probe-able provider CLI installed.", file=sys.stderr)
+    elif which in PROBES:
+        if shutil.which(which):
+            targets = [which]
+        else:
+            targets = []
+            print(f"{which}: not installed — probe skipped.", file=sys.stderr)
+    else:
+        print(f"teamctl: no probe defined for provider '{which}'.",
+              file=sys.stderr)
+        return 2
+    for prov in targets:
+        print(f"probing {prov} in hidden tmux session '{PROBE_SESSION}'…")
+        result, err = probe_provider(prov, PROBES[prov])
+        if result:
+            _save_probe_result(prov, result)
+            wins = ", ".join(f"{k} {v['used_percent']:.0f}%"
+                             for k, v in result["windows"].items())
+            print(f"{prov}: probe ok — {wins}")
+        else:
+            print(f"{prov}: probe failed ({err})")
+    return 0
+
+
 def cmd_usage(args: argparse.Namespace) -> int:
     """Real provider usage %/reset where the provider exposes it locally.
     Also refreshes routing signals: a provider at 100% on its 5h window is
     marked exhausted so `route` skips it until it resets."""
+    if getattr(args, "probe", ""):
+        rc = _run_probes(args.probe)
+        if rc:
+            return rc
     now = time.time()
     rl = codex_usage()
     codex = {}
@@ -966,6 +1316,9 @@ def cmd_usage(args: argparse.Namespace) -> int:
             _record_provider_signal("claude", "exhausted",
                                     resets_at=fh.get("resets_at"))
 
+    probes = load_probe_cache()
+    stale_after = probe_stale_minutes() * 60
+
     if args.json:
         claude_json = None
         if claude:
@@ -975,8 +1328,14 @@ def cmd_usage(args: argparse.Namespace) -> int:
             "codex": codex or None,
             "claude": claude_json,
             "grok": None,
+            "probes": probes or None,
         }, indent=2))
         return 0
+
+    def _stale_note(age_seconds: float) -> str:
+        if age_seconds > stale_after:
+            return " — stale, consider `teamctl usage --probe`"
+        return ""
 
     print(f"{'PROVIDER':<8}  USAGE")
     if codex:
@@ -986,8 +1345,10 @@ def cmd_usage(args: argparse.Namespace) -> int:
     else:
         print(f"{'codex':<8}  no local usage data found")
     if claude:
-        age = (_fmt_age(now - claude_captured)
-               if isinstance(claude_captured, (int, float)) else "age unknown")
+        if isinstance(claude_captured, (int, float)):
+            age = _fmt_age(now - claude_captured) + _stale_note(now - claude_captured)
+        else:
+            age = "age unknown"
         for label, w in claude.items():
             print(f"{'claude':<8}  {label}: {w['used_percent']:.0f}% used, "
                   f"resets {_fmt_reset(w['resets_at'], now)}")
@@ -995,7 +1356,25 @@ def cmd_usage(args: argparse.Namespace) -> int:
     else:
         print(f"{'claude':<8}  no data yet — run any Claude Code turn with the "
               "teamctl statusline installed (`teamctl init`)")
-    print(f"{'grok':<8}   no local usage data exposed")
+    print(f"{'grok':<8}   no local usage data exposed (probe it: "
+          "`teamctl usage --probe grok`)")
+
+    if probes:
+        print(f"\n{'PROBE':<8}  (TUI-scraped, observed-only formats)")
+        for prov in sorted(probes):
+            entry = probes[prov]
+            if not isinstance(entry, dict):
+                continue
+            cap = entry.get("captured_at")
+            age = (_fmt_age(now - cap) + _stale_note(now - cap)
+                   if isinstance(cap, (int, float)) else "age unknown")
+            windows = entry.get("windows") or {}
+            for label, w in windows.items():
+                if isinstance(w, dict) and w.get("used_percent") is not None:
+                    print(f"{prov:<8}  {label}: {w['used_percent']:.0f}% used "
+                          f"({age})")
+            for note in entry.get("reset_notes") or []:
+                print(f"{prov:<8}  {note}")
     return 0
 
 
@@ -1095,7 +1474,14 @@ def cmd_route(args: argparse.Namespace) -> int:
             print(f"  {prov}: {reason}", file=sys.stderr)
         return 1
 
-    reason = f"first available in preference {'>'.join(preference)}"
+    configured = (load_config().get("routing") or {}).get("preference")
+    if isinstance(configured, list) and configured:
+        reason = f"first available in your preference {'>'.join(preference)}"
+    else:
+        reason = (f"first available in alphabetical order "
+                  f"{'>'.join(preference)} — an arbitrary order, not a "
+                  "recommendation; set yours with `teamctl config "
+                  "routing.preference ...`")
     if exclusions:
         skipped = ", ".join(f"{p}: {r}" for p, r in exclusions.items())
         reason += f"; skipped {skipped}"
@@ -1172,7 +1558,8 @@ def _detect_providers() -> list[tuple[str, bool, bool]]:
             for prov in ROUTABLE]
 
 
-def _render_config(providers_cfg: dict[str, dict[str, str]], verbosity: str) -> str:
+def _render_config(providers_cfg: dict[str, dict[str, str]], verbosity: str,
+                   preference: list[str] | None = None) -> str:
     lines = [
         "# agent-team configuration (written by `teamctl init`)",
         "# Delete this file to fall back to each provider CLI's own defaults.",
@@ -1180,6 +1567,14 @@ def _render_config(providers_cfg: dict[str, dict[str, str]], verbosity: str) -> 
         "[output]",
         f'verbosity = "{_toml_escape(verbosity)}"',
     ]
+    if preference:
+        lines += [
+            "",
+            "[routing]",
+            "# your auto-routing order (also the --provider default);",
+            "# reorder any time: teamctl config routing.preference \"a,b,c\"",
+            f"preference = {_toml_value(list(preference))}",
+        ]
     for prov, vals in providers_cfg.items():
         lines += ["", f"[providers.{prov}]"]
         wrote = False
@@ -1220,12 +1615,37 @@ def cmd_init(args: argparse.Namespace) -> int:
             providers_cfg[prov] = {"model": "", "effort": ""}
             continue
         print(f"{prov}: choose defaults (leave blank to keep the CLI's own default).")
-        model = _ask(f"  default model for {prov}: ")
+        known = discover_models(prov)
+        if known:
+            print(f"  {prov} currently reports: {', '.join(known[:10])}")
+        model = _ask(f"  default model for {prov} (any id works — the CLI validates it): ")
         if prov == "grok":
             print("  note: grok has no persistent effort setting of its own;")
             print("  teamctl passes your choice per invocation via --effort.")
         effort = _ask(f"  default effort for {prov} (e.g. low, medium, high): ")
         providers_cfg[prov] = {"model": model, "effort": effort}
+
+    # -- routing order: the user's, never teamctl's -------------------------
+    preference: list[str] = []
+    if len(available) == 1:
+        preference = list(available)
+    elif len(available) > 1:
+        if args.yes:
+            preference = sorted(available)  # alphabetical: arbitrary, documented
+        else:
+            raw = _ask("Order your providers for auto-routing, best first, "
+                       f"comma-separated [detected: {', '.join(available)}]: ")
+            if raw:
+                chosen = [p.strip() for p in raw.split(",") if p.strip()]
+                unknown = [p for p in chosen if p not in available]
+                if unknown:
+                    print(f"  ignoring unknown/unavailable: {', '.join(unknown)}")
+                preference = [p for p in chosen if p in available]
+            if not preference:
+                preference = sorted(available)
+                print("  no order given — using alphabetical "
+                      f"({' > '.join(preference)}), which is arbitrary; "
+                      "change it any time with `teamctl config routing.preference`.")
 
     verbosity = "normal"
     if not args.yes:
@@ -1242,7 +1662,7 @@ def cmd_init(args: argparse.Namespace) -> int:
         shutil.copy2(cfg_path, cfg_path.with_name("config.toml.bak-teamctl"))
         backed_up = True
     cfg_path.parent.mkdir(parents=True, exist_ok=True)
-    cfg_path.write_text(_render_config(providers_cfg, verbosity))
+    cfg_path.write_text(_render_config(providers_cfg, verbosity, preference))
     print(f"\nwrote {cfg_path}"
           + (" (previous file backed up to config.toml.bak-teamctl)" if backed_up else ""))
     changes.append((
@@ -1331,17 +1751,21 @@ def cmd_init(args: argparse.Namespace) -> int:
                 print(f"created {settings_path} with a statusLine key")
                 changes.append((f"created {settings_path}", f"rm {settings_path}"))
 
-    # -- optional: lead mode (manager identity for a Claude Code lead) ------
+    # -- optional: lead mode (manager identity for a lead agent) ------------
     want_lead = False if args.yes else _ask_yn(
-        "Install lead mode for Claude Code (teamctl lead on)? [y/N] ")
+        "Install lead mode for your agent CLIs (teamctl lead on)? [y/N] ")
     if want_lead:
-        _lead_install_skill(changes)
-        _lead_install_claude_md(changes)
-        if _lead_status()["hook"] == "installed":
-            print("settings.json already has a teamctl-lead hook — skipping.")
-        elif _ask_yn("Also install the per-prompt reminder hook (recommended "
-                     "— survives context compaction)? [Y/n] ", default=True):
-            _lead_install_hook(changes)
+        selected = _lead_selected_clis("")
+        if "claude" in selected:
+            _lead_install_skill(changes)
+        for cli in selected:
+            _lead_install_block(cli, changes)
+        if "claude" in selected:
+            if _lead_status()["hook"] == "installed":
+                print("settings.json already has a teamctl-lead hook — skipping.")
+            elif _ask_yn("Also install the per-prompt reminder hook (recommended "
+                         "— survives context compaction)? [Y/n] ", default=True):
+                _lead_install_hook(changes)
 
     print("\nSummary of changes:")
     for what, revert in changes:
@@ -1410,7 +1834,11 @@ main chat; teammates are tmux panes tiled to your right.
    preferences (`~/.config/agent-team/config.toml`, adjustable via
    `teamctl config`), and task fit — light/cheap models for mechanical
    work, heavyweight for hard reasoning. `teamctl route` automates the
-   pick.
+   pick and `teamctl models` shows what each provider currently offers.
+   Keep the numbers fresh: occasionally run `teamctl usage --probe all`
+   (each provider's own usage command, in a hidden background tmux
+   session the user never sees) — do a check-in before any large
+   dispatch wave.
 3. **Name teammates by role.** Descriptive role names (`code-reviewer`,
    `api-researcher`), one clear deliverable each.
 4. **One owner per file.** Never point two teammates at the same file; use
@@ -1486,6 +1914,35 @@ def _lead_paths() -> dict[str, Path]:
     }
 
 
+# Where each CLI reads GLOBAL instructions (all officially documented):
+# claude: ~/.claude/CLAUDE.md; codex: ~/.codex/AGENTS.md (global scope, read
+# first); grok: ~/.grok/AGENTS.md (global rules, deeper files take
+# precedence). The skill and hook tiers are Claude Code mechanisms with no
+# codex/grok equivalent — that's parity with what each CLI offers, not bias.
+LEAD_BLOCK_FILES: dict[str, tuple[str, str]] = {
+    "claude": (".claude", "CLAUDE.md"),
+    "codex": (".codex", "AGENTS.md"),
+    "grok": (".grok", "AGENTS.md"),
+}
+
+
+def _lead_block_path(cli: str) -> Path:
+    d, name = LEAD_BLOCK_FILES[cli]
+    return Path.home() / d / name
+
+
+def _lead_selected_clis(cli_arg: str) -> list[str]:
+    """--cli value -> CLIs to manage. Default: every detected CLI (falling
+    back to claude when none is on PATH, so `lead on` still does something
+    useful on a bare machine)."""
+    if cli_arg == "all":
+        return list(LEAD_BLOCK_FILES)
+    if cli_arg:
+        return [cli_arg]
+    detected = [c for c in LEAD_BLOCK_FILES if shutil.which(c)]
+    return detected or ["claude"]
+
+
 def _lead_hook_indexes(data: dict) -> list[int]:
     """Indexes of hooks.UserPromptSubmit entries carrying a teamctl-lead hook."""
     entries = (data.get("hooks") or {}).get("UserPromptSubmit")
@@ -1537,8 +1994,8 @@ def _extract_lead_block(text: str) -> str:
     return "".join(out)
 
 
-def _lead_install_claude_md(changes: list[tuple[str, str]]) -> None:
-    cm = _lead_paths()["claude_md"]
+def _lead_install_block(cli: str, changes: list[tuple[str, str]]) -> None:
+    cm = _lead_block_path(cli)
     text = cm.read_text() if cm.exists() else ""
     if LEAD_MD_BEGIN in text:
         current = _extract_lead_block(text)
@@ -1631,14 +2088,14 @@ def _lead_remove_skill(removed: list[str], left: list[str]) -> None:
     removed.append(f"skill dir {sd} (backup: {bak})")
 
 
-def _lead_remove_claude_md(removed: list[str], left: list[str]) -> None:
-    cm = _lead_paths()["claude_md"]
+def _lead_remove_block(cli: str, removed: list[str], left: list[str]) -> None:
+    cm = _lead_block_path(cli)
     if not cm.exists():
-        left.append(f"CLAUDE.md: {cm} not present")
+        left.append(f"{cli} block: {cm} not present")
         return
     text = cm.read_text()
     if LEAD_MD_BEGIN not in text:
-        left.append(f"CLAUDE.md: no teamctl-lead block in {cm}; left untouched")
+        left.append(f"{cli} block: no teamctl-lead block in {cm}; left untouched")
         return
     bak = Path(str(cm) + ".bak-teamctl-off")
     shutil.copy2(cm, bak)
@@ -1693,15 +2150,17 @@ def _lead_remove_hook(removed: list[str], left: list[str]) -> None:
                    f"(backup: {bak}; other settings preserved)")
 
 
-def _lead_status() -> dict[str, str]:
+def _lead_status() -> dict:
     p = _lead_paths()
     skill = "installed" if p["skill_md"].exists() else "not installed"
-    cm = p["claude_md"]
-    try:
-        block_present = cm.exists() and LEAD_MD_BEGIN in cm.read_text()
-    except OSError:
-        block_present = False
-    block = "installed" if block_present else "not installed"
+    blocks: dict[str, str] = {}
+    for cli in LEAD_BLOCK_FILES:
+        f = _lead_block_path(cli)
+        try:
+            present = f.exists() and LEAD_MD_BEGIN in f.read_text()
+        except OSError:
+            present = False
+        blocks[cli] = "installed" if present else "not installed"
     sp = p["settings"]
     if not sp.exists():
         hook = "not installed"
@@ -1714,7 +2173,7 @@ def _lead_status() -> dict[str, str]:
             hook = "unknown (settings.json is not parseable JSON)"
         else:
             hook = "installed" if _lead_hook_indexes(data) else "not installed"
-    return {"skill": skill, "claude_md": block, "hook": hook}
+    return {"skill": skill, "blocks": blocks, "hook": hook}
 
 
 def cmd_lead(args: argparse.Namespace) -> int:
@@ -1722,30 +2181,44 @@ def cmd_lead(args: argparse.Namespace) -> int:
 
     if args.action == "status":
         st = _lead_status()
-        print("lead mode (Claude Code manager identity) — tier status:")
-        print(f"  skill      {st['skill']:<14}  {p['skill_md']}")
-        print(f"  CLAUDE.md  {st['claude_md']:<14}  marker block in {p['claude_md']}")
-        print(f"  hook       {st['hook']:<14}  UserPromptSubmit in {p['settings']}")
+        print("lead mode (manager identity) — tier status:")
+        print(f"  skill         {st['skill']:<14}  {p['skill_md']} "
+              "(Claude Code mechanism)")
+        for cli in LEAD_BLOCK_FILES:
+            print(f"  {cli + ' block':<12}  {st['blocks'][cli]:<14}  "
+                  f"marker block in {_lead_block_path(cli)}")
+        print(f"  hook          {st['hook']:<14}  UserPromptSubmit in "
+              f"{p['settings']} (Claude Code mechanism)")
         _print_controls()
         return 0
 
     if args.action == "on":
+        selected = _lead_selected_clis(args.cli)
         changes: list[tuple[str, str]] = []
-        print("teamctl lead on — install the lead-agent identity for Claude Code.\n")
-        _lead_install_skill(changes)
-        _lead_install_claude_md(changes)
-        if _lead_status()["hook"] == "installed":
-            print(f"{p['settings']} already has a teamctl-lead hook — skipping.")
-            want_hook = False
-        elif args.hook:
-            want_hook = True
+        print("teamctl lead on — install the lead-agent identity "
+              f"({', '.join(selected)}).\n")
+        if "claude" in selected:
+            _lead_install_skill(changes)
+        for cli in selected:
+            _lead_install_block(cli, changes)
+        want_hook = False
+        if "claude" in selected:
+            if _lead_status()["hook"] == "installed":
+                print(f"{p['settings']} already has a teamctl-lead hook — "
+                      "skipping.")
+            elif args.hook:
+                want_hook = True
+            else:
+                print("\nRecommended: a UserPromptSubmit hook echoes a one-line")
+                print("reminder into context on every prompt. It is the strongest")
+                print("tier because it survives context compaction (compaction can")
+                print("drop instruction-file text from a long session; the hook")
+                print("re-injects the rule each turn).")
+                want_hook = _ask_yn("Install the per-prompt reminder hook? [Y/n] ",
+                                    default=True)
         else:
-            print("\nRecommended: a UserPromptSubmit hook echoes a one-line reminder")
-            print("into context on every prompt. It is the strongest tier because")
-            print("it survives context compaction (compaction can drop CLAUDE.md")
-            print("text from a long session; the hook re-injects the rule each turn).")
-            want_hook = _ask_yn("Install the per-prompt reminder hook? [Y/n] ",
-                                default=True)
+            print("(skill and hook tiers are Claude Code mechanisms; the other "
+                  "CLIs have no equivalent — their block is the whole install.)")
         if want_hook:
             _lead_install_hook(changes)
 
@@ -1760,11 +2233,17 @@ def cmd_lead(args: argparse.Namespace) -> int:
         return 0
 
     # off: remove exactly what `on` installed, tolerating partial installs.
+    # Default (and --cli all): clean up everything ever installed.
+    selected = ([args.cli] if args.cli and args.cli != "all"
+                else list(LEAD_BLOCK_FILES))
     removed: list[str] = []
     left: list[str] = []
-    _lead_remove_skill(removed, left)
-    _lead_remove_claude_md(removed, left)
-    _lead_remove_hook(removed, left)
+    if "claude" in selected:
+        _lead_remove_skill(removed, left)
+    for cli in selected:
+        _lead_remove_block(cli, removed, left)
+    if "claude" in selected:
+        _lead_remove_hook(removed, left)
     print("teamctl lead off:")
     for line in removed:
         print(f"  removed: {line}")
@@ -2003,12 +2482,18 @@ def build_parser() -> argparse.ArgumentParser:
     ip.set_defaults(func=cmd_init)
 
     lp2 = sub.add_parser(
-        "lead", help="install/remove the lead-agent (manager) identity for Claude Code")
+        "lead", help="install/remove the lead-agent (manager) identity")
     lp2.add_argument("action", choices=["on", "off", "status"],
-                     help="on: install skill + CLAUDE.md block (+ optional hook); "
-                          "off: remove exactly what on installed; status: report tiers")
+                     help="on: install instruction blocks for your CLIs (plus "
+                          "skill + optional hook for Claude Code); off: remove "
+                          "exactly what on installed; status: report tiers")
+    lp2.add_argument("--cli", default="",
+                     choices=["claude", "codex", "grok", "all"],
+                     help="which CLI's identity to manage (default: every "
+                          "detected CLI for on; everything for off)")
     lp2.add_argument("--hook", action="store_true",
-                     help="with 'on': install the per-prompt reminder hook without asking")
+                     help="with 'on': install the per-prompt reminder hook "
+                          "(Claude Code) without asking")
     lp2.set_defaults(func=cmd_lead)
 
     cp = sub.add_parser("config", help="show or change agent-team preferences")
@@ -2022,7 +2507,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("spawn", help="open a teammate in a new tmux pane")
     sp.add_argument("role", help="descriptive role name, e.g. code-reviewer")
-    sp.add_argument("--provider", default="claude", help="claude|codex|grok|shell")
+    sp.add_argument("--provider", default="",
+                    help="claude|codex|grok|shell (default: first entry of your "
+                         "[routing] preference, or the only detected provider; "
+                         "with several providers and no preference you must "
+                         "choose)")
     sp.add_argument("--prompt", default="", help="initial prompt seeding the session")
     sp.add_argument("--model", default="", help="model for the teammate")
     sp.add_argument("--effort", default="", help="effort/reasoning level")
@@ -2047,7 +2536,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     dsp = sub.add_parser("dispatch", help="hand a teammate a task headlessly (watchable)")
     dsp.add_argument("role")
-    dsp.add_argument("--provider", default="claude", help="claude|codex|grok|shell")
+    dsp.add_argument("--provider", default="",
+                     help="claude|codex|grok|shell (default: first entry of your "
+                          "[routing] preference, or the only detected provider)")
     dsp.add_argument("--task", required=True, help="the task/instruction")
     dsp.add_argument("--context-file", default="", help="file whose contents are appended as context")
     dsp.add_argument("--model", default="", help="override model")
@@ -2070,7 +2561,10 @@ def build_parser() -> argparse.ArgumentParser:
     rt.add_argument("role")
     rt.add_argument("--task", required=True, help="the task/instruction")
     rt.add_argument("--providers", default="",
-                    help="comma-separated candidate providers (default: claude,codex,grok)")
+                    help="comma-separated candidate providers (default: all three; "
+                         "ranked by your [routing] preference — without one the "
+                         "order is alphabetical, which is arbitrary, not a "
+                         "recommendation)")
     rt.add_argument("--model", default="", help="override model")
     rt.add_argument("--effort", default="", help="override effort/reasoning level")
     rt.add_argument("--cwd", default="", help="working directory for the teammate")
@@ -2084,7 +2578,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     up = sub.add_parser("usage", help="show real provider usage %%/reset where exposed")
     up.add_argument("--json", action="store_true")
+    up.add_argument("--probe", nargs="?", const="all", default="",
+                    metavar="PROVIDER",
+                    help="first refresh usage by running the provider TUI's own "
+                         "usage command in a hidden background tmux session "
+                         "(grok /usage, codex /status; claude uses the "
+                         "statusline cache instead). Default: all probe-able")
     up.set_defaults(func=cmd_usage)
+
+    mo = sub.add_parser("models",
+                        help="best-effort model discovery per provider (ids "
+                             "always pass through verbatim — new models need "
+                             "no teamctl update)")
+    mo.add_argument("provider", nargs="?", default="",
+                    help="claude|codex|grok (default: all)")
+    mo.set_defaults(func=cmd_models)
 
     return p
 
