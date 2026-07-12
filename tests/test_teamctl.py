@@ -365,7 +365,7 @@ class VersionTests(unittest.TestCase):
             tc.main(["--version"])
         self.assertEqual(cm.exception.code, 0)
         self.assertIn(tc.VERSION, buf.getvalue())
-        self.assertEqual(tc.VERSION, "0.3.0")
+        self.assertEqual(tc.VERSION, "0.4.0-dev")
 
 
 class CliTests(unittest.TestCase):
@@ -1166,6 +1166,280 @@ class LatticeRenderTests(_LatticeHome):
         rc, out, _ = self._run("usage")
         self.assertEqual(rc, 0)
         self.assertIn("locked out — sign in: `codex login`", out)
+
+
+class UpdateMachineryTests(_LatticeHome):
+    """`teamctl update`: version ordering, install metadata, --check and
+    apply against a mocked source — no network, no real binaries."""
+
+    def setUp(self):
+        super().setUp()
+        self._orig_fetch = None
+
+    def tearDown(self):
+        if self._orig_fetch is not None:
+            tc._fetch_from_source = self._orig_fetch
+        super().tearDown()
+
+    def _write_meta(self, **over):
+        meta = {"source": "curl", "repo": "https://github.com/o/r.git",
+                "raw_base": "", "ref": "main",
+                "bin_dir": str(self.home / "bin"), "version": "0.0.1"}
+        meta.update(over)
+        (self.home / "install-meta.json").write_text(json.dumps(meta))
+        return meta
+
+    def _seed_bin(self, version="0.4.0"):
+        bin_dir = self.home / "bin"
+        bin_dir.mkdir(exist_ok=True)
+        (bin_dir / "teamctl").write_text(
+            f'#!/usr/bin/env python3\nVERSION = "{version}"\n')
+        (bin_dir / "claude-statusline").write_text(
+            "#!/usr/bin/env python3\n# old statusline\n")
+        return bin_dir
+
+    def _mock_fetch(self, teamctl_text, statusline_text="# new statusline\n"):
+        files = {"teamctl": teamctl_text,
+                 "claude-statusline": statusline_text}
+        self._orig_fetch = tc._fetch_from_source
+        tc._fetch_from_source = lambda meta, names: (
+            {n: files[n] for n in names}, "mock", [])
+
+    def test_version_key_ordering(self):
+        k = tc._version_key
+        self.assertGreater(k("0.4.0"), k("0.4.0-dev"))   # release > prerelease
+        self.assertGreater(k("0.4.0-dev"), k("0.3.9"))
+        self.assertGreater(k("0.10.0"), k("0.9.9"))
+        self.assertEqual(k("weird"), (0, 0, 0, 1))       # degrades, not raises
+
+    def test_no_metadata_degrades_honestly(self):
+        rc, _, err = self._run("update", "--check")
+        self.assertEqual(rc, 1)
+        self.assertIn("no install metadata", err)
+        self.assertIn("install.sh", err)
+        self.assertNotIn("Traceback", err)
+
+    def test_check_reports_versions_and_caches(self):
+        self._write_meta()
+        self._seed_bin("0.4.0")
+        self._mock_fetch('VERSION = "0.5.0"\n')
+        rc, out, _ = self._run("update", "--check")
+        self.assertEqual(rc, 0)
+        self.assertIn("installed 0.4.0 · latest 0.5.0 (via mock)", out)
+        self.assertIn("update available", out)
+        cache = json.loads((self.home / "update-check.json").read_text())
+        self.assertEqual(cache["latest"], "0.5.0")
+
+    def test_check_up_to_date(self):
+        self._write_meta()
+        self._seed_bin("0.5.0")
+        self._mock_fetch('VERSION = "0.5.0"\n')
+        rc, out, _ = self._run("update", "--check")
+        self.assertEqual(rc, 0)
+        self.assertIn("up to date", out)
+
+    def test_apply_replaces_binaries_and_preserves_config(self):
+        self._write_meta()
+        bin_dir = self._seed_bin("0.4.0")
+        cfg = self.home / ".config" / "agent-team"
+        cfg.mkdir(parents=True)
+        (cfg / "config.toml").write_text('[output]\nverbosity = "terse"\n')
+        new_teamctl = '#!/usr/bin/env python3\nVERSION = "0.5.0"\n'
+        self._mock_fetch(new_teamctl, "# new statusline\n")
+        rc, out, _ = self._run("update")
+        self.assertEqual(rc, 0)
+        self.assertIn("updated teamctl 0.4.0", out)
+        self.assertIn("0.5.0", out)
+        self.assertEqual((bin_dir / "teamctl").read_text(), new_teamctl)
+        self.assertEqual((bin_dir / "claude-statusline").read_text(),
+                         "# new statusline\n")
+        self.assertTrue(os.access(bin_dir / "teamctl", os.X_OK))
+        # user config byte-for-byte untouched
+        self.assertEqual((cfg / "config.toml").read_text(),
+                         '[output]\nverbosity = "terse"\n')
+        # metadata now records the new version
+        meta = json.loads((self.home / "install-meta.json").read_text())
+        self.assertEqual(meta["version"], "0.5.0")
+
+    def test_apply_refuses_a_broken_download(self):
+        self._write_meta()
+        bin_dir = self._seed_bin("0.4.0")
+        before = (bin_dir / "teamctl").read_text()
+        self._mock_fetch('VERSION = "9.9.9"\ndef broken(\n')
+        rc, _, err = self._run("update")
+        self.assertEqual(rc, 1)
+        self.assertIn("does not compile", err)
+        self.assertNotIn("Traceback", err)
+        self.assertEqual((bin_dir / "teamctl").read_text(), before)
+
+    def test_apply_when_already_current_is_a_noop(self):
+        self._write_meta()
+        bin_dir = self._seed_bin("0.5.0")
+        before = (bin_dir / "teamctl").read_text()
+        self._mock_fetch('VERSION = "0.5.0"\n')
+        rc, out, _ = self._run("update")
+        self.assertEqual(rc, 0)
+        self.assertIn("already up to date", out)
+        self.assertEqual((bin_dir / "teamctl").read_text(), before)
+
+    def test_unreachable_source_lists_reasons_no_traceback(self):
+        self._write_meta()
+        self._seed_bin("0.4.0")
+        self._orig_fetch = tc._fetch_from_source
+        tc._fetch_from_source = lambda meta, names: (
+            None, "", ["curl: offline", "gh: gh not installed"])
+        rc, _, err = self._run("update", "--check")
+        self.assertEqual(rc, 1)
+        self.assertIn("could not reach the install source", err)
+        self.assertIn("curl: offline", err)
+        self.assertIn("installed copy is untouched", err)
+        self.assertNotIn("Traceback", err)
+
+    def test_refresh_cache_flag_is_silent(self):
+        self._write_meta()
+        self._mock_fetch('VERSION = "1.2.3"\n')
+        rc, out, err = self._run("update", "--refresh-cache")
+        self.assertEqual(rc, 0)
+        self.assertEqual(out, "")
+        self.assertEqual(err, "")
+        cache = json.loads((self.home / "update-check.json").read_text())
+        self.assertEqual(cache["latest"], "1.2.3")
+
+    def test_fetch_route_order_follows_recorded_source(self):
+        calls = []
+
+        def probe(name, result=(None, "nope")):
+            def fn(meta, names):
+                calls.append(name)
+                return result
+            return fn
+        saved = (tc._fetch_via_git, tc._fetch_via_gh, tc._fetch_via_curl,
+                 tc._fetch_via_local)
+        tc._fetch_via_git = probe("git")
+        tc._fetch_via_gh = probe("gh")
+        tc._fetch_via_curl = probe("curl")
+        tc._fetch_via_local = probe("local")
+        try:
+            tc._fetch_from_source({"source": "curl"}, ["teamctl"])
+            self.assertEqual(calls, ["curl", "gh"])
+            calls.clear()
+            tc._fetch_from_source({"source": "git-clone"}, ["teamctl"])
+            self.assertEqual(calls, ["git", "gh", "curl"])
+            calls.clear()
+            tc._fetch_from_source({"source": "local-copy"}, ["teamctl"])
+            self.assertEqual(calls, ["local", "git", "gh", "curl"])
+        finally:
+            (tc._fetch_via_git, tc._fetch_via_gh, tc._fetch_via_curl,
+             tc._fetch_via_local) = saved
+
+
+class UpdatePromptTests(_LatticeHome):
+    """The once-a-day cached check and its one unobtrusive line."""
+
+    def _cache(self, latest, ago=0.0):
+        import time as _t
+        (self.home / "update-check.json").write_text(json.dumps(
+            {"checked_at": _t.time() - ago, "latest": latest}))
+
+    def _config(self, text):
+        cfg = self.home / ".config" / "agent-team"
+        cfg.mkdir(parents=True, exist_ok=True)
+        (cfg / "config.toml").write_text(text)
+
+    def test_notice_when_cache_knows_newer(self):
+        self._cache("99.0.0")
+        self.assertEqual(tc._update_notice(),
+                         "teamctl 99.0.0 available — teamctl update")
+
+    def test_no_notice_without_cache_or_when_current(self):
+        self.assertIsNone(tc._update_notice())
+        self._cache(tc.VERSION)
+        self.assertIsNone(tc._update_notice())
+
+    def test_mode_off_silences_the_notice(self):
+        self._cache("99.0.0")
+        self._config('[update]\nmode = "off"\n')
+        self.assertIsNone(tc._update_notice())
+
+    def test_providers_and_usage_print_the_notice_line(self):
+        self._cache("99.0.0")
+        for cmd in ("providers", "usage"):
+            rc, out, _ = self._run(cmd)
+            self.assertEqual(rc, 0)
+            self.assertIn("teamctl 99.0.0 available — teamctl update", out,
+                          cmd)
+
+    def test_express_frame_shows_the_notice(self):
+        self._cache("99.0.0")
+        rc, out, _ = self._run("init")
+        self.assertEqual(rc, 0)
+        self.assertIn("teamctl 99.0.0 available — teamctl update", out)
+
+    def test_auto_mode_applies_at_session_start(self):
+        self._config('[update]\nmode = "auto"\n')
+        self._cache("9.9.9")                      # fresh: no spawn attempt
+        (self.home / "install-meta.json").write_text(json.dumps(
+            {"source": "curl", "bin_dir": str(self.home / "bin")}))
+        bin_dir = self.home / "bin"
+        bin_dir.mkdir()
+        (bin_dir / "teamctl").write_text('VERSION = "0.4.0"\n')
+        new = '#!/usr/bin/env python3\nVERSION = "9.9.9"\n'
+        orig = tc._fetch_from_source
+        tc._fetch_from_source = lambda meta, names: (
+            {n: (new if n == "teamctl" else "# sl\n") for n in names},
+            "mock", [])
+        try:
+            rc, out, _ = self._run("init")
+        finally:
+            tc._fetch_from_source = orig
+        self.assertEqual(rc, 0)
+        self.assertIn("auto-updated teamctl", out)
+        self.assertEqual((bin_dir / "teamctl").read_text(), new)
+
+    def test_init_rerun_preserves_update_settings(self):
+        # the wizard never asks about updates, so re-running it must not
+        # reset the user's choice back to the defaults
+        import tomllib
+        self._config('[update]\ncheck = false\nmode = "off"\n')
+        rc, _, _ = self._run("init", "--yes")
+        self.assertEqual(rc, 0)
+        data = tomllib.loads(
+            (self.home / ".config" / "agent-team" / "config.toml").read_text())
+        self.assertEqual(data["update"], {"check": False, "mode": "off"})
+
+    def test_daily_spawn_respects_cache_and_config(self):
+        import time as _t
+        (self.home / "install-meta.json").write_text(json.dumps(
+            {"source": "curl", "bin_dir": str(self.home / "bin")}))
+        spawned = []
+        orig_popen = tc.subprocess.Popen
+        tc.subprocess.Popen = lambda *a, **k: spawned.append(a) or None
+        try:
+            tc._maybe_spawn_update_check()        # no cache -> spawn
+            self.assertEqual(len(spawned), 1)
+            self.assertIn("--refresh-cache", spawned[0][0])
+            tc._maybe_spawn_update_check()        # cache stamped -> no spawn
+            self.assertEqual(len(spawned), 1)
+            self._cache("1.0.0", ago=2 * 86400)   # stale -> spawn again
+            tc._maybe_spawn_update_check()
+            self.assertEqual(len(spawned), 2)
+            (self.home / "update-check.json").unlink()
+            self._config("[update]\ncheck = false\n")
+            tc._maybe_spawn_update_check()        # disabled -> never
+            self.assertEqual(len(spawned), 2)
+        finally:
+            tc.subprocess.Popen = orig_popen
+
+    def test_check_disabled_never_spawns_even_without_meta_gate(self):
+        self._config('[update]\nmode = "off"\n')
+        spawned = []
+        orig_popen = tc.subprocess.Popen
+        tc.subprocess.Popen = lambda *a, **k: spawned.append(a) or None
+        try:
+            tc._maybe_spawn_update_check()
+            self.assertEqual(spawned, [])
+        finally:
+            tc.subprocess.Popen = orig_popen
 
 
 class InitTests(_AuthSandbox, unittest.TestCase):

@@ -1,4 +1,6 @@
-"""Tests for install.sh's dependency detection/offers and Windows guidance.
+"""Tests for install.sh: dependency detection/offers, Windows guidance,
+the provider detection screen, and the install-source metadata that powers
+`teamctl update`.
 
 Each test runs install.sh in a sandbox: throwaway HOME and bin dir, a
 restricted PATH containing only symlinks to the tools the script needs plus
@@ -8,7 +10,9 @@ answers via TEAMCTL_TTY (the file read instead of /dev/tty).
 Run with:  python3 -m unittest discover -s tests
 """
 
+import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -204,6 +208,43 @@ class InstallShTestCase(unittest.TestCase):
         r = self.run_install("--bogus")
         self.assertEqual(r.returncode, 2)
         self.assertIn("unknown option", r.stderr)
+
+    # ---- install-source metadata for `teamctl update` -----------------------
+
+    def _meta(self):
+        p = (self.home / ".local" / "state" / "agent-team"
+             / "install-meta.json")
+        self.assertTrue(p.exists(), "install-meta.json was not written")
+        return json.loads(p.read_text())
+
+    def test_install_records_source_metadata(self):
+        self.fake_uname("Darwin")
+        r = self.run_install("--no-init", answers="")
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("recorded install source", r.stdout)
+        meta = self._meta()
+        self.assertEqual(meta["bin_dir"], str(self.bin))
+        self.assertEqual(Path(meta["src_dir"]).resolve(),
+                         INSTALL_SH.parent.resolve())
+        # no git in the sandbox PATH -> the checkout counts as a local copy
+        self.assertEqual(meta["source"], "local-copy")
+        # version matches the single source of truth in the teamctl file
+        v = re.search(r'^VERSION = "([^"]+)"',
+                      (INSTALL_SH.parent / "teamctl").read_text(),
+                      re.M).group(1)
+        self.assertEqual(meta["version"], v)
+
+    def test_install_records_git_clone_when_git_available(self):
+        self.fake_uname("Darwin")
+        real_git = shutil.which("git")
+        if not real_git:
+            self.skipTest("requires git")
+        (self.fakebin / "git").symlink_to(real_git)
+        r = self.run_install("--no-init", answers="")
+        self.assertEqual(r.returncode, 0)
+        meta = self._meta()
+        self.assertEqual(meta["source"], "git-clone")
+        self.assertTrue(meta["ref"])            # branch, or HEAD if detached
 
     # ---- provider detection screen ------------------------------------------
 

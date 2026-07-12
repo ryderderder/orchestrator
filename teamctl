@@ -59,7 +59,7 @@ try:
 except Exception:  # pragma: no cover - platforms without curses
     curses = None
 
-VERSION = "0.3.0"
+VERSION = "0.4.0-dev"
 
 # provider -> launch command (as an argv prefix). A positional prompt is
 # appended when supplied. `shell` is a real provider used for verification:
@@ -1873,6 +1873,8 @@ def cmd_usage(args: argparse.Namespace) -> int:
                           f"({age})")
             for note in entry.get("reset_notes") or []:
                 print(f"{prov:<8}  {note}")
+    _maybe_spawn_update_check()
+    _print_update_notice()
     return 0
 
 
@@ -1919,6 +1921,8 @@ def cmd_providers(args: argparse.Namespace) -> int:
     print(f"{'PROVIDER':<8}  STATE")
     for prov, state, detail in rows:
         print(f"{prov:<8}  {state}" + (f" — {detail}" if detail else ""))
+    _maybe_spawn_update_check()
+    _print_update_notice()
     return 0
 
 
@@ -2089,6 +2093,16 @@ def _render_config(providers_cfg: dict[str, dict[str, str]], verbosity: str,
         "[lead]",
         "# how a lead agent decides to delegate: ask | always | manual",
         f'delegation = "{_toml_escape(delegation)}"',
+    ]
+    # the wizard never asks about updates, so re-running it must not reset
+    # the user's choice: carry the settings currently in force forward
+    upd_check, upd_mode = update_settings()
+    lines += [
+        "",
+        "[update]",
+        "# once-a-day background version check; mode: prompt | auto | off",
+        f"check = {'true' if upd_check else 'false'}",
+        f'mode = "{upd_mode}"',
     ]
     if preference:
         lines += [
@@ -2744,6 +2758,9 @@ def _init_express(args: argparse.Namespace) -> int:
     """Zero-question setup: detect providers, lock sane defaults, write the
     config, print one frame (spec §3.3–3.8). `--yes` keeps its scripted
     contract: same writes, no chrome."""
+    # session-start update line — evaluated BEFORE the config write, so the
+    # [update] settings in force when this session started decide it
+    upd_line = None if getattr(args, "yes", False) else _session_update_line()
     rows = _detect_providers()
     ready = _usable(rows)
     providers_cfg = {p: {"model": "", "effort": "high"} for p in ready}
@@ -2794,6 +2811,8 @@ def _init_express(args: argparse.Namespace) -> int:
     out.append("")
     out.append("  " + _fg("dim", f"customize {g['arrow']}  ")
                + _fg("soft", "teamctl init --custom"))
+    if upd_line:
+        out.append("  " + _fg("dim", f"{g['dot']} {upd_line}"))
     print("\n".join(out))
     return 0
 
@@ -2823,6 +2842,7 @@ def _init_custom(args: argparse.Namespace) -> int:
 
 
 def cmd_init(args: argparse.Namespace) -> int:
+    _maybe_spawn_update_check()          # detached + cached; never blocks
     if getattr(args, "custom", False):
         return _init_custom(args)
     return _init_express(args)
@@ -2968,7 +2988,9 @@ provider/model/effort from that live data, the user's preferences
 (~/.config/agent-team/config.toml — see `teamctl config`), and task fit.
 Use descriptive role names; never point two teammates at the same file;
 shut each teammate down (`teamctl shutdown <role>`) the moment its job is
-done — zero idle teammates.
+done — zero idle teammates. Keep the toolchain current: when teamctl or
+any provider CLI reports an available update, surface it to the user
+promptly (e.g. `teamctl update`) instead of silently ignoring it.
 Delegation posture: honor `teamctl config lead.delegation` (ask / always /
 manual; missing = ask). ask = the FIRST time non-trivial work comes up in
 a session, ask once whether to use teamctl agent teams (parallel
@@ -3018,7 +3040,11 @@ main chat; teammates are tmux panes tiled to your right.
    extra teammates as reviewers of a single owner's work.
 5. **Zero idle teammates.** Shut each teammate down the moment its job is
    done (`teamctl shutdown <role>`). No lingering panes.
-6. **The user overrides everything.** The user's explicit instructions
+6. **Keep the toolchain current.** When teamctl or any provider CLI
+   reports an available update, surface it to the user promptly (e.g.
+   `teamctl update`) rather than silently ignoring it — and apply it only
+   with the user's go-ahead.
+7. **The user overrides everything.** The user's explicit instructions
    always take precedence over these rules.
 
 ## Command reference
@@ -3466,6 +3492,410 @@ def cmd_lead(args: argparse.Namespace) -> int:
 
 
 # --------------------------------------------------------------------------
+# `teamctl update` — self-update from the recorded install source.
+#
+# install.sh records where this copy came from (install-meta.json in the
+# state dir: source, repo, ref, src_dir, bin_dir, version). `update`
+# re-fetches teamctl + claude-statusline from that source and atomically
+# replaces the installed copies; user config (~/.config/agent-team/) and
+# state are never touched. Reachability degrades honestly, route by route:
+#
+#   git    fetch inside the original checkout, then read the files out of
+#          FETCH_HEAD — the checkout itself is never moved or dirtied
+#   gh     authenticated GitHub API raw-content fetch (private repos)
+#   curl   raw.githubusercontent.com (public repos)
+#   local  plain file copy from the recorded source dir (local-copy installs)
+#
+# Every subprocess runs with a timeout and GIT_TERMINAL_PROMPT=0 — an
+# unreachable or credential-hungry source produces a reasons list, never a
+# hang or a stack trace.
+# --------------------------------------------------------------------------
+
+UPDATE_FILES = ("teamctl", "claude-statusline")
+
+UPDATE_CHECK_SECONDS = 24 * 3600      # background check: at most once a day
+
+_VERSION_RE = re.compile(r'^VERSION = "([^"]+)"', re.M)
+
+
+def install_meta_path() -> Path:
+    return state_path().parent / "install-meta.json"
+
+
+def load_install_meta() -> dict | None:
+    try:
+        data = json.loads(install_meta_path().read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _version_key(v: str) -> tuple:
+    """Sortable key: '0.4.0' > '0.4.0-dev' > '0.3.9'. Unparseable numeric
+    parts count as 0; any -suffix marks a prerelease of its core."""
+    core, _, suffix = str(v).partition("-")
+    nums = []
+    for part in core.split("."):
+        try:
+            nums.append(int(part))
+        except ValueError:
+            nums.append(0)
+    while len(nums) < 3:
+        nums.append(0)
+    return (*nums[:3], 0 if suffix else 1)
+
+
+def _source_version(text: str) -> str | None:
+    m = _VERSION_RE.search(text)
+    return m.group(1) if m else None
+
+
+def _repo_owner_name(meta: dict) -> tuple[str, str] | None:
+    m = re.search(r"github\.com[:/]([^/]+)/([^/\s]+?)(?:\.git)?/?$",
+                  str(meta.get("repo") or ""))
+    return (m.group(1), m.group(2)) if m else None
+
+
+def _run_captured(argv: list[str], timeout: float = 30.0
+                  ) -> subprocess.CompletedProcess | None:
+    """subprocess.run that can never prompt or hang; None on OS failure."""
+    env = dict(os.environ)
+    env["GIT_TERMINAL_PROMPT"] = "0"   # a private remote must fail, not ask
+    try:
+        return subprocess.run(argv, capture_output=True, text=True,
+                              timeout=timeout, env=env)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _fetch_via_git(meta: dict, names: list[str]
+                   ) -> tuple[dict[str, str] | None, str]:
+    src = str(meta.get("src_dir") or "")
+    if not src or not Path(src).is_dir():
+        return None, "original checkout not found"
+    ref = str(meta.get("ref") or "main")
+    res = _run_captured(["git", "-C", src, "fetch", "--quiet", "origin", ref],
+                        timeout=60)
+    if res is None or res.returncode != 0:
+        why = "git not runnable"
+        if res is not None:
+            tail = res.stderr.strip().splitlines()
+            why = tail[-1] if tail else "git fetch failed"
+        return None, f"git fetch: {why}"
+    files = {}
+    for name in names:
+        res = _run_captured(["git", "-C", src, "show", f"FETCH_HEAD:{name}"])
+        if res is None or res.returncode != 0:
+            return None, f"git show FETCH_HEAD:{name} failed"
+        files[name] = res.stdout
+    return files, ""
+
+
+def _fetch_via_gh(meta: dict, names: list[str]
+                  ) -> tuple[dict[str, str] | None, str]:
+    if shutil.which("gh") is None:
+        return None, "gh not installed"
+    repo = _repo_owner_name(meta)
+    if repo is None:
+        return None, "no GitHub repo recorded"
+    owner, rname = repo
+    ref = str(meta.get("ref") or "main")
+    files = {}
+    for name in names:
+        res = _run_captured(
+            ["gh", "api", "-H", "Accept: application/vnd.github.raw",
+             f"repos/{owner}/{rname}/contents/{name}?ref={ref}"])
+        if res is None or res.returncode != 0:
+            why = "gh not runnable"
+            if res is not None:
+                head = res.stderr.strip().splitlines()
+                why = head[0] if head else "gh api failed"
+            return None, f"gh api: {why}"
+        files[name] = res.stdout
+    return files, ""
+
+
+def _fetch_via_curl(meta: dict, names: list[str]
+                    ) -> tuple[dict[str, str] | None, str]:
+    if shutil.which("curl") is None:
+        return None, "curl not installed"
+    raw_base = str(meta.get("raw_base") or "")
+    if not raw_base:
+        repo = _repo_owner_name(meta)
+        if repo is None:
+            return None, "no download URL recorded"
+        raw_base = (f"https://raw.githubusercontent.com/{repo[0]}/{repo[1]}"
+                    f"/{meta.get('ref') or 'main'}")
+    files = {}
+    for name in names:
+        res = _run_captured(["curl", "-fsSL", "-m", "20",
+                             f"{raw_base}/{name}"])
+        if res is None or res.returncode != 0:
+            return None, (f"curl {raw_base}/{name} failed "
+                          "(offline, or a private repo — gh handles those)")
+        files[name] = res.stdout
+    return files, ""
+
+
+def _fetch_via_local(meta: dict, names: list[str]
+                     ) -> tuple[dict[str, str] | None, str]:
+    src = str(meta.get("src_dir") or "")
+    if not src or not Path(src).is_dir():
+        return None, "original source dir not found"
+    files = {}
+    for name in names:
+        try:
+            files[name] = (Path(src) / name).read_text()
+        except OSError as exc:
+            return None, f"could not read {Path(src) / name}: {exc}"
+    return files, ""
+
+
+def _fetch_from_source(meta: dict, names: list[str]
+                       ) -> tuple[dict[str, str] | None, str, list[str]]:
+    """(files, via, tried): the recorded source's route first, then the
+    others; `tried` collects each failure reason for honest reporting."""
+    source = str(meta.get("source") or "")
+    if source == "curl":
+        routes = [("curl", _fetch_via_curl), ("gh", _fetch_via_gh)]
+    elif source == "local-copy":
+        routes = [("local", _fetch_via_local), ("git", _fetch_via_git),
+                  ("gh", _fetch_via_gh), ("curl", _fetch_via_curl)]
+    else:                                  # git-clone (and anything unknown)
+        routes = [("git", _fetch_via_git), ("gh", _fetch_via_gh),
+                  ("curl", _fetch_via_curl)]
+    tried: list[str] = []
+    for via, fn in routes:
+        files, why = fn(meta, names)
+        if files is not None:
+            return files, via, tried
+        tried.append(f"{via}: {why}")
+    return None, "", tried
+
+
+def _installed_version(bin_dir: Path) -> str:
+    """Version of the installed copy (falling back to this running one)."""
+    try:
+        v = _source_version((bin_dir / "teamctl").read_text())
+        if v:
+            return v
+    except OSError:
+        pass
+    return VERSION
+
+
+def _apply_update(meta: dict, files: dict[str, str]) -> Path:
+    """Atomically replace the installed artifacts; returns the bin dir.
+    Refuses a download that does not compile. Config/state untouched."""
+    compile(files["teamctl"], "teamctl", "exec")
+    bin_dir = Path(str(meta.get("bin_dir") or "~/.local/bin")).expanduser()
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    for name, text in files.items():
+        dest = bin_dir / name
+        tmp = dest.with_name(dest.name + ".tmp-update")
+        tmp.write_text(text)
+        os.chmod(tmp, 0o755)
+        tmp.replace(dest)
+    meta = dict(meta)
+    meta["version"] = _source_version(files["teamctl"]) or meta.get("version")
+    meta["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    mp = install_meta_path()
+    mp.parent.mkdir(parents=True, exist_ok=True)
+    mp.write_text(json.dumps(meta, indent=2, sort_keys=True) + "\n")
+    return bin_dir
+
+
+# ---- the once-a-day background check and its one unobtrusive line --------
+
+def update_cache_path() -> Path:
+    return state_path().parent / "update-check.json"
+
+
+def _read_update_cache() -> dict:
+    try:
+        data = json.loads(update_cache_path().read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_update_cache(latest: str | None) -> None:
+    """Stamp a check; keep the last known `latest` when none was learned.
+    Best-effort — a cache failure must never break the caller."""
+    try:
+        entry: dict = {"checked_at": time.time()}
+        known = latest or _read_update_cache().get("latest")
+        if known:
+            entry["latest"] = known
+        p = update_cache_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(entry))
+        tmp.replace(p)
+    except OSError:
+        pass
+
+
+def update_settings() -> tuple[bool, str]:
+    """[update]: check = true|false (default true) and mode = prompt |
+    auto | off (default prompt). prompt = one quiet line when newer
+    exists; auto = apply it at session start (explicit opt-in — never the
+    default); off = never mention updates. check=false disables the
+    background check entirely."""
+    upd = load_config().get("update") or {}
+    check = upd.get("check", True)
+    if not isinstance(check, bool):
+        check = str(check).strip().lower() not in ("false", "0", "no", "off")
+    mode = str(upd.get("mode", "prompt")).strip().lower()
+    if mode not in ("prompt", "auto", "off"):
+        mode = "prompt"
+    return check, mode
+
+
+def _maybe_spawn_update_check() -> None:
+    """Background version check: at most once a day, fully detached,
+    silent on every failure, never blocking the caller. No-op when
+    disabled ([update]) or when this copy has no recorded install
+    source."""
+    check, mode = update_settings()
+    if not check or mode == "off":
+        return
+    if load_install_meta() is None:
+        return
+    cache = _read_update_cache()
+    if time.time() - (cache.get("checked_at") or 0) < UPDATE_CHECK_SECONDS:
+        return
+    _write_update_cache(None)   # stamp first: a failure must not retry-storm
+    try:
+        subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve()),
+             "update", "--refresh-cache"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError:
+        pass
+
+
+def _update_notice() -> str | None:
+    """One line when the cached daily check knows a newer version."""
+    _check, mode = update_settings()
+    if mode == "off":
+        return None
+    latest = _read_update_cache().get("latest")
+    if latest and _version_key(str(latest)) > _version_key(VERSION):
+        return f"teamctl {latest} available — teamctl update"
+    return None
+
+
+def _print_update_notice() -> None:
+    """The quiet footer line for providers/usage (prompt mode only)."""
+    _check, mode = update_settings()
+    if mode != "prompt":
+        return
+    notice = _update_notice()
+    if notice:
+        print(_fg("dim", f"\n· {notice}"))
+
+
+def _session_update_line() -> str | None:
+    """Session-start line for the init frame. prompt: the invitation.
+    auto: actually apply the known-newer version, quietly, and report in
+    one line — degrading to the invitation when the source is
+    unreachable."""
+    notice = _update_notice()
+    if notice is None:
+        return None
+    _check, mode = update_settings()
+    if mode != "auto":
+        return notice
+    meta = load_install_meta()
+    if meta is None:
+        return notice
+    files, _via, _tried = _fetch_from_source(meta, list(UPDATE_FILES))
+    if not files:
+        return notice + " (auto-update could not reach the source)"
+    latest = _source_version(files["teamctl"])
+    bin_dir = Path(str(meta.get("bin_dir") or "~/.local/bin")).expanduser()
+    if not latest or _version_key(latest) <= _version_key(
+            _installed_version(bin_dir)):
+        _write_update_cache(latest)
+        return None
+    try:
+        _apply_update(meta, files)
+    except (OSError, SyntaxError, ValueError):
+        return notice + " (auto-update failed — run it by hand)"
+    _write_update_cache(latest)
+    return f"auto-updated teamctl → {latest}"
+
+
+def cmd_update(args: argparse.Namespace) -> int:
+    meta = load_install_meta()
+
+    if getattr(args, "refresh_cache", False):
+        # hidden flag: the detached daily check. Silent; always exits 0.
+        if meta is not None:
+            files, _via, _tried = _fetch_from_source(meta, ["teamctl"])
+            if files:
+                _write_update_cache(_source_version(files["teamctl"]))
+        return 0
+
+    if meta is None:
+        print("teamctl: no install metadata found — this copy predates "
+              "`teamctl update` or was not installed by install.sh.\n"
+              "Re-run the installer once from your original source (it now "
+              "records the source, so future updates are one command):\n"
+              "  ./install.sh --no-init            # from a checkout\n"
+              "  curl -fsSL <install.sh url> | bash -s -- --no-init",
+              file=sys.stderr)
+        return 1
+
+    bin_dir = Path(str(meta.get("bin_dir") or "~/.local/bin")).expanduser()
+    installed = _installed_version(bin_dir)
+    names = ["teamctl"] if args.check else list(UPDATE_FILES)
+    files, via, tried = _fetch_from_source(meta, names)
+    if files is None:
+        print(f"teamctl: could not reach the install source "
+              f"({meta.get('source', '?')}):", file=sys.stderr)
+        for reason in tried:
+            print(f"  {reason}", file=sys.stderr)
+        print("  the installed copy is untouched.", file=sys.stderr)
+        return 1
+    latest = _source_version(files["teamctl"])
+    if not latest:
+        print("teamctl: the fetched teamctl has no version string — "
+              "refusing to install it.", file=sys.stderr)
+        return 1
+    _write_update_cache(latest)
+
+    if args.check:
+        print(f"installed {installed} · latest {latest} (via {via})")
+        if _version_key(latest) > _version_key(installed):
+            print("update available — run `teamctl update`")
+        else:
+            print("up to date")
+        return 0
+
+    if _version_key(latest) <= _version_key(installed):
+        print(f"already up to date (installed {installed}, "
+              f"latest {latest} via {via})")
+        return 0
+    try:
+        bin_dir = _apply_update(meta, files)
+    except (SyntaxError, ValueError):
+        print("teamctl: the fetched teamctl does not compile — refusing to "
+              "install it. The installed copy is untouched.", file=sys.stderr)
+        return 1
+    except OSError as exc:
+        print(f"teamctl: could not write the update: {exc}", file=sys.stderr)
+        return 1
+    print(f"updated teamctl {installed} {_out_glyphs()['arrow']} {latest} "
+          f"in {bin_dir} (via {via})")
+    print("config and state untouched (~/.config/agent-team, "
+          "~/.local/state/agent-team)")
+    return 0
+
+
+# --------------------------------------------------------------------------
 # `teamctl config` — show and adjust ~/.config/agent-team/config.toml
 # --------------------------------------------------------------------------
 
@@ -3601,6 +4031,7 @@ def _write_config_file(data: dict) -> Path | None:
 _MENU_ENUMS: dict[str, tuple[str, ...]] = {
     "lead.delegation": ("ask", "always", "manual"),
     "output.verbosity": ("normal", "terse", "detailed"),
+    "update.mode": ("prompt", "auto", "off"),
 }
 
 
@@ -3923,6 +4354,16 @@ def build_parser() -> argparse.ArgumentParser:
     pp = sub.add_parser("providers", help="show provider install/auth/credit status")
     pp.add_argument("--json", action="store_true")
     pp.set_defaults(func=cmd_providers)
+
+    ud = sub.add_parser(
+        "update",
+        help="update teamctl from its recorded install source "
+             "(--check: just compare versions)")
+    ud.add_argument("--check", action="store_true",
+                    help="print installed vs latest and exit; change nothing")
+    ud.add_argument("--refresh-cache", action="store_true",
+                    dest="refresh_cache", help=argparse.SUPPRESS)
+    ud.set_defaults(func=cmd_update)
 
     up = sub.add_parser("usage", help="show real provider usage %%/reset where exposed")
     up.add_argument("--json", action="store_true")

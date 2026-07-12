@@ -104,6 +104,53 @@ for f in "${FILES[@]}"; do
   chmod +x "$BIN_DIR/$f"
 done
 
+# ---- record the install source so `teamctl update` knows where to pull ----
+# source=git-clone (checkout with a git remote) | local-copy (plain dir) |
+# curl (one-liner). `teamctl update` re-fetches from here later; config and
+# state stay untouched.
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/agent-team"
+json_escape() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+
+SOURCE="curl" REPO_URL="" REF="main" SRC_DIR_META="" RAW_BASE_META=""
+if [ -n "$SRC_DIR" ] && [ -f "$SRC_DIR/teamctl" ]; then
+  SRC_DIR_META="$SRC_DIR"
+  if git -C "$SRC_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    SOURCE="git-clone"
+    REPO_URL="$(git -C "$SRC_DIR" config --get remote.origin.url 2>/dev/null || true)"
+    REF="$(git -C "$SRC_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)"
+  else
+    SOURCE="local-copy"
+    REF=""
+  fi
+else
+  RAW_BASE_META="$RAW_BASE"
+  case "$RAW_BASE" in
+    https://raw.githubusercontent.com/*)
+      _rest="${RAW_BASE#https://raw.githubusercontent.com/}"
+      _owner="${_rest%%/*}"
+      _rest="${_rest#*/}"
+      _repo="${_rest%%/*}"
+      REF="${_rest#*/}"
+      REPO_URL="https://github.com/$_owner/$_repo.git"
+      ;;
+  esac
+fi
+INSTALLED_VERSION="$(sed -n 's/^VERSION = "\(.*\)"$/\1/p' "$BIN_DIR/teamctl" | head -1)"
+mkdir -p "$STATE_DIR"
+cat > "$STATE_DIR/install-meta.json" <<EOF
+{
+  "source": "$(json_escape "$SOURCE")",
+  "repo": "$(json_escape "$REPO_URL")",
+  "raw_base": "$(json_escape "$RAW_BASE_META")",
+  "ref": "$(json_escape "$REF")",
+  "src_dir": "$(json_escape "$SRC_DIR_META")",
+  "bin_dir": "$(json_escape "$BIN_DIR")",
+  "version": "$(json_escape "$INSTALLED_VERSION")",
+  "installed_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown)"
+}
+EOF
+echo "recorded install source ($SOURCE) for \`teamctl update\`"
+
 # ---- dependencies: detect, then OFFER to install ---------------------------
 python_ok() {
   command -v python3 >/dev/null 2>&1 || return 1
