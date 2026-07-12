@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import io
 import itertools
 import json
 import os
@@ -2905,12 +2906,16 @@ def _init_express(args: argparse.Namespace) -> int:
                + _fg("soft", "teamctl init --custom"))
     if upd_line:
         out.append("  " + _fg("dim", f"{g['dot']} {upd_line}"))
-    # installer first-run orientation (A2): the curl|bash path lands the
-    # user inside tmux with a fresh config but no idea what to do next —
-    # give the headline moves. Gated to the installer (TEAMCTL_FIRST_RUN),
-    # so a standalone `teamctl init` keeps its tight spec-§7 frame.
+    # installer first-run (A2): the curl|bash path lands the user inside
+    # tmux with the pitch's headline feature — a lead + teammates — dark.
+    # So the very first landing actually ENABLES lead mode (reversible; it
+    # is just the manager identity in each CLI's instructions file, not a
+    # running/billable session) and the frame shows the moves. Gated to the
+    # installer (TEAMCTL_FIRST_RUN) so a standalone `teamctl init` keeps its
+    # tight spec-§7 frame and never enables lead mode behind the user.
     if os.environ.get("TEAMCTL_FIRST_RUN") == "1":
-        out.extend(_first_run_orientation(preference, g))
+        lead_clis = _enable_lead_mode_quiet() if ready else []
+        out.extend(_first_run_orientation(preference, lead_clis, g))
     # A3: the installer's "$BIN_DIR not on PATH" warning is wiped by the
     # tmux takeover — re-print it durably inside the frame when the
     # installer flags it (TEAMCTL_PATH_NOTE=<dir>).
@@ -2924,22 +2929,53 @@ def _init_express(args: argparse.Namespace) -> int:
     return 0
 
 
-def _first_run_orientation(preference: list[str], g: dict) -> list[str]:
+def _enable_lead_mode_quiet() -> list[str]:
+    """Install lead mode for every detected CLI, suppressing the per-file
+    chatter (the express frame prints its own one-line summary). Returns
+    the CLIs that now carry the lead identity. Idempotent and reversible
+    (`teamctl lead off`); no interactive hook prompt."""
+    selected = _lead_selected_clis("")
+    changes: list[tuple[str, str]] = []
+    buf = io.StringIO()
+    saved = sys.stdout
+    sys.stdout = buf
+    try:
+        if "claude" in selected:
+            _lead_install_skill(changes)
+        for cli in selected:
+            _lead_install_block(cli, changes)
+    except Exception:            # lead mode is a bonus; never break init
+        pass
+    finally:
+        sys.stdout = saved
+    return selected
+
+
+def _first_run_orientation(preference: list[str], lead_clis: list[str],
+                           g: dict) -> list[str]:
     """The 'you're in tmux — here's your first move' block for the curl|bash
-    first run (A2). Provider-agnostic: the spawn example uses the user's
-    top routed provider, or a placeholder when none is ready yet."""
+    first run (A2). Lead mode is already ENABLED by the caller, so this tells
+    the user to just type `teamctl` to open the lead chat, shows one real
+    spawn example, and orients them in tmux. Provider-agnostic."""
     prov = preference[0] if preference else "<provider>"
-    lines = ["", "  " + _fg("soft", "you're in tmux — teammates open as panes "
-                            "to the right")]
+    lines = ["",
+             "  " + _fg("soft", "you're in tmux") + _fg("dim",
+                       " — your team tiles into the panes on the right")]
+    lines.append("    " + _fg("dim", "talk to your lead  ")
+                 + _fg("primary", "teamctl")
+                 + _fg("dim", "   (opens your lead chat right here)"))
     if preference:
-        lines.append("    " + _fg("dim", "spawn one  ")
-                     + _fg("primary", f"teamctl spawn reviewer --provider {prov}"))
+        lines.append("    " + _fg("dim", "or spawn one now   ")
+                     + _fg("primary",
+                           f"teamctl spawn reviewer --provider {prov}"))
     else:
         lines.append("    " + _fg("dim", "sign a provider in, then  ")
-                     + _fg("primary", "teamctl spawn reviewer"))
-    lines.append("    " + _fg("dim", "lead mode  ")
-                 + _fg("primary", "teamctl lead on")
-                 + _fg("dim", "  (make this chat the manager)"))
+                     + _fg("primary", "teamctl"))
+    if lead_clis:
+        pretty = ", ".join(lead_clis)
+        lines.append("  " + _fg("ok", "lead mode on")
+                     + _fg("dim", f"  {pretty}  {g['dot']}  reverse: "
+                                  "teamctl lead off"))
     return lines
 
 

@@ -1672,11 +1672,12 @@ class InitTests(_AuthSandbox, unittest.TestCase):
         self.assertIn("wrote", out)
         self.assertNotIn("t e a m c t l", out)          # --yes = no chrome
 
-    def test_installer_first_run_adds_orientation_and_path_note(self):
-        # A2/A3: the curl|bash first run (TEAMCTL_FIRST_RUN=1) lands the
-        # user in tmux — the frame gains the spawn + lead-on moves and,
-        # when the installer flags it, a DURABLE PATH note (the bare
-        # installer warning is wiped by the tmux takeover).
+    def test_installer_first_run_enables_lead_and_shows_orientation(self):
+        # A2: the curl|bash first run (TEAMCTL_FIRST_RUN=1) actually ENABLES
+        # lead mode (the headline feature, no longer dark) and the frame
+        # tells the user to type `teamctl` to talk to their lead, shows a
+        # real spawn example, and — A3 — re-prints a DURABLE PATH note (the
+        # bare installer warning is wiped by the tmux takeover).
         os.environ["TEAMCTL_FIRST_RUN"] = "1"
         os.environ["TEAMCTL_PATH_NOTE"] = "/home/u/.local/bin"
         try:
@@ -1686,17 +1687,45 @@ class InitTests(_AuthSandbox, unittest.TestCase):
             os.environ.pop("TEAMCTL_PATH_NOTE")
         self.assertEqual(rc, 0)
         self.assertIn("you're in tmux", out)
+        self.assertIn("talk to your lead", out)
         self.assertIn("teamctl spawn reviewer --provider claude", out)
-        self.assertIn("teamctl lead on", out)
+        self.assertIn("lead mode on", out)
         self.assertIn("/home/u/.local/bin is not on your PATH", out)
+        # lead mode was really installed, not just advertised
+        self.assertIn(tc.LEAD_MD_BEGIN, self.claude_md.read_text())
+        self.assertTrue(self.skill_md.exists())
 
-    def test_standalone_frame_has_no_installer_orientation(self):
+    @property
+    def claude_md(self):
+        return self.home / ".claude" / "CLAUDE.md"
+
+    @property
+    def skill_md(self):
+        return (self.home / ".claude" / "skills" / "teamctl-lead"
+                / "SKILL.md")
+
+    def test_first_run_without_provider_does_not_enable_lead(self):
+        # nothing signed in -> no lead identity written behind the user;
+        # the frame still orients but points at signing a provider in
+        tc.shutil.which = lambda name, *a, **k: None     # nothing installed
+        os.environ["TEAMCTL_FIRST_RUN"] = "1"
+        try:
+            rc, out = self._run_init(None)
+        finally:
+            os.environ.pop("TEAMCTL_FIRST_RUN")
+        self.assertEqual(rc, 0)
+        self.assertIn("you're in tmux", out)
+        self.assertNotIn("lead mode on", out)
+        self.assertFalse(self.claude_md.exists())
+
+    def test_standalone_frame_has_no_installer_orientation_or_lead(self):
         # without the installer env, the frame stays tight (no tmux/PATH
-        # orientation, spec §7 budget)
+        # orientation, spec §7 budget) and never enables lead mode
         rc, out = self._run_init(None)
         self.assertEqual(rc, 0)
         self.assertNotIn("you're in tmux", out)
         self.assertNotIn("not on your PATH", out)
+        self.assertFalse(self.claude_md.exists())        # no surprise writes
 
     def test_express_asks_no_questions_and_prints_the_frame(self):
         # any prompt during express is a regression
