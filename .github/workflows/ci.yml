@@ -1,0 +1,55 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tmux (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y tmux
+
+      - name: Install tmux (macOS)
+        if: runner.os == 'macOS'
+        run: command -v tmux >/dev/null || brew install tmux
+
+      - name: Show versions
+        run: |
+          python3 --version
+          tmux -V
+          bash --version | head -1
+
+      # Run the suite INSIDE a detached tmux session so the live pane tests
+      # (spawn/send/dispatch/shutdown against real panes) execute too —
+      # outside tmux they self-skip via skipUnless(os.environ.get("TMUX")).
+      - name: Run tests inside tmux
+        run: |
+          tmux new-session -d -s ci -x 220 -y 50 \
+            'python3 -m unittest discover -s tests -v > /tmp/teamctl-tests.log 2>&1; echo $? > /tmp/teamctl-tests.rc'
+          for _ in $(seq 1 240); do
+            tmux has-session -t ci 2>/dev/null || break
+            sleep 2
+          done
+          if tmux has-session -t ci 2>/dev/null; then
+            echo "tests still running after timeout" >&2
+            tmux kill-server || true
+            cat /tmp/teamctl-tests.log || true
+            exit 1
+          fi
+          cat /tmp/teamctl-tests.log
+          # confirm which tier ran: the live tmux tests must not have skipped
+          if grep -q "requires a live tmux session" /tmp/teamctl-tests.log; then
+            echo "::warning::live tmux tests were skipped on this runner"
+          fi
+          exit "$(cat /tmp/teamctl-tests.rc)"

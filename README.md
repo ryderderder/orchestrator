@@ -1,5 +1,7 @@
 # teamctl
 
+[![ci](https://github.com/ryderderder/teamctl/actions/workflows/ci.yml/badge.svg)](https://github.com/ryderderder/teamctl/actions/workflows/ci.yml)
+
 **teamctl** turns a tmux window into an AI agent team: a *lead* agent (or you)
 in the left pane manages *teammates* — Claude Code, Codex, or Grok CLI
 sessions — as tmux panes tiled in a square grid to the right. It spawns
@@ -10,12 +12,23 @@ usage where providers expose it, and tears teammates down cleanly
 
 ## Requirements
 
-- macOS or Linux
+| platform | status |
+| --- | --- |
+| macOS | supported — developed and verified here |
+| Linux | supported — verified by CI (ubuntu-latest, live tmux pane tests) |
+| Windows | native: **not supported** (tmux doesn't run there). Use WSL — the installer detects native Windows and prints the WSL steps. |
+
 - [tmux](https://github.com/tmux/tmux) (teamctl runs inside a tmux session)
 - Python 3.11+ (3.9+ works, but config-file support needs `tomllib` from 3.11)
 - At least one provider CLI installed and logged in:
   [Claude Code](https://code.claude.com) (`claude`), OpenAI Codex CLI
   (`codex`), or Grok CLI (`grok`)
+
+The installer detects missing tmux/python3 and **offers** to install them via
+your package manager (brew / apt-get / dnf / pacman) — it always asks first,
+tells you when a command will use sudo, and `--no-deps` skips the offers
+entirely. Provider CLIs are never auto-installed; their official install
+one-liners are printed instead.
 
 ## Install
 
@@ -37,6 +50,45 @@ Then, inside a tmux session:
 
 ```sh
 teamctl init        # onboarding wizard (optional but recommended)
+```
+
+### Install via your AI agent — paste this prompt
+
+Prefer to have an agent set everything up? Paste this into Claude Code,
+Codex, or Grok (also in [INSTALL_PROMPT.md](INSTALL_PROMPT.md)):
+
+```text
+Install teamctl (https://github.com/ryderderder/teamctl) for me — it manages
+AI teammates (Claude Code / Codex / Grok CLIs) as tmux panes. Do all of the
+following, in order:
+
+1. Run the installer:
+     curl -fsSL https://raw.githubusercontent.com/ryderderder/teamctl/main/install.sh | bash
+   If it reports missing dependencies (tmux, or python3 older than 3.11),
+   install them with the system package manager (ask me before anything
+   that needs sudo). If it reports no provider CLI, show me the official
+   install one-liners it prints and ask which (if any) to run.
+   Make sure ~/.local/bin is on my PATH; fix my shell profile if not.
+
+2. Configure it: run `teamctl init` interactively if you have a terminal
+   for me to answer prompts; otherwise run `teamctl init --yes` and tell me
+   I can re-run `teamctl init` or use `teamctl config --menu` later.
+
+3. Offer me lead mode: explain that `teamctl lead on` installs a
+   lead-agent identity for Claude Code (a skill, a CLAUDE.md block, and a
+   recommended per-prompt reminder hook — all reversible with
+   `teamctl lead off`), then run it if I say yes.
+
+4. Verify your work: run `teamctl --version` and `teamctl providers`, and
+   show me the output.
+
+5. Report what you did, what you skipped and why, and finish by telling me
+   my controls:
+     - from the shell: `teamctl config --menu` to adjust preferences,
+       `teamctl lead on|off|status` for the lead identity,
+       `./uninstall.sh` (or `teamctl lead off` first) to undo everything.
+     - from a chat: with lead mode on, I can just say "open the teamctl
+       menu" to any lead agent and it will present and apply my settings.
 ```
 
 ## Quickstart
@@ -137,12 +189,13 @@ overrides) — in three tiers, from discoverable to unmissable:
 2. **CLAUDE.md block** — *always on*. A compact, marker-guarded block
    (`<!-- BEGIN teamctl-lead -->` … `<!-- END teamctl-lead -->`) appended to
    `~/.claude/CLAUDE.md`, in context from the first prompt of every session.
-3. **Hook** (optional; asked as y/N, default no, or forced with
+3. **Hook** (recommended; asked as Y/n — default **yes** — or forced with
    `teamctl lead on --hook`) — *per-prompt, the strongest tier*. A
    `UserPromptSubmit` hook in `~/.claude/settings.json` that `echo`es a
    one-line reminder; its stdout is injected into context on **every**
-   prompt, so it keeps working even after context compaction has dropped
-   the CLAUDE.md text from a long session.
+   prompt, so it always fires and keeps working even after context
+   compaction has dropped the CLAUDE.md text from a long session. That is
+   why it's the recommended tier.
 
 Every step is skipped if already present, backed up first if it changes an
 existing file, and printed with its exact revert. `teamctl lead on` refuses
@@ -198,6 +251,11 @@ teamctl config routing.preference "codex,claude"  # comma-separated -> list
 teamctl config --menu                           # numbered menu: pick, edit, repeat
 ```
 
+Or from a chat: with [lead mode](#lead-mode) on, tell your lead agent
+*"open the teamctl menu"* — the teamctl-lead skill teaches it to read your
+settings with `teamctl config`, present them as a numbered menu in chat,
+and apply your changes key by key.
+
 Sets rewrite the file safely: the previous version is backed up to
 `config.toml.bak-teamctl`, all other keys are preserved, and a config that
 fails to parse is refused rather than silently replaced. You can also just
@@ -244,8 +302,10 @@ uninstalling (the uninstaller removes the `teamctl` binary itself).
 - **`send` types into a terminal.** It sends literal keys plus Enter; there's
   no acknowledgment protocol. For machine-readable round-trips use
   `dispatch`/`result`.
-- **macOS/Linux only** (uses `flock`, `pgrep`, POSIX signals). Not tested on
-  Windows/WSL.
+- **macOS/Linux only** (uses `flock`, `pgrep`, POSIX signals): macOS verified
+  directly, Linux verified by CI. Native Windows can't work (no tmux); WSL
+  provides a standard Linux userland and is the supported route there, but
+  hasn't been separately tested.
 - Provider CLIs must already be installed and logged in; teamctl never
   handles credentials itself.
 
