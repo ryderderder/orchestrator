@@ -1926,6 +1926,12 @@ def _addstr(win, y: int, x: int, s: str, attr: int = 0) -> None:
         win.addstr(y, x, s, attr)
     except curses.error:
         pass  # clipped at a screen edge — cosmetic only
+    except (UnicodeEncodeError, ValueError):
+        # a non-UTF-8 locale can't encode a fancy glyph: draw ASCII instead
+        try:
+            win.addstr(y, x, s.encode("ascii", "replace").decode(), attr)
+        except curses.error:
+            pass
 
 
 def _curses_colors() -> None:

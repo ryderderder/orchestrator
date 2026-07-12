@@ -1552,7 +1552,7 @@ class CursesLiveTests(unittest.TestCase):
         self._start("init --custom")
         self._wait_for("teamctl setup")
         self._tmux("send-keys", "q")
-        self._wait_for("cancelled — nothing was written")
+        self._wait_for("nothing was written")  # ASCII-safe substring
         self.assertFalse(
             (self.home / ".config" / "agent-team" / "config.toml").exists())
 
