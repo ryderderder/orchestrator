@@ -329,22 +329,28 @@ class InitLeadOfferTests(ThrowawayHomeTestCase):
         self.assertFalse(self.skill_md.exists())
         self.assertFalse(self.claude_md.exists())
 
-    def test_init_default_answer_skips_lead_mode(self):
-        # model, effort, verbosity, tmux n, statusline n, lead <default>
+    def test_init_plain_path_never_offers_lead_mode(self):
+        # spec §5: no integration prompts on the default plain path — the
+        # trailing y answers must never reach a lead-mode offer
         rc, _, _ = self.run_cli(["init", "--custom"],
-                        answers=["", "", "", "", "n", "n"])
+                                answers=["", "", "", "", "y", "y", "y"])
         self.assertEqual(rc, 0)
         self.assertFalse(self.skill_md.exists())
 
-    def test_init_yes_answer_installs_lead_mode(self):
-        # ... lead y, hook n
-        rc, out, _ = self.run_cli(
-            ["init", "--custom"], answers=["", "", "", "", "n", "n", "y", "n"])
+    def test_init_extras_escape_installs_lead_mode(self):
+        # TEAMCTL_INIT_EXTRAS=1 re-enables the offers: model, effort, voice,
+        # lead, write, tmux n, statusline n, lead-mode y, hook n
+        os.environ["TEAMCTL_INIT_EXTRAS"] = "1"
+        try:
+            rc, out, _ = self.run_cli(
+                ["init", "--custom"],
+                answers=["", "", "", "", "y", "n", "n", "y", "n"])
+        finally:
+            os.environ.pop("TEAMCTL_INIT_EXTRAS", None)
         self.assertEqual(rc, 0)
         self.assertTrue(self.skill_md.exists())
         self.assertIn(tc.LEAD_MD_BEGIN, self.claude_md.read_text())
         self.assertFalse(self.settings.exists())            # hook declined
-        self.assertIn("Summary of changes", out)
 
 
 class LeadMultiCliTests(ThrowawayHomeTestCase):
@@ -508,30 +514,29 @@ class InitRoutingOrderTests(ThrowawayHomeTestCase):
         return tomllib.loads(self.cfg.read_text())
 
     def test_wizard_writes_users_order(self):
-        # claude model/effort, codex model/effort, ROUTING ORDER, verbosity,
-        # tmux n, statusline n, lead default-no (answers exhausted)
+        # plain path: claude model, codex model, effort, voice, lead,
+        # ROUTE, write
         rc, _, _ = self.run_cli(
             ["init", "--custom"],
-            answers=["", "", "", "", "codex, claude", "", "", "n", "n"])
+            answers=["", "", "", "", "", "codex, claude", "y"])
         self.assertEqual(rc, 0)
         self.assertEqual(self._config()["routing"]["preference"],
                          ["codex", "claude"])
 
     def test_wizard_drops_unknown_entries(self):
-        rc, out, _ = self.run_cli(
+        # spec §6.3: unknowns dropped silently
+        rc, _, _ = self.run_cli(
             ["init", "--custom"],
-            answers=["", "", "", "", "gpt, codex", "", "", "n", "n"])
+            answers=["", "", "", "", "", "gpt, codex", "y"])
         self.assertEqual(rc, 0)
         self.assertEqual(self._config()["routing"]["preference"], ["codex"])
-        self.assertIn("ignoring unknown", out)
 
     def test_blank_order_falls_back_to_documented_alphabetical(self):
-        rc, out, _ = self.run_cli(
-            ["init", "--custom"], answers=["", "", "", "", "", "", "", "n", "n"])
+        rc, _, _ = self.run_cli(
+            ["init", "--custom"], answers=["", "", "", "", "", "", "y"])
         self.assertEqual(rc, 0)
         self.assertEqual(self._config()["routing"]["preference"],
                          ["claude", "codex"])
-        self.assertIn("arbitrary", out)
 
     def test_yes_writes_alphabetical_preference(self):
         rc, _, _ = self.run_cli(["init", "--yes"])
@@ -735,11 +740,11 @@ class DelegationPostureTests(ThrowawayHomeTestCase):
                          "codex": self.home / "no",
                          "grok": self.home / "no2"}
         try:
-            # model, effort, verbosity, DELEGATION=always, tmux n, statusline n
+            # plain path: model, effort, voice, LEAD=always, write
             rc, out, _ = self.run_cli(
-                ["init", "--custom"], answers=["", "", "", "always", "n", "n"])
+                ["init", "--custom"], answers=["", "", "", "always", "y"])
             self.assertEqual(rc, 0)
-            self.assertIn("Delegation posture", out)
+            self.assertIn("lead", out)
             self.assertEqual(
                 tomllib.loads(self.cfg.read_text())["lead"]["delegation"],
                 "always")

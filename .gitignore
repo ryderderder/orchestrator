@@ -12,3 +12,4 @@ tests/kill_mate/
 tests/d_mate/
 tests/sig_mate/
 tests/late_mate/
+.evidence-tty-bug/

@@ -913,19 +913,20 @@ class InitTests(unittest.TestCase):
         return tomllib.loads(path.read_text())
 
     def test_express_writes_defaults_and_touches_nothing_else(self):
-        # plain `init` (and --yes) is the ZERO-QUESTION express path
+        # --yes keeps its scripted contract: same writes, no chrome
         rc, out = self._run_init(None, "--yes")
         self.assertEqual(rc, 0)
         cfg = self._config()
         self.assertEqual(cfg["output"]["verbosity"], "normal")
-        # blank model/effort => the provider section carries no keys
-        self.assertEqual(cfg.get("providers", {}).get("claude", {}), {})
+        # express locks effort=high; model stays the CLI's own default
+        self.assertEqual(cfg["providers"]["claude"], {"effort": "high"})
         # express must not touch tmux.conf or Claude Code settings
         self.assertFalse((self.home / ".tmux.conf").exists())
         self.assertFalse((self.home / ".claude" / "settings.json").exists())
-        self.assertIn("customize any time", out)
+        self.assertIn("wrote", out)
+        self.assertNotIn("t e a m c t l", out)          # --yes = no chrome
 
-    def test_express_asks_no_questions(self):
+    def test_express_asks_no_questions_and_prints_the_frame(self):
         # any prompt during express is a regression
         def explode(prompt):
             raise AssertionError(f"express asked a question: {prompt!r}")
@@ -936,28 +937,71 @@ class InitTests(unittest.TestCase):
         self.assertEqual(cfg["output"]["verbosity"], "normal")
         self.assertEqual(cfg["lead"]["delegation"], "ask")
         self.assertEqual(cfg["routing"]["preference"], ["claude"])
-        self.assertIn("express setup", out)
+        self.assertEqual(cfg["providers"]["claude"]["effort"], "high")
+        # spec §3: wordmark + status words + defaults block + one hint
+        self.assertIn("t e a m c t l", out)
+        self.assertIn("ready", out)                     # claude
+        self.assertIn("quiet", out)                     # codex/grok stubs
+        self.assertIn("defaults locked", out)
+        self.assertIn("customize", out)
         self.assertIn("teamctl init --custom", out)
-        self.assertIn("teamctl config --menu", out)
+        # spec §7: final output 12–18 lines
+        lines = out.rstrip("\n").split("\n")
+        self.assertTrue(12 <= len(lines) <= 18, f"{len(lines)} lines")
+
+    def test_express_frame_none_ready(self):
+        tc.shutil.which = lambda name, *a, **k: None    # nothing installed
+        rc, out = self._run_init(None)
+        self.assertEqual(rc, 0)
+        self.assertIn("log a provider in, then re-run", out)
+        cfg = self._config()
+        self.assertNotIn("routing", cfg)                # no route to lock
+        self.assertEqual(cfg["lead"]["delegation"], "ask")
 
     def test_scripted_answers_reach_config(self):
-        # --custom degrades to the scripted line prompts under a non-tty.
-        # answers: claude model, claude effort, verbosity, tmux y/n, statusline y/n
-        rc, out = self._run_init(["opus", "high", "terse", "", "n", "n"],
+        # --custom degrades to the scripted plain path under a non-tty.
+        # prompts: claude model, effort, voice, lead, write
+        rc, out = self._run_init(["opus", "high", "terse", "", "y"],
                                  "--custom")
         self.assertEqual(rc, 0)
+        self.assertIn("plain path", out)
         cfg = self._config()
         self.assertEqual(cfg["providers"]["claude"]["model"], "opus")
         self.assertEqual(cfg["providers"]["claude"]["effort"], "high")
         self.assertEqual(cfg["output"]["verbosity"], "terse")
-        self.assertIn("revert", out)
+
+    def test_plain_path_blanks_mean_express_defaults(self):
+        # spec §6.4: plain path accepts blanks -> Express defaults
+        rc, _ = self._run_init([], "--custom")          # every answer blank
+        self.assertEqual(rc, 0)
+        cfg = self._config()
+        self.assertEqual(cfg["providers"]["claude"], {"effort": "high"})
+        self.assertEqual(cfg["output"]["verbosity"], "normal")
+        self.assertEqual(cfg["lead"]["delegation"], "ask")
+
+    def test_plain_path_snaps_bad_enums(self):
+        rc, out = self._run_init(["", "banana", "shouty", "psychic", "y"],
+                                 "--custom")
+        self.assertEqual(rc, 0)
+        self.assertIn("snapped to high", out)
+        self.assertIn("snapped to normal", out)
+        self.assertIn("snapped to ask", out)
+        cfg = self._config()
+        self.assertEqual(cfg["providers"]["claude"]["effort"], "high")
+        self.assertEqual(cfg["output"]["verbosity"], "normal")
+        self.assertEqual(cfg["lead"]["delegation"], "ask")
+
+    def test_plain_path_declining_write_writes_nothing(self):
+        rc, out = self._run_init(["", "", "", "", "n"], "--custom")
+        self.assertEqual(rc, 0)
+        self.assertIn("nothing written", out)
+        path = self.home / ".config" / "agent-team" / "config.toml"
+        self.assertFalse(path.exists())
 
     def test_rerun_backs_up_previous_config(self):
-        rc, _ = self._run_init(["opus", "high", "normal", "", "n", "n"],
-                               "--custom")
+        rc, _ = self._run_init(["opus", "", "", "", "y"], "--custom")
         self.assertEqual(rc, 0)
-        rc, _ = self._run_init(["sonnet", "", "normal", "", "n", "n"],
-                               "--custom")
+        rc, _ = self._run_init(["sonnet", "", "", "", "y"], "--custom")
         self.assertEqual(rc, 0)
         self.assertEqual(self._config()["providers"]["claude"]["model"], "sonnet")
         bak = self.home / ".config" / "agent-team" / "config.toml.bak-teamctl"
@@ -965,8 +1009,7 @@ class InitTests(unittest.TestCase):
         self.assertIn('model = "opus"', bak.read_text())
 
     def test_express_rerun_backs_up_previous_config(self):
-        rc, _ = self._run_init(["opus", "high", "normal", "", "n", "n"],
-                               "--custom")
+        rc, _ = self._run_init(["opus", "", "", "", "y"], "--custom")
         self.assertEqual(rc, 0)
         rc, _ = self._run_init(None)
         self.assertEqual(rc, 0)
@@ -974,10 +1017,30 @@ class InitTests(unittest.TestCase):
         self.assertTrue(bak.exists())
         self.assertIn('model = "opus"', bak.read_text())
 
+    def _run_init_extras(self, answers, *extra):
+        """Plain path with the TEAMCTL_INIT_EXTRAS=1 power-user escape."""
+        os.environ["TEAMCTL_INIT_EXTRAS"] = "1"
+        try:
+            return self._run_init(answers, *extra)
+        finally:
+            os.environ.pop("TEAMCTL_INIT_EXTRAS", None)
+
+    def test_plain_path_offers_no_extras_by_default(self):
+        rc, out = self._run_init(["", "", "", "", "y", "y", "y", "y"],
+                                 "--custom")
+        self.assertEqual(rc, 0)
+        # the trailing y answers must never reach integration prompts
+        self.assertFalse((self.home / ".tmux.conf").exists())
+        self.assertFalse(
+            (self.home / ".local" / "bin" / "claude-statusline").exists())
+        self.assertIn("extras", out)                    # pointer printed
+
     def test_tmux_block_appended_once_and_backed_up(self):
         conf = self.home / ".tmux.conf"
         conf.write_text("set -g mouse on\n")
-        rc, _ = self._run_init(["", "", "", "", "y", "n"], "--custom")
+        # prompts: model, effort, voice, lead, write, tmux, statusline, lead
+        rc, _ = self._run_init_extras(
+            ["", "", "", "", "y", "y", "n", "n"], "--custom")
         self.assertEqual(rc, 0)
         text = conf.read_text()
         self.assertEqual(text.count(tc.TMUX_MARKER_BEGIN), 1)
@@ -986,7 +1049,8 @@ class InitTests(unittest.TestCase):
         self.assertIn("pane-border-format", text)
         self.assertTrue((self.home / ".tmux.conf.bak-teamctl").exists())
         # second accept must not duplicate the block
-        rc, out = self._run_init(["", "", "", "", "y", "n"], "--custom")
+        rc, out = self._run_init_extras(
+            ["", "", "", "", "y", "y", "n", "n"], "--custom")
         self.assertEqual(rc, 0)
         self.assertEqual(conf.read_text().count(tc.TMUX_MARKER_BEGIN), 1)
         self.assertIn("skipping", out)
@@ -995,7 +1059,8 @@ class InitTests(unittest.TestCase):
         settings = self.home / ".claude" / "settings.json"
         settings.parent.mkdir(parents=True)
         settings.write_text(json.dumps({"model": "opus"}, indent=2))
-        rc, _ = self._run_init(["", "", "", "", "n", "y"], "--custom")
+        rc, _ = self._run_init_extras(
+            ["", "", "", "", "y", "n", "y", "n"], "--custom")
         self.assertEqual(rc, 0)
         data = json.loads(settings.read_text())
         self.assertEqual(data["model"], "opus")          # existing keys untouched
@@ -1006,13 +1071,15 @@ class InitTests(unittest.TestCase):
         self.assertTrue(Path(str(settings) + ".bak-teamctl").exists())
         # second run: key already present -> settings must be left alone
         before = settings.read_text()
-        rc, out = self._run_init(["", "", "", "", "n", "y"], "--custom")
+        rc, out = self._run_init_extras(
+            ["", "", "", "", "y", "n", "y", "n"], "--custom")
         self.assertEqual(rc, 0)
         self.assertEqual(settings.read_text(), before)
         self.assertIn("already has a statusLine key", out)
 
     def test_statusline_creates_settings_when_absent(self):
-        rc, _ = self._run_init(["", "", "", "", "n", "y"], "--custom")
+        rc, _ = self._run_init_extras(
+            ["", "", "", "", "y", "n", "y", "n"], "--custom")
         self.assertEqual(rc, 0)
         settings = self.home / ".claude" / "settings.json"
         data = json.loads(settings.read_text())
@@ -1598,39 +1665,62 @@ class CursesLiveTests(unittest.TestCase):
                f"{teamctl_args}; sleep 30")
         self._tmux("new-session", "-d", "-x", "110", "-y", "35", cmd)
 
-    def test_custom_wizard_renders_in_tmux_and_writes_config(self):
+    def test_cockpit_renders_in_tmux_and_writes_config(self):
+        # spec §4: screen 1 models -> screen 2 posture -> screen 3 seal
         self._start("init --custom")
-        cap = self._wait_for("teamctl setup")
-        self.assertIn("providers & models", cap)
+        cap = self._wait_for("pick a model")
+        self.assertIn("1 models", cap)                  # progress chrome
+        self.assertIn("2 posture", cap)
+        self.assertIn("3 seal", cap)
         self.assertIn("claude", cap)
-        self.assertIn("model", cap)
-        # Right: model CLI default -> sonnet; Down; Right: effort -> low
-        self._tmux("send-keys", "Right")
-        self._wait_for("sonnet")
+        self.assertIn("(provider default)", cap)
+        self.assertIn("sonnet", cap)                    # documented aliases
+        self.assertIn("custom", cap)                    # escape hatch row
+        # Down to sonnet, Enter commits it
         self._tmux("send-keys", "Down")
-        self._tmux("send-keys", "Right")
-        self._wait_for("low")
-        self._tmux("send-keys", "n")                    # next screen
-        cap = self._wait_for("team & integrations")
-        self.assertIn("delegation", cap)
-        self.assertIn("integrations", cap)
-        self._tmux("send-keys", "d")                    # save & finish
-        self._wait_for("Summary of changes")
+        self._tmux("send-keys", "Enter")
+        self._tmux("send-keys", "n")                    # -> posture
+        cap = self._wait_for("how hard")
+        self.assertIn("effort", cap)
+        self.assertIn("voice", cap)
+        self.assertIn("lead", cap)
+        # focus starts on effort 'high'; Down Down -> 'low'; Enter commits
+        self._tmux("send-keys", "Down")
+        self._tmux("send-keys", "Down")
+        self._tmux("send-keys", "Enter")
+        self._tmux("send-keys", "n")                    # -> seal
+        cap = self._wait_for("seal it")
+        self.assertIn("review", cap)
+        self.assertIn("sonnet", cap)                    # committed choices
+        self.assertIn("low", cap)
+        self.assertIn("write config", cap)
+        self.assertIn("tmux borders", cap)              # extras, off
+        self._tmux("send-keys", "Enter")                # write (pre-focused)
+        self._wait_for("wrote the map")
         cfg = self.home / ".config" / "agent-team" / "config.toml"
-        self.assertTrue(cfg.exists(), "wizard did not write config.toml")
+        self.assertTrue(cfg.exists(), "cockpit did not write config.toml")
         text = cfg.read_text()
         self.assertIn('model = "sonnet"', text)
         self.assertIn('effort = "low"', text)
         self.assertIn('delegation = "ask"', text)
         self.assertIn('verbosity = "normal"', text)
+        # extras stayed off
+        self.assertFalse((self.home / ".tmux.conf").exists())
 
-    def test_custom_wizard_cancel_writes_nothing(self):
+    def test_cockpit_cancel_writes_nothing(self):
         self._start("init --custom")
-        self._wait_for("teamctl setup")
+        self._wait_for("pick a model")
         self._tmux("send-keys", "q")
         self._wait_for("nothing was written")  # ASCII-safe substring
         self.assertFalse(
             (self.home / ".config" / "agent-team" / "config.toml").exists())
+
+    def test_cockpit_p_escapes_to_plain_path(self):
+        self._start("init --custom")
+        self._wait_for("pick a model")
+        self._tmux("send-keys", "p")
+        cap = self._wait_for("plain path")
+        self.assertIn("model per provider", cap)
 
     def test_config_menu_curses_cycles_and_saves(self):
         cfg = self.home / ".config" / "agent-team" / "config.toml"

@@ -1900,22 +1900,40 @@ def _render_config(providers_cfg: dict[str, dict[str, str]], verbosity: str,
 
 
 # --------------------------------------------------------------------------
-# rich terminal UI (stdlib curses) — powers `init --custom` and
-# `config --menu`. Degrades to the classic line-prompt flows whenever curses
-# cannot run: no real tty on stdin/stdout (scripted runs, CI, pipes), a dumb
-# TERM, curses missing, or TEAMCTL_UI=plain. The scripted-stdin test seams
-# (tc._input) therefore keep working unchanged — redirected stdio is never
-# a tty, so tests always exercise the line flow unless they drive a real
-# terminal (the live tmux test does exactly that).
+# setup experience — three paths, one config schema. Canonical design:
+# docs/design/installer-spec.md ("teamctl Setup Experience", Grok 4.5).
+#
+#   express (default `init`)  zero questions; wordmark frame; sane defaults
+#   custom  (`init --custom`) 3-screen curses cockpit: models → posture → seal
+#   plain   (degrade / `p`)   short prompts, Express defaults on blank
+#
+# The cockpit degrades to the plain path whenever curses cannot run: no real
+# tty on stdin/stdout (scripted runs, CI, pipes), a dumb TERM, curses
+# missing, or TEAMCTL_UI=plain. The scripted-stdin test seams (tc._input)
+# therefore keep working — redirected stdio is never a tty.
 # --------------------------------------------------------------------------
-
-CUSTOM_CHOICE = "custom id…"
 
 # claude has no model-listing command; these are its documented --model
 # aliases. codex/grok lists come from discover_models() (cache / CLI).
 CLAUDE_MODEL_ALIASES = ("sonnet", "opus", "haiku", "fable")
 
 EFFORT_CHOICES = ("low", "medium", "high", "xhigh")
+
+VOICE_CHOICES = ("terse", "normal", "detailed")
+
+LEAD_CHOICES = ("ask", "always", "manual")
+
+LEAD_GLOSS = {"ask": "check once per session",
+              "always": "hand off non-trivial work",
+              "manual": "only when told"}
+
+# spec §1.1 — 256-color palette; background stays the terminal's own.
+_PALETTE = (("accent", 51), ("ok", 114), ("warn", 180), ("dim", 240),
+            ("soft", 44), ("primary", 252), ("border", 238), ("bad", 167),
+            ("mute", 236))
+_ROLE_PAIR = {name: i for i, (name, _) in enumerate(_PALETTE, start=1)}
+_SELECT_PAIR = 10          # fg 232 on bg 51 (spec: selection bar)
+_HAS_256 = False
 
 
 class _RichUnusable(Exception):
@@ -1940,26 +1958,61 @@ def _use_rich_ui() -> bool:
     return True
 
 
+def _ansi_ok() -> bool:
+    """Color for the non-curses frames (express, post-write)."""
+    if os.environ.get("NO_COLOR") or os.environ.get("TEAMCTL_PLAIN") == "1":
+        return False
+    try:
+        if not sys.stdout.isatty():
+            return False
+    except (AttributeError, ValueError):
+        return False
+    term = os.environ.get("TERM", "")
+    return bool(term) and term != "dumb"
+
+
+def _fg(role: str, s: str) -> str:
+    """256-color ANSI tint for print()-based frames; plain when unsuitable."""
+    if not _ansi_ok():
+        return s
+    return f"\033[38;5;{dict(_PALETTE)[role]}m{s}\033[0m"
+
+
+def _out_glyphs() -> dict[str, str]:
+    """Unicode accents when stdout can encode them, ASCII otherwise."""
+    enc = (getattr(sys.stdout, "encoding", "") or "").upper()
+    if "UTF" in enc:
+        return {"rule": "━", "chev": "›", "dot": "·", "arrow": "→",
+                "dash": "—"}
+    return {"rule": "=", "chev": ">", "dot": "*", "arrow": "->", "dash": "--"}
+
+
+def _tilde(p) -> str:
+    home = str(Path.home())
+    s = str(p)
+    return "~" + s[len(home):] if s.startswith(home) else s
+
+
 def _model_choices(provider: str) -> list[str]:
     """Model ids offered as picks. Ids always pass through to the CLI
-    verbatim, so the 'custom id…' escape hatch accepts anything."""
+    verbatim, so the 'custom…' escape hatch accepts anything."""
     if provider == "claude":
         return list(CLAUDE_MODEL_ALIASES)
-    return discover_models(provider)[:12]
+    return discover_models(provider)
 
 
 def _ui_glyphs() -> dict[str, str]:
-    """Unicode accents when the locale can render them, ASCII otherwise."""
+    """Unicode accents for curses when the locale can render them."""
     try:
         import locale
         utf = "UTF" in (locale.nl_langinfo(locale.CODESET) or "").upper()
     except (ImportError, AttributeError, ValueError):
         utf = False
     if utf:
-        return {"sel": "▸ ", "on": "●", "off": "○", "l": "‹ ", "r": " ›",
-                "sep": " → "}
+        return {"sel": "› ", "on": "●", "off": "○", "l": "‹ ", "r": " ›",
+                "sep": " › ", "dot": "·", "dash": "—", "more": "…"}
     return {"sel": "> ", "on": "*", "off": "o", "l": "< ", "r": " >",
-            "sep": " > "}
+            "sep": " > ", "dot": "*", "dash": "--", "more": "..."}
 
 
 def _addstr(win, y: int, x: int, s: str, attr: int = 0) -> None:
@@ -1976,33 +2029,47 @@ def _addstr(win, y: int, x: int, s: str, attr: int = 0) -> None:
 
 
 def _curses_colors() -> None:
+    """Palette init shared by the cockpit and the config menu; sets 256-color
+    pairs when the terminal has them, else the drawing code degrades to
+    reverse-video / dim attributes (spec §1.1 degrade rule)."""
+    global _HAS_256
+    _HAS_256 = False
     try:
         curses.start_color()
         curses.use_default_colors()
-        curses.init_pair(1, curses.COLOR_CYAN, -1)    # titles
-        curses.init_pair(2, curses.COLOR_GREEN, -1)   # values
-        curses.init_pair(3, curses.COLOR_YELLOW, -1)  # section headers
+        if getattr(curses, "COLORS", 0) >= 256:
+            for i, (_name, code) in enumerate(_PALETTE, start=1):
+                curses.init_pair(i, code, -1)
+            curses.init_pair(_SELECT_PAIR, 232, 51)
+            _HAS_256 = True
     except curses.error:
-        pass  # monochrome terminals still get the layout
+        _HAS_256 = False
+
+
+def _cattr(role: str) -> int:
+    if not _HAS_256:
+        if role == "select":
+            return curses.A_REVERSE
+        if role in ("dim", "mute", "border"):
+            return curses.A_DIM
+        if role in ("accent", "soft", "ok", "warn"):
+            return curses.A_BOLD
+        return curses.A_NORMAL
+    if role == "select":
+        return curses.color_pair(_SELECT_PAIR)
+    return curses.color_pair(_ROLE_PAIR[role])
 
 
 def _pair(n: int) -> int:
+    """Legacy pair accessor used by the config menu (1 accent, 2 ok, 3 warn)."""
     try:
         return curses.color_pair(n)
     except curses.error:
         return 0
 
 
-def _field_value_text(f: dict) -> str:
-    if f["kind"] == "toggle":
-        return "[x] yes" if f["value"] else "[ ] no"
-    if f.get("custom"):
-        return f"custom: {f['custom']}"
-    return f["options"][f["idx"]]
-
-
 def _curses_prompt(stdscr, label: str) -> str:
-    """One-line text input on the bottom row (for 'custom id…')."""
+    """One-line text input on the bottom row (custom model ids, menu edits)."""
     h, _ = stdscr.getmaxyx()
     stdscr.move(h - 1, 0)
     stdscr.clrtoeol()
@@ -2025,216 +2092,222 @@ def _curses_prompt(stdscr, label: str) -> str:
     return raw.decode("utf-8", "replace").strip()
 
 
-def _change_field(stdscr, f: dict, delta: int) -> None:
-    if f["kind"] == "toggle":
-        f["value"] = not f["value"]
-        return
-    n = len(f["options"])
-    f["idx"] = (f["idx"] + delta) % n
-    f["custom"] = ""
-    if f["options"][f["idx"]] == CUSTOM_CHOICE:
-        txt = _curses_prompt(stdscr, f.get("prompt", "custom value:"))
-        if txt:
-            f["custom"] = txt
-        else:  # cancelled — step past the escape hatch
-            f["idx"] = (f["idx"] + (1 if delta >= 0 else -1)) % n
+# --------------------------------------------------------------------------
+# custom cockpit — 3 screens (models → posture → seal), spec §4
+# --------------------------------------------------------------------------
+
+_COCKPIT_FOOTERS = {
+    1: "↑↓ move   enter choose   tab next provider   n next   p plain   q quit",
+    2: "↑↓ section/item   enter choose   n next   b back   p plain   q quit",
+    3: "↑↓  space toggle  enter run  b back  p plain  q quit",
+}
+
+_COCKPIT_TITLES = {1: "pick a model — or leave the CLI its secrets",
+                   2: "how hard · how loud · when to hand off",
+                   3: "seal it"}
+
+_EXTRAS_ROWS = (
+    ("tmux", "tmux borders", "pane labels · role · model"),
+    ("statusline", "claude statusline", "model · effort · ctx%"),
+    ("lead", "lead mode", "manager identity for agent CLIs"),
+    ("hook", "lead hook", "per-prompt reminder (claude only)"),
+)
 
 
-def _draw_form(stdscr, title: str, step: int, nsteps: int,
-               fields: list[dict], sel: int, last: bool) -> None:
+def _cockpit_rows(screen: int, state: dict, ready: list[str],
+                  discovered: dict[str, list[str]]) -> list[dict]:
+    g = _ui_glyphs()
+    rows: list[dict] = [{"kind": "title", "text": _COCKPIT_TITLES[screen]},
+                        {"kind": "blank"}]
+    if screen == 1:
+        # cap visible discoveries so three provider blocks still fit the
+        # spec's 100×30 canvas; the tail collapses into a "… N more" row
+        # that jumps to the custom editor (spec §4.3).
+        cap = {1: 8, 2: 5}.get(len(ready), 3)
+        for prov in ready:
+            rows.append({"kind": "header", "text": prov})
+            rows.append({"kind": "choice", "group": ("model", prov),
+                         "value": "", "label": "(provider default)"})
+            found = discovered.get(prov) or []
+            for m in found[:cap]:
+                rows.append({"kind": "choice", "group": ("model", prov),
+                             "value": m, "label": m})
+            if len(found) > cap:
+                rows.append({"kind": "more", "prov": prov,
+                             "label": f"{g['more']} {len(found) - cap} more"})
+            custom_val = state["models"].get(prov, "")
+            is_custom = custom_val and custom_val not in found[:cap]
+            rows.append({"kind": "custom", "prov": prov,
+                         "label": (f"custom:  {custom_val}" if is_custom
+                                   else f"custom{g['more']}")})
+            rows.append({"kind": "blank"})
+        rows.append({"kind": "info",
+                     "text": f"{g['dot']} discovered via teamctl models "
+                             f"{g['dot']} ids pass through verbatim"})
+    elif screen == 2:
+        rows.append({"kind": "header", "text": "effort",
+                     "note": "[global for all ready]"})
+        efforts = ["high", "medium", "low"]
+        if "codex" in ready:
+            efforts.append("xhigh")
+        for e in efforts:
+            rows.append({"kind": "choice", "group": ("effort",),
+                         "value": e, "label": e})
+        rows.append({"kind": "blank"})
+        rows.append({"kind": "header", "text": "voice"})
+        for v in VOICE_CHOICES:
+            rows.append({"kind": "choice", "group": ("voice",),
+                         "value": v, "label": v})
+        rows.append({"kind": "blank"})
+        rows.append({"kind": "header", "text": "lead"})
+        for d in LEAD_CHOICES:
+            rows.append({"kind": "choice", "group": ("lead",), "value": d,
+                         "label": f"{d:<12} {g['dash']} {LEAD_GLOSS[d]}"})
+        if len(ready) > 1:
+            rows.append({"kind": "blank"})
+            rows.append({"kind": "header", "text": "route"})
+            for i, prov in enumerate(state["route"], start=1):
+                rows.append({"kind": "route", "prov": prov,
+                             "label": f"{i}  {prov}"})
+            rows.append({"kind": "info",
+                         "text": f"{g['dot']} h/l or </> swap {g['dot']} "
+                                 "order is yours, not ours"})
+    else:
+        rows.append({"kind": "header", "text": "review"})
+        route_txt = g["sep"].join(state["route"]) if state["route"] else "—"
+        rows.append({"kind": "review", "key": "route", "val": route_txt})
+        for prov in ready:
+            model = state["models"].get(prov) or "(cli default)"
+            rows.append({"kind": "review", "key": prov,
+                         "val": f"{model} {g['dot']} {state['effort']}"})
+        rows.append({"kind": "review", "key": "voice", "val": state["voice"]})
+        rows.append({"kind": "review", "key": "lead", "val": state["lead"]})
+        rows.append({"kind": "blank"})
+        rows.append({"kind": "header", "text": "extras",
+                     "note": "[off by default]"})
+        for key, label, gloss in _EXTRAS_ROWS:
+            rows.append({"kind": "check", "key": key, "label": label,
+                         "gloss": gloss})
+        rows.append({"kind": "blank"})
+        rows.append({"kind": "action", "act": "write", "label": "write config"})
+        rows.append({"kind": "action", "act": "abort", "label": "abort"})
+        rows.append({"kind": "blank"})
+        rows.append({"kind": "info",
+                     "text": f"{g['dot']} backups first {g['dot']} extras "
+                             f"default off {g['dot']} re-run anytime"})
+    return rows
+
+
+_FOCUSABLE = ("choice", "custom", "more", "route", "check", "action")
+
+
+def _paint_cockpit(stdscr, screen: int, rows: list[dict], sel: int,
+                   state: dict) -> None:
     g = _ui_glyphs()
     stdscr.erase()
     h, w = stdscr.getmaxyx()
-    box_w = min(w - 3, 92)
-    box_h = len(fields) + 3
-    top, left = 1, 1
-    try:
-        curses.textpad.rectangle(stdscr, top, left, top + box_h, left + box_w)
-    except curses.error:
-        pass
-    dots = " ".join(g["on"] if i < step else g["off"] for i in range(nsteps))
-    _addstr(stdscr, top, left + 2,
-            f" teamctl setup · {title} · step {step}/{nsteps} {dots} ",
-            _pair(1) | curses.A_BOLD)
-    y = top + 2
-    for i, f in enumerate(fields):
-        if f["kind"] == "header":
-            _addstr(stdscr, y, left + 3, f["label"],
-                    _pair(3) | curses.A_BOLD)
+    if h < len(rows) + 4 or w < 70:
+        raise _RichUnusable("terminal too small for the cockpit")
+    _addstr(stdscr, 0, 0, "teamctl", _cattr("primary") | curses.A_BOLD)
+    _addstr(stdscr, 0, 7, f"  {g['dot']}  ", _cattr("dim"))
+    _addstr(stdscr, 0, 12, "custom", _cattr("accent"))
+    x = 0
+    for i, name in enumerate(("1 models", "2 posture", "3 seal"), start=1):
+        role = "accent" if i == screen else ("ok" if i < screen else "dim")
+        _addstr(stdscr, 1, x, name, _cattr(role))
+        x += len(name)
+        if i < 3:
+            _addstr(stdscr, 1, x, " ── ", _cattr("mute"))
+            x += 4
+    y = 3
+    bar_w = min(w - 4, 96)
+    for i, r in enumerate(rows):
+        kind = r["kind"]
+        if kind == "blank":
+            y += 1
+            continue
+        if kind == "title":
+            _addstr(stdscr, y, 2, r["text"], _cattr("primary"))
+        elif kind == "header":
+            _addstr(stdscr, y, 2, r["text"], _cattr("soft") | curses.A_BOLD)
+            if r.get("note"):
+                _addstr(stdscr, y, 50, r["note"], _cattr("dim"))
+        elif kind == "info":
+            _addstr(stdscr, y, 2, r["text"], _cattr("dim"))
+        elif kind == "review":
+            _addstr(stdscr, y, 4, f"{r['key']:<10}", _cattr("dim"))
+            _addstr(stdscr, y, 14, r["val"], _cattr("primary"))
         else:
-            sel_here = (i == sel)
-            marker = g["sel"] if sel_here else "  "
-            label = f"{f['label']:<19}"
-            val = _field_value_text(f)
-            shown = (val if f["kind"] == "toggle"
-                     else f"{g['l']}{val}{g['r']}")
-            _addstr(stdscr, y, left + 3, marker + label,
-                    curses.A_REVERSE if sel_here else curses.A_NORMAL)
-            _addstr(stdscr, y, left + 3 + len(marker + label), shown,
-                    (curses.A_REVERSE | curses.A_BOLD) if sel_here
-                    else (_pair(2)))
+            focused = (i == sel)
+            if kind == "choice":
+                committed = _cockpit_get(state, r["group"]) == r["value"]
+                label = r["label"]
+            elif kind == "check":
+                committed = state["extras"][r["key"]]
+                label = f"{'[x]' if committed else '[ ]'}  {r['label']:<20} "
+            elif kind == "custom":
+                committed = r["label"].startswith("custom: ")
+                label = r["label"]
+            else:
+                committed = False
+                label = r["label"]
+            if focused:
+                _addstr(stdscr, y, 2, (g["sel"] + label).ljust(bar_w),
+                        _cattr("select"))
+                if kind == "check":
+                    _addstr(stdscr, y, 2 + len(g["sel"]) + len(label),
+                            r["gloss"], _cattr("select"))
+            else:
+                attr = _cattr("ok") if committed else (
+                    _cattr("dim") if kind in ("more", "info") else
+                    _cattr("primary"))
+                _addstr(stdscr, y, 2, "  " + label, attr)
+                if kind == "check":
+                    _addstr(stdscr, y, 4 + len(label), r["gloss"],
+                            _cattr("dim"))
         y += 1
-    hint = fields[sel].get("help", "")
-    if hint:
-        _addstr(stdscr, top + box_h + 1, left + 2, hint, curses.A_DIM)
-    keys = ("Up/Down move   Left/Right change   "
-            + ("d = save & finish" if last else "n = next screen")
-            + ("   b = back" if step > 1 else "") + "   q = cancel")
-    _addstr(stdscr, top + box_h + 2, left + 2, keys, curses.A_DIM)
+    _addstr(stdscr, h - 1, 1, _COCKPIT_FOOTERS[screen], _cattr("dim"))
     stdscr.refresh()
 
 
-def _curses_form(stdscr, title: str, step: int, nsteps: int,
-                 fields: list[dict], last: bool) -> str:
-    """Drive one screen; returns 'next' | 'back' | 'done' | 'cancel'."""
-    selectable = [i for i, f in enumerate(fields) if f["kind"] != "header"]
-    if not selectable:
-        raise _RichUnusable("nothing to select")
-    sel = selectable[0]
-
-    def move(delta: int) -> None:
-        nonlocal sel
-        pos = selectable.index(sel)
-        pos = max(0, min(len(selectable) - 1, pos + delta))
-        sel = selectable[pos]
-
-    while True:
-        h, w = stdscr.getmaxyx()
-        if h < len(fields) + 7 or w < 64:
-            raise _RichUnusable("terminal too small for the rich UI")
-        _draw_form(stdscr, title, step, nsteps, fields, sel, last)
-        ch = stdscr.getch()
-        if ch in (curses.KEY_UP, ord("k")):
-            move(-1)
-        elif ch in (curses.KEY_DOWN, ord("j"), 9):
-            move(1)
-        elif ch in (curses.KEY_LEFT, ord("h")):
-            _change_field(stdscr, fields[sel], -1)
-        elif ch in (curses.KEY_RIGHT, ord("l"), ord(" "),
-                    curses.KEY_ENTER, 10, 13):
-            _change_field(stdscr, fields[sel], 1)
-        elif ch in (ord("n"), curses.KEY_NPAGE):
-            return "done" if last else "next"
-        elif ch in (ord("b"), curses.KEY_PPAGE):
-            if step > 1:
-                return "back"
-        elif ch == ord("d"):
-            return "done"
-        elif ch in (27, ord("q")):
-            return "cancel"
-        # KEY_RESIZE and anything else: redraw
+def _cockpit_get(state: dict, group: tuple):
+    if group[0] == "model":
+        return state["models"].get(group[1], "")
+    return state[group[0]]
 
 
-def _wizard_screens(available: list[str]) -> list[tuple[str, list[dict]]]:
-    """Build the (at most two) custom-wizard screens."""
-    screens: list[tuple[str, list[dict]]] = []
-    if available:
-        fields: list[dict] = []
-        for prov in available:
-            fields.append({"kind": "header", "label": prov})
-            models = _model_choices(prov)
-            fields.append({
-                "kind": "choice", "label": "model", "prov": prov,
-                "key": "model", "idx": 0, "custom": "",
-                "options": ["CLI default", *models, CUSTOM_CHOICE],
-                "prompt": f"custom model id for {prov}:",
-                "help": ("ids pass through to the CLI verbatim — "
-                         "'custom id…' accepts anything the CLI does"),
-            })
-            fields.append({
-                "kind": "choice", "label": "effort", "prov": prov,
-                "key": "effort", "idx": 0, "custom": "",
-                "options": ["CLI default", *EFFORT_CHOICES],
-                "help": "reasoning effort passed per invocation",
-            })
-        screens.append(("providers & models", fields))
-
-    team: list[dict] = []
-    if len(available) > 1:
-        g = _ui_glyphs()
-        perms = [g["sep"].join(p)
-                 for p in itertools.permutations(available)]
-        team.append({
-            "kind": "choice", "label": "routing order", "key": "routing",
-            "idx": 0, "custom": "", "options": perms,
-            "help": "who gets work first when you don't name a provider",
-        })
-    team.append({
-        "kind": "choice", "label": "delegation", "key": "delegation",
-        "idx": 0, "custom": "", "options": [
-            "ask — the lead checks with you once per session",
-            "always — the lead delegates non-trivial work by default",
-            "manual — single-agent unless you explicitly ask",
-        ],
-        "help": "how a lead agent decides to hand work to teammates",
-    })
-    team.append({
-        "kind": "choice", "label": "verbosity", "key": "verbosity",
-        "idx": 0, "custom": "", "options": ["normal", "terse", "detailed"],
-        "help": "how chatty teamctl-driven agents should be",
-    })
-    team.append({"kind": "header", "label": "integrations"})
-    team.append({
-        "kind": "toggle", "label": "tmux pane labels", "key": "tmux",
-        "value": False,
-        "help": "role · model border labels via a marker-guarded ~/.tmux.conf block",
-    })
-    team.append({
-        "kind": "toggle", "label": "claude statusline", "key": "statusline",
-        "value": False,
-        "help": "model · effort · ctx% in Claude Code's status line",
-    })
-    team.append({
-        "kind": "toggle", "label": "lead mode", "key": "lead",
-        "value": False,
-        "help": "manager identity for your CLIs, incl. the per-prompt reminder hook",
-    })
-    screens.append(("team & integrations", team))
-    return screens
+def _cockpit_set(state: dict, group: tuple, value) -> None:
+    if group[0] == "model":
+        state["models"][group[1]] = value
+    else:
+        state[group[0]] = value
+    state["dirty"] = True
 
 
-def _decisions_from_screens(screens: list[tuple[str, list[dict]]],
-                            available: list[str]) -> dict:
-    providers_cfg = {p: {"model": "", "effort": ""} for p in available}
-    d = {"providers_cfg": providers_cfg, "preference": list(available),
-         "verbosity": "normal", "delegation": "ask", "want_tmux": False,
-         "want_statusline": False, "want_lead": False}
-    g = _ui_glyphs()
-    for _, fields in screens:
-        for f in fields:
-            key = f.get("key")
-            if key in ("model", "effort"):
-                val = f.get("custom") or (
-                    "" if f["idx"] == 0 else f["options"][f["idx"]])
-                if val == CUSTOM_CHOICE:
-                    val = ""
-                providers_cfg[f["prov"]][key] = val
-            elif key == "routing":
-                d["preference"] = f["options"][f["idx"]].split(g["sep"])
-            elif key == "delegation":
-                d["delegation"] = f["options"][f["idx"]].split()[0]
-            elif key == "verbosity":
-                d["verbosity"] = f["options"][f["idx"]]
-            elif key == "tmux":
-                d["want_tmux"] = f["value"]
-            elif key == "statusline":
-                d["want_statusline"] = f["value"]
-            elif key == "lead":
-                d["want_lead"] = f["value"]
-    return d
+def _edit_custom_model(stdscr, state: dict, prov: str) -> None:
+    txt = _curses_prompt(stdscr, f"custom model id for {prov}:")
+    state["models"][prov] = txt          # empty = provider default (spec §6.3)
+    state["dirty"] = True
 
 
-def _run_curses_wizard() -> dict | str | None:
-    """Run the arrow-key wizard. Returns the decisions dict, 'cancelled'
-    (user quit), or None (curses could not run here — caller falls back)."""
+def _run_cockpit():
+    """Drive the 3-screen cockpit. Returns (state, ready) on write, or one
+    of 'abort' | 'cancel' | 'plain', or None when curses cannot run."""
     try:
         import locale
         locale.setlocale(locale.LC_ALL, "")
     except Exception:
         pass
-    available = [p for p, installed, authed in _detect_providers()
-                 if installed and authed]
-    screens = _wizard_screens(available)
+    ready = [p for p, installed, authed in _detect_providers()
+             if installed and authed]
+    discovered = {p: _model_choices(p) for p in ready}
+    state = {
+        "models": {p: "" for p in ready},
+        "effort": "high", "voice": "normal", "lead": "ask",
+        "route": sorted(ready),
+        "extras": {k: False for k, _l, _g in _EXTRAS_ROWS},
+        "dirty": False,
+    }
 
     def run(stdscr):
         try:
@@ -2242,19 +2315,87 @@ def _run_curses_wizard() -> dict | str | None:
         except curses.error:
             pass
         _curses_colors()
-        idx = 0
+        screen = 1 if ready else 2       # nothing to pick without providers
+        focus: dict[int, int | None] = {1: None, 2: None, 3: None}
         while True:
-            title, fields = screens[idx]
-            act = _curses_form(stdscr, title, idx + 1, len(screens), fields,
-                               last=(idx == len(screens) - 1))
-            if act == "cancel":
-                return "cancelled"
-            if act == "back":
-                idx = max(0, idx - 1)
-            elif act == "next":
-                idx += 1
-            elif act == "done":
-                return "done"
+            rows = _cockpit_rows(screen, state, ready, discovered)
+            focusables = [i for i, r in enumerate(rows)
+                          if r["kind"] in _FOCUSABLE]
+            if not focusables:
+                raise _RichUnusable("nothing to focus")
+            if focus[screen] is None:
+                if screen == 3:          # fast path: write pre-focused
+                    focus[screen] = next(i for i, r in enumerate(rows)
+                                         if r.get("act") == "write")
+                else:
+                    focus[screen] = focusables[0]
+            if focus[screen] not in focusables:
+                focus[screen] = focusables[0]
+            sel = focus[screen]
+            _paint_cockpit(stdscr, screen, rows, sel, state)
+
+            ch = stdscr.getch()
+            r = rows[sel]
+            if ch in (curses.KEY_UP, ord("k")):
+                pos = focusables.index(sel)
+                focus[screen] = focusables[max(0, pos - 1)]
+            elif ch in (curses.KEY_DOWN, ord("j")):
+                pos = focusables.index(sel)
+                focus[screen] = focusables[min(len(focusables) - 1, pos + 1)]
+            elif ch == 9 and screen == 1:        # Tab: next provider block
+                headers = [i for i, row in enumerate(rows)
+                           if row["kind"] == "header"]
+                nxt = next((i for i in headers if i > sel), None)
+                if nxt is None and headers:
+                    nxt = headers[0]
+                if nxt is not None:
+                    focus[screen] = next(i for i in focusables if i > nxt)
+            elif ch in (10, 13, curses.KEY_ENTER, ord(" ")):
+                if r["kind"] == "choice":
+                    _cockpit_set(state, r["group"], r["value"])
+                elif r["kind"] in ("custom", "more"):
+                    _edit_custom_model(stdscr, state, r["prov"])
+                elif r["kind"] == "check":
+                    state["extras"][r["key"]] = not state["extras"][r["key"]]
+                    state["dirty"] = True
+                elif r["kind"] == "action" and ch != ord(" "):
+                    return r["act"]
+            elif ch == ord("e") and r["kind"] in ("custom", "more"):
+                _edit_custom_model(stdscr, state, r["prov"])
+            elif (ch in (ord("h"), ord("l"), ord("<"), ord(">"))
+                  and r["kind"] == "route"):
+                order = state["route"]
+                idx = order.index(r["prov"])
+                delta = -1 if ch in (ord("h"), ord("<")) else 1
+                j = idx + delta
+                if 0 <= j < len(order):
+                    order[idx], order[j] = order[j], order[idx]
+                    state["dirty"] = True
+                    # follow the moved provider with the focus
+                    focus[screen] = sel + delta
+            elif ch in (ord("n"), curses.KEY_NPAGE):
+                if screen < 3:
+                    screen += 1
+            elif ch in (ord("b"), curses.KEY_PPAGE):
+                if screen > (1 if ready else 2):
+                    screen -= 1
+            elif ch == 27:                      # Esc: back, or quit from 1st
+                if screen > (1 if ready else 2):
+                    screen -= 1
+                elif _confirm_quit(stdscr, state):
+                    return "cancel"
+            elif ch == ord("p"):
+                return "plain"
+            elif ch == ord("q"):
+                if _confirm_quit(stdscr, state):
+                    return "cancel"
+            # anything else (incl. KEY_RESIZE): repaint
+
+    def _confirm_quit(stdscr, st) -> bool:
+        if not st["dirty"]:
+            return True
+        ans = _curses_prompt(stdscr, "quit without writing? [y/N]")
+        return ans.lower().startswith("y")
 
     try:
         outcome = curses.wrapper(run)
@@ -2262,9 +2403,214 @@ def _run_curses_wizard() -> dict | str | None:
         return None
     except Exception:
         return None
-    if outcome == "cancelled":
-        return "cancelled"
-    return _decisions_from_screens(screens, available)
+    if outcome == "write":
+        return (state, ready)
+    return outcome
+
+
+def _apply_cockpit(state: dict, ready: list[str]) -> int:
+    g = _out_glyphs()
+    providers_cfg = {p: {"model": state["models"].get(p, ""),
+                         "effort": state["effort"]} for p in ready}
+    changes: list[tuple[str, str]] = []
+    cfg_path, backed_up = _write_wizard_config(
+        providers_cfg, state["voice"], list(state["route"]), state["lead"],
+        changes)
+    ex = state["extras"]
+    if ex["tmux"]:
+        _install_tmux_block(changes)
+    if ex["statusline"]:
+        _install_statusline(changes)
+    if ex["lead"]:
+        _install_lead(changes, want_hook=ex["hook"])
+    elif ex["hook"]:
+        _lead_install_hook(changes)
+
+    print()
+    print("  " + _fg("ok", "wrote the map"))
+    print("    " + _fg("dim", _tilde(cfg_path)))
+    if backed_up:
+        print("    " + _fg("dim",
+                           f"prior config {g['arrow']} config.toml.bak-teamctl"))
+    print()
+    print("  from here")
+    spawn_prov = state["route"][0] if state["route"] else "claude"
+    for cmd_line in ("teamctl providers",
+                     f"teamctl spawn reviewer --provider {spawn_prov}",
+                     "teamctl config --menu"):
+        print("    " + _fg("primary", cmd_line))
+    installed = [("tmux block", "source: tmux source-file ~/.tmux.conf")
+                 if ex["tmux"] else None,
+                 ("statusline", "~/.local/bin/claude-statusline")
+                 if ex["statusline"] else None,
+                 ("lead mode", "teamctl lead status")
+                 if ex["lead"] else None]
+    installed = [x for x in installed if x]
+    if installed:
+        print()
+        for name, note in installed:
+            print(f"  + {name:<14} {note}")
+        print("  " + _fg("dim", f"revert notes: teamctl lead off {g['dot']} "
+                                "backups *.bak-teamctl"))
+    return 0
+
+
+# --------------------------------------------------------------------------
+# plain path — spec §5: few prompts, Express defaults on blank
+# --------------------------------------------------------------------------
+
+def _snap(value: str, allowed: tuple, default: str) -> str:
+    v = value.strip().lower()
+    if v in allowed:
+        return v
+    if v and v != default:
+        print(f"  snapped to {default}")
+    return default
+
+
+def _plain_init(args: argparse.Namespace) -> int:
+    rows = _detect_providers()
+    ready = sorted(p for p, installed, authed in rows if installed and authed)
+    print("teamctl init — plain path")
+    print()
+    for prov, installed, authed in rows:
+        word = ("ready" if (installed and authed)
+                else ("locked out" if installed else "quiet"))
+        print(f"  {prov:<7} {word}")
+    print()
+
+    models: dict[str, str] = {}
+    if ready:
+        print("  model per provider [enter = cli default]")
+        for prov in ready:
+            models[prov] = _ask(f"  {prov}: ")
+        print()
+    effort = _snap(_ask("  effort [high]: ", "high"), EFFORT_CHOICES, "high")
+    voice = _snap(_ask("  voice  [normal]: ", "normal"), VOICE_CHOICES,
+                  "normal")
+    lead = _snap(_ask("  lead   [ask]: ", "ask"), LEAD_CHOICES, "ask")
+    route = list(ready)
+    if len(ready) > 1:
+        raw = _ask(f"  route  [{','.join(route)}]: ")
+        if raw:
+            chosen = [p.strip() for p in raw.split(",") if p.strip()]
+            picked = [p for p in chosen if p in ready]
+            if picked:                   # unknowns dropped silently (§6.3)
+                route = picked
+    print()
+
+    cfg_path = Path.home() / ".config" / "agent-team" / "config.toml"
+    if not _ask_yn(f"  write {_tilde(cfg_path)}? [Y/n] ", default=True):
+        print("  nothing written.")
+        return 0
+    providers_cfg = {p: {"model": models.get(p, ""), "effort": effort}
+                     for p in ready}
+    changes: list[tuple[str, str]] = []
+    path, backed_up = _write_wizard_config(providers_cfg, voice, route, lead,
+                                           changes)
+    g = _out_glyphs()
+    print(f"  wrote {_tilde(path)}"
+          + (f"  (prior {g['arrow']} config.toml.bak-teamctl)"
+             if backed_up else ""))
+
+    if os.environ.get("TEAMCTL_INIT_EXTRAS") == "1":
+        if _ask_yn("  add tmux pane-border block? [y/N] "):
+            _install_tmux_block(changes)
+        if _ask_yn("  install claude statusline? [y/N] "):
+            _install_statusline(changes)
+        if _ask_yn("  install lead mode? [y/N] "):
+            _install_lead(changes, want_hook=_ask_yn(
+                "  with per-prompt hook? [Y/n] ", default=True))
+    else:
+        print(f"  extras (tmux borders {g['dot']} statusline {g['dot']} lead "
+              "mode): teamctl init --custom, or teamctl lead on")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# express — spec §3: zero questions, one frame
+# --------------------------------------------------------------------------
+
+def _init_express(args: argparse.Namespace) -> int:
+    """Zero-question setup: detect providers, lock sane defaults, write the
+    config, print one frame (spec §3.3–3.8). `--yes` keeps its scripted
+    contract: same writes, no chrome."""
+    rows = _detect_providers()
+    ready = [p for p, installed, authed in rows if installed and authed]
+    providers_cfg = {p: {"model": "", "effort": "high"} for p in ready}
+    preference = sorted(ready)
+    changes: list[tuple[str, str]] = []
+    cfg_path, backed_up = _write_wizard_config(
+        providers_cfg, "normal", preference, "ask", changes)
+
+    if getattr(args, "yes", False):      # scripted: machine-readable, no chrome
+        print(f"wrote {cfg_path}"
+              + (" (backup: config.toml.bak-teamctl)" if backed_up else ""))
+        return 0
+
+    g = _out_glyphs()
+    word_role = {"ready": "ok", "quiet": "dim", "locked out": "warn"}
+    out = [""]
+    out.append("            " + _fg("accent", "t e a m c t l"))
+    out.append("         " + _fg("border", g["rule"] * 17))
+    out.append("")
+    for prov, installed, authed in rows:
+        word = ("ready" if (installed and authed)
+                else ("locked out" if installed else "quiet"))
+        out.append("  " + _fg("dim", g["dot"]) + f" {prov:<12}"
+                   + _fg(word_role[word], word))
+    out.append("")
+    out.append("  " + _fg("primary", "defaults locked"))
+    route_val = (_fg("primary", f" {g['chev']} ".join(preference))
+                 if preference else _fg("dim", g["dash"]))
+    for key, val in (("route", route_val),
+                     ("model", _fg("primary", "(cli default)")),
+                     ("effort", _fg("primary", "high")),
+                     ("voice", _fg("primary", "normal")),
+                     ("lead", _fg("primary", "ask"))):
+        out.append("    " + _fg("dim", f"{key:<10}") + val)
+    out.append("")
+    out.append("  " + _fg("ok", "wrote") + "  " + _fg("dim", _tilde(cfg_path)))
+    if backed_up:
+        out.append("  " + _fg("dim", f"prior config {g['arrow']} "
+                                     "config.toml.bak-teamctl"))
+    if not ready:
+        out.append("  " + _fg("dim", "log a provider in, then re-run"))
+    out.append("")
+    out.append("  " + _fg("dim", f"customize {g['arrow']}  ")
+               + _fg("soft", "teamctl init --custom"))
+    print("\n".join(out))
+    return 0
+
+
+def _init_custom(args: argparse.Namespace) -> int:
+    if not _use_rich_ui():
+        print("no tty. plain path.")
+        print()
+        return _plain_init(args)
+    outcome = _run_cockpit()
+    if outcome == "plain":
+        print()
+        return _plain_init(args)
+    if outcome == "cancel":
+        print("cancelled — nothing was written.")
+        return 1
+    if outcome == "abort":
+        print("left without writing.")
+        return 0
+    if isinstance(outcome, tuple):
+        state, ready = outcome
+        return _apply_cockpit(state, ready)
+    # curses blew up mid-flight: degrade, still functional
+    print("no tty. plain path.")
+    print()
+    return _plain_init(args)
+
+
+def cmd_init(args: argparse.Namespace) -> int:
+    if getattr(args, "custom", False):
+        return _init_custom(args)
+    return _init_express(args)
 
 
 def _write_wizard_config(providers_cfg: dict[str, dict[str, str]],
@@ -2378,220 +2724,6 @@ def _install_lead(changes: list[tuple[str, str]], want_hook: bool) -> None:
             print("settings.json already has a teamctl-lead hook — skipping.")
         elif want_hook:
             _lead_install_hook(changes)
-
-
-def _summarize_changes(changes: list[tuple[str, str]]) -> None:
-    print("\nSummary of changes:")
-    for what, revert in changes:
-        print(f"  * {what}")
-        print(f"    revert: {revert}")
-    if not changes:
-        print("  nothing was changed")
-    _print_controls()
-
-
-def _tint(code: str, s: str) -> str:
-    """ANSI-tint `s` when stdout is a terminal; plain text otherwise."""
-    try:
-        if not sys.stdout.isatty():
-            return s
-    except (AttributeError, ValueError):
-        return s
-    return f"\033[{code}m{s}\033[0m"
-
-
-def _init_express(args: argparse.Namespace) -> int:
-    """Zero-question setup: detect providers, write sane defaults, print a
-    compact summary. Everything it writes is the same schema the custom
-    wizard writes; `teamctl init --custom` / `teamctl config --menu`
-    customize it later."""
-    rows = _detect_providers()
-    available = [p for p, installed, authed in rows if installed and authed]
-    providers_cfg = {p: {"model": "", "effort": ""} for p in available}
-    preference = list(available)  # detected order; the user's to reorder
-
-    changes: list[tuple[str, str]] = []
-    cfg_path, backed_up = _write_wizard_config(
-        providers_cfg, "normal", preference, "ask", changes)
-
-    print(_tint("1;36", f"teamctl {VERSION} — express setup") + "  (zero questions)")
-    print()
-    for prov, installed, authed in rows:
-        if not installed:
-            mark, note = _tint("2", "-"), _tint("2", "not installed")
-        elif not authed:
-            mark, note = _tint("33", "!"), ("installed, not logged in — "
-                                            "log in, then re-run `teamctl init`")
-        else:
-            mark, note = _tint("32", "✓"), "ready"
-        print(f"  {prov:<8}{mark} {note}")
-    print()
-    label = _tint("2", "%-12s")
-    print(f"  {label % 'models'}CLI defaults (per-provider override any time)")
-    print(f"  {label % 'effort'}CLI defaults")
-    if preference:
-        print(f"  {label % 'routing'}{_tint('32', ' → '.join(preference))}"
-              "   (detected order — yours to reorder)")
-    print(f"  {label % 'delegation'}ask — the lead checks with you once per session")
-    print(f"  {label % 'verbosity'}normal")
-    print()
-    print(f"wrote {cfg_path}"
-          + (" (backup: config.toml.bak-teamctl)" if backed_up else ""))
-    if not available:
-        print("\nno provider CLI is ready yet — install or log in to one "
-              "(claude / codex / grok),\nthen re-run `teamctl init`.")
-    print()
-    print("customize any time:  " + _tint("1", "teamctl init --custom")
-          + "   (rich setup: models, routing, integrations)")
-    print("                     " + _tint("1", "teamctl config --menu")
-          + "   (change individual settings)")
-    return 0
-
-
-def _init_line_wizard(args: argparse.Namespace) -> int:
-    """The classic question-driven wizard: the fallback when the rich curses
-    UI cannot run (no tty, TERM too dumb, curses missing, scripted stdin)."""
-    home = Path.home()
-    changes: list[tuple[str, str]] = []
-
-    print("teamctl init — set up defaults and optional integrations.")
-    print("A summary of everything changed, with exact revert steps, is")
-    print("printed at the end. Optional steps default to 'no'.\n")
-
-    print("Provider CLIs:")
-    available: list[str] = []
-    for prov, installed, authed in _detect_providers():
-        if not installed:
-            status = "not installed"
-        elif not authed:
-            status = "installed, but not logged in (log in, then re-run `teamctl init`)"
-        else:
-            status = "available"
-            available.append(prov)
-        print(f"  {prov:<7} {status}")
-    print()
-
-    providers_cfg: dict[str, dict[str, str]] = {}
-    for prov in available:
-        print(f"{prov}: choose defaults (leave blank to keep the CLI's own default).")
-        known = _model_choices(prov)
-        if known:
-            print(f"  {prov} currently reports: {', '.join(known[:10])}")
-        model = _ask(f"  default model for {prov} (any id works — the CLI validates it): ")
-        if prov == "grok":
-            print("  note: grok has no persistent effort setting of its own;")
-            print("  teamctl passes your choice per invocation via --effort.")
-        effort = _ask(f"  default effort for {prov} (e.g. low, medium, high): ")
-        providers_cfg[prov] = {"model": model, "effort": effort}
-
-    # -- routing order: the user's, never teamctl's -------------------------
-    preference: list[str] = []
-    if len(available) == 1:
-        preference = list(available)
-    elif len(available) > 1:
-        raw = _ask("Order your providers for auto-routing, best first, "
-                   f"comma-separated [detected: {', '.join(available)}]: ")
-        if raw:
-            chosen = [p.strip() for p in raw.split(",") if p.strip()]
-            unknown = [p for p in chosen if p not in available]
-            if unknown:
-                print(f"  ignoring unknown/unavailable: {', '.join(unknown)}")
-            preference = [p for p in chosen if p in available]
-        if not preference:
-            preference = sorted(available)
-            print("  no order given — using alphabetical "
-                  f"({' > '.join(preference)}), which is arbitrary; "
-                  "change it any time with `teamctl config routing.preference`.")
-
-    verbosity = "normal"
-    v = _ask("Output verbosity — terse / normal / detailed [normal]: ",
-             "normal").lower()
-    if v in ("terse", "normal", "detailed"):
-        verbosity = v
-    else:
-        print(f"  unrecognized verbosity '{v}'; using 'normal'")
-
-    delegation = "ask"
-    print("Delegation posture — when should a lead agent hand work to")
-    print("teamctl teammates? ask = it checks with you once per session;")
-    print("always = it delegates non-trivial work by default;")
-    print("manual = single-agent unless you explicitly ask.")
-    d = _ask("Default delegation posture — ask / always / manual [ask]: ",
-             "ask").lower()
-    if d in ("ask", "always", "manual"):
-        delegation = d
-    else:
-        print(f"  unrecognized posture '{d}'; using 'ask'")
-
-    cfg_path, backed_up = _write_wizard_config(
-        providers_cfg, verbosity, preference, delegation, changes)
-    print(f"\nwrote {cfg_path}"
-          + (" (previous file backed up to config.toml.bak-teamctl)" if backed_up else ""))
-
-    # -- optional: tmux pane borders + status-bar segment ------------------
-    if _ask_yn("Add teamctl pane-border/status-bar block to ~/.tmux.conf? [y/N] "):
-        _install_tmux_block(changes)
-
-    # -- optional: Claude Code status line ---------------------------------
-    if _ask_yn("Install claude-statusline for Claude Code's status line "
-               "(shows model · effort · ctx%)? [y/N] "):
-        _install_statusline(changes)
-
-    # -- optional: lead mode (manager identity for a lead agent) ------------
-    if _ask_yn("Install lead mode for your agent CLIs (teamctl lead on)? [y/N] "):
-        selected = _lead_selected_clis("")
-        if "claude" in selected:
-            _lead_install_skill(changes)
-        for cli in selected:
-            _lead_install_block(cli, changes)
-        if "claude" in selected:
-            if _lead_status()["hook"] == "installed":
-                print("settings.json already has a teamctl-lead hook — skipping.")
-            elif _ask_yn("Also install the per-prompt reminder hook (recommended "
-                         "— survives context compaction)? [Y/n] ", default=True):
-                _lead_install_hook(changes)
-
-    _summarize_changes(changes)
-    return 0
-
-
-def _apply_custom_decisions(d: dict) -> int:
-    """Write out what the curses wizard collected — the same steps, files,
-    and messages as the line wizard."""
-    changes: list[tuple[str, str]] = []
-    cfg_path, backed_up = _write_wizard_config(
-        d["providers_cfg"], d["verbosity"], d["preference"], d["delegation"],
-        changes)
-    print(f"wrote {cfg_path}"
-          + (" (previous file backed up to config.toml.bak-teamctl)" if backed_up else ""))
-    if d.get("want_tmux"):
-        _install_tmux_block(changes)
-    if d.get("want_statusline"):
-        _install_statusline(changes)
-    if d.get("want_lead"):
-        _install_lead(changes, want_hook=True)
-    _summarize_changes(changes)
-    return 0
-
-
-def _init_custom(args: argparse.Namespace) -> int:
-    if _use_rich_ui():
-        outcome = _run_curses_wizard()
-        if outcome == "cancelled":
-            print("cancelled — nothing was written.")
-            return 1
-        if isinstance(outcome, dict):
-            return _apply_custom_decisions(outcome)
-        print("(rich UI unavailable — using the plain question flow instead)")
-    return _init_line_wizard(args)
-
-
-def cmd_init(args: argparse.Namespace) -> int:
-    if getattr(args, "custom", False):
-        return _init_custom(args)
-    # default (and --yes, kept for compatibility): zero-question express
-    return _init_express(args)
-
 
 # --------------------------------------------------------------------------
 # `teamctl lead` — durable manager identity for a Claude Code lead agent.
@@ -3472,14 +3604,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     ip = sub.add_parser(
         "init",
-        help="express setup: zero questions, sane defaults, compact summary "
-             "(--custom for the rich wizard)")
+        help="express setup: zero questions, sane defaults, one frame "
+             "(--custom for the cockpit)")
     ip.add_argument("--custom", action="store_true",
-                    help="rich arrow-key setup: model/effort picks, routing "
-                         "order, delegation, integrations (falls back to "
-                         "plain prompts without a capable terminal)")
+                    help="the three-screen arrow-key cockpit: models -> "
+                         "posture -> seal (degrades to short plain prompts "
+                         "without a capable terminal)")
     ip.add_argument("--yes", action="store_true",
-                    help="compatibility alias — init is already zero-question")
+                    help="scripted: same writes as express, no chrome")
     ip.set_defaults(func=cmd_init)
 
     lp2 = sub.add_parser(

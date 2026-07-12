@@ -270,23 +270,33 @@ installs, and reports what it removed and what it left alone.
 
 ## Configuration
 
-Two ways in, same config file either way:
+> **`teamctl init` is a twelve-line dark room that finds your providers and
+> locks sane defaults; `--custom` is a three-screen cockpit if you want to
+> aim.**
+
+Three ways in, same config file every way (canonical design:
+[docs/design/installer-spec.md](docs/design/installer-spec.md)):
 
 - **`teamctl init` — express (the default).** Zero questions: detects your
-  provider CLIs, writes sane defaults (each CLI's own model/effort,
-  routing in detected order, delegation `ask`, verbosity `normal`), and
-  prints a compact summary of what it chose. Runs in seconds; `--yes` is
-  accepted as a compatibility alias.
-- **`teamctl init --custom` — the rich wizard.** An arrow-key terminal UI
-  (stdlib curses; two screens with visible progress): per-provider
-  **model picks** from live discovery (plus a `custom id…` escape hatch —
-  ids always pass through verbatim), effort picks, routing order as a
-  selectable ordering, delegation with one-line explanations, and the
-  three optional integrations (tmux pane labels, Claude statusline, lead
-  mode) as clear toggles on one screen. Everything it changes is listed
-  with exact revert steps at the end. Without a capable terminal (no tty,
-  dumb TERM, `TEAMCTL_UI=plain`) it degrades gracefully to plain
-  line prompts with the same questions.
+  provider CLIs (`ready` / `quiet` / `locked out`), locks sane defaults
+  (each CLI's own model, effort `high`, routing in alphabetical order,
+  delegation `ask`, voice `normal`), writes the config, and prints one
+  compact frame. Done in seconds; `--yes` keeps its scripted contract
+  (same writes, no chrome).
+- **`teamctl init --custom` — the cockpit.** A three-screen arrow-key
+  terminal UI (stdlib curses, 256-color, designed for a 100×30 tmux
+  pane): **models** (per-provider picks from live discovery, plus a
+  `custom…` escape hatch — ids always pass through verbatim), **posture**
+  (effort, voice, delegation with one-line glosses, and the routing order
+  reorderable in place with `h`/`l`), and **seal** (a review strip, the
+  optional integrations as off-by-default toggles, and a single
+  `write config` action). `q` quits without writing; `p` drops to the
+  plain path.
+- **The plain path.** Wherever the cockpit can't run — no tty, dumb TERM,
+  `TEAMCTL_UI=plain`, or you pressed `p` — a handful of short prompts
+  with the express defaults on blank. No integration questions (those
+  live on the seal screen and in `teamctl lead on`;
+  `TEAMCTL_INIT_EXTRAS=1` re-enables them for scripted power users).
 
 `~/.config/agent-team/config.toml`:
 
