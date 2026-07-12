@@ -65,7 +65,7 @@ try:
 except Exception:  # pragma: no cover - platforms without curses
     curses = None
 
-VERSION = "0.4.0"
+VERSION = "0.5.0-dev"
 
 # provider -> launch command (as an argv prefix). A positional prompt is
 # appended when supplied. `shell` is a real provider used for verification:
