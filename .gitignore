@@ -9,3 +9,6 @@ tests/providers.json
 tests/rt_mate/
 tests/orphan_mate/
 tests/kill_mate/
+tests/d_mate/
+tests/sig_mate/
+tests/late_mate/

@@ -331,14 +331,15 @@ class InitLeadOfferTests(ThrowawayHomeTestCase):
 
     def test_init_default_answer_skips_lead_mode(self):
         # model, effort, verbosity, tmux n, statusline n, lead <default>
-        rc, _, _ = self.run_cli(["init"], answers=["", "", "", "", "n", "n"])
+        rc, _, _ = self.run_cli(["init", "--custom"],
+                        answers=["", "", "", "", "n", "n"])
         self.assertEqual(rc, 0)
         self.assertFalse(self.skill_md.exists())
 
     def test_init_yes_answer_installs_lead_mode(self):
         # ... lead y, hook n
         rc, out, _ = self.run_cli(
-            ["init"], answers=["", "", "", "", "n", "n", "y", "n"])
+            ["init", "--custom"], answers=["", "", "", "", "n", "n", "y", "n"])
         self.assertEqual(rc, 0)
         self.assertTrue(self.skill_md.exists())
         self.assertIn(tc.LEAD_MD_BEGIN, self.claude_md.read_text())
@@ -510,21 +511,23 @@ class InitRoutingOrderTests(ThrowawayHomeTestCase):
         # claude model/effort, codex model/effort, ROUTING ORDER, verbosity,
         # tmux n, statusline n, lead default-no (answers exhausted)
         rc, _, _ = self.run_cli(
-            ["init"], answers=["", "", "", "", "codex, claude", "", "", "n", "n"])
+            ["init", "--custom"],
+            answers=["", "", "", "", "codex, claude", "", "", "n", "n"])
         self.assertEqual(rc, 0)
         self.assertEqual(self._config()["routing"]["preference"],
                          ["codex", "claude"])
 
     def test_wizard_drops_unknown_entries(self):
         rc, out, _ = self.run_cli(
-            ["init"], answers=["", "", "", "", "gpt, codex", "", "", "n", "n"])
+            ["init", "--custom"],
+            answers=["", "", "", "", "gpt, codex", "", "", "n", "n"])
         self.assertEqual(rc, 0)
         self.assertEqual(self._config()["routing"]["preference"], ["codex"])
         self.assertIn("ignoring unknown", out)
 
     def test_blank_order_falls_back_to_documented_alphabetical(self):
         rc, out, _ = self.run_cli(
-            ["init"], answers=["", "", "", "", "", "", "", "n", "n"])
+            ["init", "--custom"], answers=["", "", "", "", "", "", "", "n", "n"])
         self.assertEqual(rc, 0)
         self.assertEqual(self._config()["routing"]["preference"],
                          ["claude", "codex"])
@@ -734,7 +737,7 @@ class DelegationPostureTests(ThrowawayHomeTestCase):
         try:
             # model, effort, verbosity, DELEGATION=always, tmux n, statusline n
             rc, out, _ = self.run_cli(
-                ["init"], answers=["", "", "", "always", "n", "n"])
+                ["init", "--custom"], answers=["", "", "", "always", "n", "n"])
             self.assertEqual(rc, 0)
             self.assertIn("Delegation posture", out)
             self.assertEqual(

@@ -7,13 +7,14 @@
 #
 # Default flow on an interactive terminal: install, offer to install missing
 # dependencies (tmux defaults to yes — it is a hard requirement), then enter
-# a tmux session and start the `teamctl init` wizard, leaving you inside a
-# working setup.
+# a tmux session and run the zero-question `teamctl init` EXPRESS setup,
+# leaving you inside a working, already-configured session in seconds.
 #
 # Options:
-#   --no-init   skip the wizard/tmux bootstrap at the end
-#   --init      kept for compatibility (the wizard now runs by default)
-#   --no-deps   skip dependency detection and install offers
+#   --no-init      skip the setup/tmux bootstrap at the end
+#   --init         kept for compatibility (express setup runs by default)
+#   --custom-init  run the rich `teamctl init --custom` wizard instead of express
+#   --no-deps      skip dependency detection and install offers
 #
 # The installer never runs a package manager without asking first, and says
 # so when a command will use sudo. Provider CLIs are never auto-installed;
@@ -42,14 +43,16 @@ EOF
 esac
 
 RUN_INIT="yes"
+INIT_ARGS=""
 SKIP_DEPS=0
 for arg in "$@"; do
   case "$arg" in
-    --init) RUN_INIT="yes" ;;
+    --init) RUN_INIT="yes" INIT_ARGS="" ;;
+    --custom-init) RUN_INIT="yes" INIT_ARGS=" --custom" ;;
     --no-init) RUN_INIT="no" ;;
     --no-deps) SKIP_DEPS=1 ;;
     *)
-      echo "install.sh: unknown option '$arg' (supported: --init, --no-init, --no-deps)" >&2
+      echo "install.sh: unknown option '$arg' (supported: --init, --custom-init, --no-init, --no-deps)" >&2
       exit 2
       ;;
   esac
@@ -243,20 +246,23 @@ case ":$PATH:" in
     ;;
 esac
 
-# ---- bootstrap: land the user inside tmux with the wizard running ----------
+# ---- bootstrap: land the user inside tmux with setup already done ----------
 # Default flow (opt out with --no-init): if we're already inside tmux, run
-# the wizard here; otherwise enter (or create) a 'teamctl' tmux session and
-# run the wizard inside it. `< "$TTY_IN"` matters: under curl|bash stdin is
-# the pipe, and tmux needs the real terminal.
+# the express setup here; otherwise enter (or create) a 'teamctl' tmux
+# session and run it inside — express asks ZERO questions and prints what it
+# chose (`--custom-init` swaps in the rich wizard). `< "$TTY_IN"` matters:
+# under curl|bash stdin is the pipe, and tmux needs the real terminal.
 TEAMCTL_Q="$(printf "%q" "$BIN_DIR/teamctl")"
-BOOTSTRAP_CMD="$TEAMCTL_Q init; exec \${SHELL:-/bin/sh}"
+BOOTSTRAP_CMD="$TEAMCTL_Q init$INIT_ARGS; exec \${SHELL:-/bin/sh}"
 if [ "$RUN_INIT" = "no" ]; then
   echo "done. Run '$BIN_DIR/teamctl init' any time to configure defaults."
 elif [ -n "${TMUX:-}" ]; then
-  # already inside tmux: run the wizard right here
+  # already inside tmux: run the setup right here
   if [ "$HAVE_TTY" = 1 ] && [ "$TTY_IN" = /dev/tty ]; then
-    "$BIN_DIR/teamctl" init < /dev/tty
+    # shellcheck disable=SC2086 — INIT_ARGS is "" or " --custom"
+    "$BIN_DIR/teamctl" init$INIT_ARGS < /dev/tty
   else
+    # no terminal to ask on: express, which asks nothing anyway
     "$BIN_DIR/teamctl" init --yes
   fi
 elif command -v tmux >/dev/null 2>&1 && [ "$HAVE_TTY" = 1 ]; then
@@ -269,13 +275,13 @@ elif command -v tmux >/dev/null 2>&1 && [ "$HAVE_TTY" = 1 ]; then
     TTYDEV="$(tty 0<&2 2>/dev/null)" || TTYDEV=""
   fi
   if [ -n "$TTYDEV" ] && [ -e "$TTYDEV" ]; then
-    echo "entering tmux (session 'teamctl') and starting the setup wizard…"
+    echo "entering tmux (session 'teamctl') and running the express setup…"
     exec tmux new-session -A -s teamctl "$BOOTSTRAP_CMD" < "$TTYDEV"
   else
     echo "could not find your terminal device; finish setup with:"
-    echo "  tmux new-session -A -s teamctl '$BIN_DIR/teamctl init; exec \$SHELL'"
+    echo "  tmux new-session -A -s teamctl '$BIN_DIR/teamctl init$INIT_ARGS; exec \$SHELL'"
   fi
 else
   echo "finish setup once you have a terminal and tmux:"
-  echo "  tmux new-session -A -s teamctl '$BIN_DIR/teamctl init; exec \$SHELL'"
+  echo "  tmux new-session -A -s teamctl '$BIN_DIR/teamctl init$INIT_ARGS; exec \$SHELL'"
 fi

@@ -239,6 +239,17 @@ class InstallShTestCase(unittest.TestCase):
         log = self.pm_log()
         self.assertIn("tmux new-session -A -s teamctl", log)
         self.assertIn("teamctl init", log)
+        self.assertNotIn("--custom", log)               # default = express
+
+    def test_custom_init_flag_bootstraps_rich_wizard(self):
+        self.fake_uname("Darwin")
+        self.fake("tmux", f'echo "tmux $*" >> "{self.log}"')
+        r = self.run_install("--custom-init", answers="")
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("entering tmux", r.stdout)
+        log = self.pm_log()
+        self.assertIn("tmux new-session -A -s teamctl", log)
+        self.assertIn("init --custom", log)
 
 
 @unittest.skipUnless(shutil.which("bash") and shutil.which("tmux"),

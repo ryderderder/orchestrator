@@ -17,10 +17,22 @@ curl -fsSL https://raw.githubusercontent.com/ryderderder/teamctl/main/install.sh
 That one line is the whole setup: the installer copies the tools to
 `~/.local/bin`, offers to install anything missing (tmux — a hard
 requirement — defaults to yes; nothing is ever installed without asking),
-then drops you into a tmux session with the onboarding wizard running.
-Opt-outs: `bash -s -- --no-init` (skip the wizard/tmux bootstrap),
-`--no-deps` (skip dependency offers). Safe to re-run. From a checkout:
+then drops you into a tmux session where the zero-question **express
+setup** has already run — providers detected, sane defaults written, a
+compact summary of what was chosen, done in seconds. Want to pick models,
+routing order, and integrations yourself? `bash -s -- --custom-init` runs
+the rich arrow-key wizard instead, and `teamctl init --custom` opens it
+any time later. Other opt-outs: `--no-init` (skip the setup/tmux
+bootstrap), `--no-deps` (skip dependency offers). Safe to re-run. From a
+checkout:
 `git clone https://github.com/ryderderder/teamctl && cd teamctl && ./install.sh`.
+
+![Install: the one-liner installs teamctl, detects dependencies and provider CLIs, then drops you into a tmux session with the setup wizard running](docs/assets/install.gif)
+
+And here is the lead-and-teammates workflow itself — check real usage, route a
+task, spawn teammates as labeled tmux panes, and tear them down cleanly:
+
+![Demo: a lead pane runs teamctl usage and route --dry-run, spawns a code-reviewer and a researcher as tmux panes with role and model labels on their borders, lists them, then shuts both down](docs/assets/demo.gif)
 
 ### Install via your AI agent — paste this prompt
 
@@ -35,17 +47,20 @@ following, in order:
 1. Run the installer:
      curl -fsSL https://raw.githubusercontent.com/ryderderder/teamctl/main/install.sh | bash -s -- --no-init
    (--no-init because you are driving the setup yourself; without it the
-   installer opens an interactive tmux wizard). If it reports missing
+   installer enters tmux and runs the express setup). If it reports missing
    dependencies (tmux, or python3 older than 3.11), install them with the
    system package manager (ask me before anything that needs sudo). If it
    reports no provider CLI, show me the official install one-liners it
    prints and ask which (if any) to run. Make sure ~/.local/bin is on my
    PATH; fix my shell profile if not.
 
-2. Configure it: run `teamctl init` interactively if you have a terminal
-   for me to answer prompts; otherwise run `teamctl init --yes` and tell me
-   I can re-run `teamctl init` or use `teamctl config --menu` later. The
-   wizard asks for MY provider routing order — never pick it for me.
+2. Configure it: run `teamctl init` (the express setup — zero questions;
+   it detects providers, writes sane defaults, and prints a compact
+   summary). Show me that summary, and tell me I can run
+   `teamctl init --custom` (rich arrow-key wizard) or
+   `teamctl config --menu` any time to change it. Express uses the
+   detected provider order for routing; if I want a different order, set
+   it with `teamctl config routing.preference ...` — never pick it for me.
 
 3. Offer me lead mode: explain that `teamctl lead on` installs a manager
    identity into every detected agent CLI's global instructions file
@@ -149,9 +164,16 @@ appears in the status bar.
 A lead agent drives the same commands programmatically: `dispatch` writes the
 task to a per-teammate handoff directory
 (`~/.local/state/agent-team/<role>/`), the teammate's stdout is captured to
-`result.json`, stderr to `error.log`, and an exit `status` file makes
-`result --wait` reliable — including failing fast when a teammate dies
-without reporting.
+`result.json`, stderr goes straight to `error.log` (durably — a background
+tail mirrors it into the pane so the run stays watchable), and an exit
+`status` file makes `result --wait` reliable — including failing fast when
+a teammate dies without reporting, and recording the killing signal
+(`DONE 137 SIGKILL`) when one is killed. A dispatched teammate's pane
+closes by itself when the task finishes; the teammate stays tracked as
+`done` (`teamctl list` shows lifecycle state), `result` keeps working
+indefinitely, `followup` continues the same provider session in a fresh
+pane, and `shutdown` clears the state and handoff artifacts when you're
+finished with the role.
 
 ### Lead-agent playbook
 
@@ -243,9 +265,23 @@ installs, and reports what it removed and what it left alone.
 
 ## Configuration
 
-`teamctl init` walks you through everything below, shows exactly what it
-changes, and prints revert steps. Run it with `--yes` for non-interactive
-defaults (config file only; no tmux or Claude Code changes).
+Two ways in, same config file either way:
+
+- **`teamctl init` — express (the default).** Zero questions: detects your
+  provider CLIs, writes sane defaults (each CLI's own model/effort,
+  routing in detected order, delegation `ask`, verbosity `normal`), and
+  prints a compact summary of what it chose. Runs in seconds; `--yes` is
+  accepted as a compatibility alias.
+- **`teamctl init --custom` — the rich wizard.** An arrow-key terminal UI
+  (stdlib curses; two screens with visible progress): per-provider
+  **model picks** from live discovery (plus a `custom id…` escape hatch —
+  ids always pass through verbatim), effort picks, routing order as a
+  selectable ordering, delegation with one-line explanations, and the
+  three optional integrations (tmux pane labels, Claude statusline, lead
+  mode) as clear toggles on one screen. Everything it changes is listed
+  with exact revert steps at the end. Without a capable terminal (no tty,
+  dumb TERM, `TEAMCTL_UI=plain`) it degrades gracefully to plain
+  line prompts with the same questions.
 
 `~/.config/agent-team/config.toml`:
 
@@ -270,7 +306,8 @@ effort = "high"             # grok has no persistent effort setting of its
                             # own; teamctl passes this per invocation
 
 [routing]
-preference = ["codex", "claude"]  # YOUR order — the wizard asks for it.
+preference = ["codex", "claude"]  # YOUR order — express uses the detected
+                            # order; the custom wizard asks for it.
                             # `route` picks the first available entry, and
                             # a bare spawn/dispatch (no --provider) uses the
                             # first entry. Without a configured preference
@@ -306,8 +343,14 @@ teamctl config                                  # show current settings as dotte
 teamctl config providers.claude.model           # show one value
 teamctl config providers.claude.model sonnet    # set one key (others preserved)
 teamctl config routing.preference "codex,claude"  # comma-separated -> list
-teamctl config --menu                           # numbered menu: pick, edit, repeat
+teamctl config --menu                           # arrow-key settings editor
 ```
+
+`config --menu` uses the same rich curses UI as the custom wizard —
+arrow keys move, Left/Right cycles known values (delegation, verbosity,
+routing order), Enter edits anything as text, `s` saves (with a backup).
+On a terminal that can't run it, the numbered pick-a-setting menu appears
+instead.
 
 Or from a chat: with [lead mode](#lead-mode) on, tell your lead agent
 *"open the teamctl menu"* — the teamctl-lead skill teaches it to read your

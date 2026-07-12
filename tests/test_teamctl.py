@@ -10,6 +10,10 @@ Run with:  python3 -m unittest discover -s tests
 import importlib.util
 import json
 import os
+import shlex
+import shutil
+import subprocess
+import sys
 import unittest
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
@@ -322,7 +326,7 @@ class VersionTests(unittest.TestCase):
             tc.main(["--version"])
         self.assertEqual(cm.exception.code, 0)
         self.assertIn(tc.VERSION, buf.getvalue())
-        self.assertEqual(tc.VERSION, "0.2.0")
+        self.assertEqual(tc.VERSION, "0.3.0")
 
 
 class CliTests(unittest.TestCase):
@@ -857,7 +861,10 @@ class RouteTests(unittest.TestCase):
 
 
 class InitTests(unittest.TestCase):
-    """`teamctl init` wizard, run entirely against a throwaway HOME."""
+    """`teamctl init` (express) and `init --custom` (rich wizard, exercised
+    through its scripted line-prompt fallback: redirected stdio is not a
+    tty, so the curses path degrades exactly as documented), run entirely
+    against a throwaway HOME."""
 
     def setUp(self):
         import tempfile
@@ -904,21 +911,39 @@ class InitTests(unittest.TestCase):
         self.assertTrue(path.exists(), "config.toml was not written")
         return tomllib.loads(path.read_text())
 
-    def test_yes_writes_defaults_and_touches_nothing_else(self):
+    def test_express_writes_defaults_and_touches_nothing_else(self):
+        # plain `init` (and --yes) is the ZERO-QUESTION express path
         rc, out = self._run_init(None, "--yes")
         self.assertEqual(rc, 0)
         cfg = self._config()
         self.assertEqual(cfg["output"]["verbosity"], "normal")
         # blank model/effort => the provider section carries no keys
         self.assertEqual(cfg.get("providers", {}).get("claude", {}), {})
-        # --yes must not touch tmux.conf or Claude Code settings
+        # express must not touch tmux.conf or Claude Code settings
         self.assertFalse((self.home / ".tmux.conf").exists())
         self.assertFalse((self.home / ".claude" / "settings.json").exists())
-        self.assertIn("Summary of changes", out)
+        self.assertIn("customize any time", out)
+
+    def test_express_asks_no_questions(self):
+        # any prompt during express is a regression
+        def explode(prompt):
+            raise AssertionError(f"express asked a question: {prompt!r}")
+        tc._input = explode
+        rc, out = self._run_init(None)
+        self.assertEqual(rc, 0)
+        cfg = self._config()
+        self.assertEqual(cfg["output"]["verbosity"], "normal")
+        self.assertEqual(cfg["lead"]["delegation"], "ask")
+        self.assertEqual(cfg["routing"]["preference"], ["claude"])
+        self.assertIn("express setup", out)
+        self.assertIn("teamctl init --custom", out)
+        self.assertIn("teamctl config --menu", out)
 
     def test_scripted_answers_reach_config(self):
+        # --custom degrades to the scripted line prompts under a non-tty.
         # answers: claude model, claude effort, verbosity, tmux y/n, statusline y/n
-        rc, out = self._run_init(["opus", "high", "terse", "", "n", "n"])
+        rc, out = self._run_init(["opus", "high", "terse", "", "n", "n"],
+                                 "--custom")
         self.assertEqual(rc, 0)
         cfg = self._config()
         self.assertEqual(cfg["providers"]["claude"]["model"], "opus")
@@ -927,11 +952,23 @@ class InitTests(unittest.TestCase):
         self.assertIn("revert", out)
 
     def test_rerun_backs_up_previous_config(self):
-        rc, _ = self._run_init(["opus", "high", "normal", "", "n", "n"])
+        rc, _ = self._run_init(["opus", "high", "normal", "", "n", "n"],
+                               "--custom")
         self.assertEqual(rc, 0)
-        rc, _ = self._run_init(["sonnet", "", "normal", "", "n", "n"])
+        rc, _ = self._run_init(["sonnet", "", "normal", "", "n", "n"],
+                               "--custom")
         self.assertEqual(rc, 0)
         self.assertEqual(self._config()["providers"]["claude"]["model"], "sonnet")
+        bak = self.home / ".config" / "agent-team" / "config.toml.bak-teamctl"
+        self.assertTrue(bak.exists())
+        self.assertIn('model = "opus"', bak.read_text())
+
+    def test_express_rerun_backs_up_previous_config(self):
+        rc, _ = self._run_init(["opus", "high", "normal", "", "n", "n"],
+                               "--custom")
+        self.assertEqual(rc, 0)
+        rc, _ = self._run_init(None)
+        self.assertEqual(rc, 0)
         bak = self.home / ".config" / "agent-team" / "config.toml.bak-teamctl"
         self.assertTrue(bak.exists())
         self.assertIn('model = "opus"', bak.read_text())
@@ -939,7 +976,7 @@ class InitTests(unittest.TestCase):
     def test_tmux_block_appended_once_and_backed_up(self):
         conf = self.home / ".tmux.conf"
         conf.write_text("set -g mouse on\n")
-        rc, _ = self._run_init(["", "", "", "", "y", "n"])
+        rc, _ = self._run_init(["", "", "", "", "y", "n"], "--custom")
         self.assertEqual(rc, 0)
         text = conf.read_text()
         self.assertEqual(text.count(tc.TMUX_MARKER_BEGIN), 1)
@@ -948,7 +985,7 @@ class InitTests(unittest.TestCase):
         self.assertIn("pane-border-format", text)
         self.assertTrue((self.home / ".tmux.conf.bak-teamctl").exists())
         # second accept must not duplicate the block
-        rc, out = self._run_init(["", "", "", "", "y", "n"])
+        rc, out = self._run_init(["", "", "", "", "y", "n"], "--custom")
         self.assertEqual(rc, 0)
         self.assertEqual(conf.read_text().count(tc.TMUX_MARKER_BEGIN), 1)
         self.assertIn("skipping", out)
@@ -957,7 +994,7 @@ class InitTests(unittest.TestCase):
         settings = self.home / ".claude" / "settings.json"
         settings.parent.mkdir(parents=True)
         settings.write_text(json.dumps({"model": "opus"}, indent=2))
-        rc, _ = self._run_init(["", "", "", "", "n", "y"])
+        rc, _ = self._run_init(["", "", "", "", "n", "y"], "--custom")
         self.assertEqual(rc, 0)
         data = json.loads(settings.read_text())
         self.assertEqual(data["model"], "opus")          # existing keys untouched
@@ -968,18 +1005,34 @@ class InitTests(unittest.TestCase):
         self.assertTrue(Path(str(settings) + ".bak-teamctl").exists())
         # second run: key already present -> settings must be left alone
         before = settings.read_text()
-        rc, out = self._run_init(["", "", "", "", "n", "y"])
+        rc, out = self._run_init(["", "", "", "", "n", "y"], "--custom")
         self.assertEqual(rc, 0)
         self.assertEqual(settings.read_text(), before)
         self.assertIn("already has a statusLine key", out)
 
     def test_statusline_creates_settings_when_absent(self):
-        rc, _ = self._run_init(["", "", "", "", "n", "y"])
+        rc, _ = self._run_init(["", "", "", "", "n", "y"], "--custom")
         self.assertEqual(rc, 0)
         settings = self.home / ".claude" / "settings.json"
         data = json.loads(settings.read_text())
         self.assertEqual(data["statusLine"]["command"],
                          "~/.local/bin/claude-statusline")
+
+    def test_teamctl_ui_plain_forces_line_fallback(self):
+        # even if stdio looked like a tty, TEAMCTL_UI=plain must force the
+        # classic prompts (and never import-time-require curses)
+        os.environ["TEAMCTL_UI"] = "plain"
+        try:
+            self.assertFalse(tc._use_rich_ui())
+        finally:
+            os.environ.pop("TEAMCTL_UI", None)
+
+    def test_use_rich_ui_false_without_tty(self):
+        # under redirected stdio (this test process) the rich UI must bow out
+        import contextlib
+        import io
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertFalse(tc._use_rich_ui())
 
 
 class ResultWaitLivenessTests(unittest.TestCase):
@@ -1415,6 +1468,108 @@ class LiveTmuxTests(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("failed (teammate died before writing status)", err.getvalue())
         self.assertLess(elapsed, 5.0)
+
+
+@unittest.skipUnless(shutil.which("tmux"), "requires tmux")
+class CursesLiveTests(unittest.TestCase):
+    """The rich curses UI rendered FOR REAL inside a scratch tmux server
+    (its own -L socket — never the user's session) and driven with
+    send-keys: proves curses renders in tmux (the same terminal surface as
+    tmux-over-ssh) and that arrow-key choices land in config.toml."""
+
+    def setUp(self):
+        import tempfile
+        self.tmpdir = tempfile.TemporaryDirectory()
+        root = Path(self.tmpdir.name)
+        self.home = root / "home"
+        self.home.mkdir()
+        (self.home / ".claude.json").write_text("{}")   # claude "logged in"
+        fakebin = root / "bin"
+        fakebin.mkdir()
+        stub = fakebin / "claude"                        # claude "installed"
+        stub.write_text("#!/bin/sh\nexit 0\n")
+        stub.chmod(0o755)
+        self.path = f"{fakebin}:{os.environ.get('PATH', '')}"
+        self.sock = f"teamctl-curses-test-{os.getpid()}"
+
+    def tearDown(self):
+        subprocess.run(["tmux", "-L", self.sock, "kill-server"],
+                       capture_output=True)
+        self.tmpdir.cleanup()
+
+    def _tmux(self, *args):
+        return subprocess.run(["tmux", "-L", self.sock, *args],
+                              capture_output=True, text=True)
+
+    def _capture(self) -> str:
+        return self._tmux("capture-pane", "-p").stdout
+
+    def _wait_for(self, needle: str, timeout: float = 20.0) -> str:
+        import time as _t
+        deadline = _t.monotonic() + timeout
+        while _t.monotonic() < deadline:
+            cap = self._capture()
+            if needle in cap:
+                return cap
+            _t.sleep(0.3)
+        self.fail(f"never saw {needle!r}; last capture:\n{self._capture()}")
+
+    def _start(self, teamctl_args: str) -> None:
+        cmd = (f"env HOME={shlex.quote(str(self.home))} "
+               f"PATH={shlex.quote(self.path)} "
+               f"TEAMCTL_STATE={shlex.quote(str(self.home / 'state.json'))} "
+               f"{shlex.quote(sys.executable)} {shlex.quote(str(TEAMCTL))} "
+               f"{teamctl_args}; sleep 30")
+        self._tmux("new-session", "-d", "-x", "110", "-y", "35", cmd)
+
+    def test_custom_wizard_renders_in_tmux_and_writes_config(self):
+        self._start("init --custom")
+        cap = self._wait_for("teamctl setup")
+        self.assertIn("providers & models", cap)
+        self.assertIn("claude", cap)
+        self.assertIn("model", cap)
+        # Right: model CLI default -> sonnet; Down; Right: effort -> low
+        self._tmux("send-keys", "Right")
+        self._wait_for("sonnet")
+        self._tmux("send-keys", "Down")
+        self._tmux("send-keys", "Right")
+        self._wait_for("low")
+        self._tmux("send-keys", "n")                    # next screen
+        cap = self._wait_for("team & integrations")
+        self.assertIn("delegation", cap)
+        self.assertIn("integrations", cap)
+        self._tmux("send-keys", "d")                    # save & finish
+        self._wait_for("Summary of changes")
+        cfg = self.home / ".config" / "agent-team" / "config.toml"
+        self.assertTrue(cfg.exists(), "wizard did not write config.toml")
+        text = cfg.read_text()
+        self.assertIn('model = "sonnet"', text)
+        self.assertIn('effort = "low"', text)
+        self.assertIn('delegation = "ask"', text)
+        self.assertIn('verbosity = "normal"', text)
+
+    def test_custom_wizard_cancel_writes_nothing(self):
+        self._start("init --custom")
+        self._wait_for("teamctl setup")
+        self._tmux("send-keys", "q")
+        self._wait_for("cancelled — nothing was written")
+        self.assertFalse(
+            (self.home / ".config" / "agent-team" / "config.toml").exists())
+
+    def test_config_menu_curses_cycles_and_saves(self):
+        cfg = self.home / ".config" / "agent-team" / "config.toml"
+        cfg.parent.mkdir(parents=True)
+        cfg.write_text('[output]\nverbosity = "normal"\n\n'
+                       '[lead]\ndelegation = "ask"\n')
+        self._start("config --menu")
+        cap = self._wait_for("teamctl settings")
+        self.assertIn("output.verbosity", cap)
+        self._tmux("send-keys", "Right")                # normal -> terse
+        self._wait_for('"terse"')
+        self._tmux("send-keys", "s")                    # save
+        self._wait_for("wrote")
+        self.assertIn('verbosity = "terse"', cfg.read_text())
+        self.assertIn('delegation = "ask"', cfg.read_text())
 
 
 if __name__ == "__main__":

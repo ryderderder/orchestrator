@@ -12,17 +12,20 @@ following, in order:
 1. Run the installer:
      curl -fsSL https://raw.githubusercontent.com/ryderderder/teamctl/main/install.sh | bash -s -- --no-init
    (--no-init because you are driving the setup yourself; without it the
-   installer opens an interactive tmux wizard). If it reports missing
+   installer enters tmux and runs the express setup). If it reports missing
    dependencies (tmux, or python3 older than 3.11), install them with the
    system package manager (ask me before anything that needs sudo). If it
    reports no provider CLI, show me the official install one-liners it
    prints and ask which (if any) to run. Make sure ~/.local/bin is on my
    PATH; fix my shell profile if not.
 
-2. Configure it: run `teamctl init` interactively if you have a terminal
-   for me to answer prompts; otherwise run `teamctl init --yes` and tell me
-   I can re-run `teamctl init` or use `teamctl config --menu` later. The
-   wizard asks for MY provider routing order — never pick it for me.
+2. Configure it: run `teamctl init` (the express setup — zero questions;
+   it detects providers, writes sane defaults, and prints a compact
+   summary). Show me that summary, and tell me I can run
+   `teamctl init --custom` (rich arrow-key wizard) or
+   `teamctl config --menu` any time to change it. Express uses the
+   detected provider order for routing; if I want a different order, set
+   it with `teamctl config routing.preference ...` — never pick it for me.
 
 3. Offer me lead mode: explain that `teamctl lead on` installs a manager
    identity into every detected agent CLI's global instructions file
