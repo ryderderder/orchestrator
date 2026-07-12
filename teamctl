@@ -71,7 +71,7 @@ try:
 except Exception:  # pragma: no cover - platforms without curses
     curses = None
 
-VERSION = "0.5.0-dev"
+VERSION = "0.5.0"
 
 # --------------------------------------------------------------------------
 # the provider-spec registry — every provider, built-in OR user-defined via
@@ -213,7 +213,8 @@ PROVIDER_SPECS: dict[str, dict] = {
         "auth_env_extra": ["GOOGLE_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS"],
         "auth_files": ["~/.gemini/oauth_creds.json"],
         # no standalone login subcommand exists; /auth is the in-TUI flow
-        "login_hint": "run `gemini`, then /auth (Login with Google)",
+        # (the hint renders inside backticks — keep it quote-free)
+        "login_hint": "run gemini, then /auth (Login with Google)",
         # honesty over cheer: gemini exposes NO local usage feed (no
         # statusline pipe, no session-log rate_limits, and current builds
         # removed the /stats used-% display) — it stays 'quiet' for good
