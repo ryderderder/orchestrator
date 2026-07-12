@@ -1,0 +1,1315 @@
+#!/usr/bin/env python3
+"""teamctl - minimal, provider-agnostic agent-teammate control on tmux.
+
+Usage:
+
+    teamctl init [--yes]
+    teamctl spawn <role> [--provider claude|codex|grok|shell] [--prompt TEXT] [--cwd DIR]
+    teamctl list
+    teamctl send <role> "<instruction>" [--no-enter]
+    teamctl dispatch <role> --provider P --task "…" [--context-file F] [--model M] [--effort E]
+    teamctl result <role> [--wait]
+    teamctl followup <role> --task "…"
+    teamctl route <role> --task "…" [--providers claude,codex,grok] [--dry-run]
+    teamctl providers
+    teamctl usage
+    teamctl shutdown <role>
+    teamctl --version
+
+Every teammate is a tmux pane running a provider CLI. The lead (this process)
+never edits a teammate's work; it only spawns, lists, and cleanly shuts down.
+
+Providers share one launch shape -- `<cmd> [flags] "<prompt>"` starts an
+interactive session seeded with the prompt -- so Claude Code, Codex, and Grok
+all get the same tmux + teammate capability.
+
+State lives in a small JSON file (default ~/.local/state/agent-team/state.json,
+override with $TEAMCTL_STATE). Access is serialized with an flock so concurrent
+`spawn`/`shutdown` calls can't race and orphan a pane. Nothing global or
+system-level is touched.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+from contextlib import contextmanager
+from pathlib import Path
+
+try:
+    import tomllib  # py3.11+
+except ModuleNotFoundError:  # pragma: no cover
+    tomllib = None
+
+VERSION = "0.1.0"
+
+# provider -> launch command (as an argv prefix). A positional prompt is
+# appended when supplied. `shell` is a real provider used for verification:
+# it just holds an interactive shell in the pane, proving the tmux mechanics
+# without launching an AI agent.
+PROVIDERS: dict[str, list[str]] = {
+    "claude": ["claude"],
+    "codex": ["codex"],
+    "grok": ["grok"],
+    "shell": [os.environ.get("SHELL", "/bin/bash")],
+}
+
+
+class TeamctlError(Exception):
+    """A user-facing failure; main() renders it to stderr with a clean exit."""
+
+
+def state_path() -> Path:
+    override = os.environ.get("TEAMCTL_STATE")
+    if override:
+        return Path(override)
+    return Path.home() / ".local" / "state" / "agent-team" / "state.json"
+
+
+def handoff_dir(role: str) -> Path:
+    """Per-teammate folder holding task.md, result.json, status, error.log, pid."""
+    return state_path().parent / role
+
+
+# Where each provider stores auth, for the availability probe.
+AUTH_PATHS = {
+    "claude": Path.home() / ".claude.json",
+    "codex": Path.home() / ".codex" / "auth.json",
+    "grok": Path.home() / ".grok",
+}
+
+
+def load_config() -> dict:
+    """Preferences written by `teamctl init`; everything works without them."""
+    path = Path.home() / ".config" / "agent-team" / "config.toml"
+    if not path.exists() or tomllib is None:
+        return {}
+    try:
+        return tomllib.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def provider_defaults(provider: str) -> tuple[str | None, str | None]:
+    prov = (load_config().get("providers") or {}).get(provider) or {}
+    return prov.get("model"), prov.get("effort")
+
+
+def headless_argv(provider: str, task: str, model: str, effort: str) -> list[str]:
+    """Headless (non-interactive) launch argv for each provider."""
+    if provider == "claude":
+        a = ["claude", "-p", task, "--output-format", "json"]
+        if model:
+            a += ["--model", model]
+        if effort:
+            a += ["--effort", effort]
+        return a
+    if provider == "grok":
+        a = ["grok", "--single", task, "--output-format", "json"]
+        if model:
+            a += ["-m", model]
+        if effort:
+            a += ["--effort", effort]
+        return a
+    if provider == "codex":
+        a = ["codex", "exec", task]
+        if model:
+            a += ["-m", model]
+        if effort:
+            a += ["-c", f'model_reasoning_effort="{effort}"']
+        return a
+    if provider == "shell":  # fake provider for tests: task is a shell snippet
+        return [os.environ.get("SHELL", "/bin/bash"), "-c", task]
+    raise TeamctlError(f"no headless adapter for provider '{provider}'")
+
+
+def resume_argv(provider: str, task: str, model: str, effort: str) -> list[str]:
+    """Continue the provider's most recent session (best-effort per provider)."""
+    if provider == "claude":
+        a = ["claude", "-p", task, "--output-format", "json", "-c"]
+        if model:
+            a += ["--model", model]
+        return a
+    if provider == "grok":
+        a = ["grok", "--single", task, "--output-format", "json", "-c"]
+        if model:
+            a += ["-m", model]
+        return a
+    if provider == "codex":
+        return ["codex", "exec", "resume", "--last", task]
+    if provider == "shell":
+        return [os.environ.get("SHELL", "/bin/bash"), "-c", task]
+    raise TeamctlError(f"no resume adapter for provider '{provider}'")
+
+
+def classify_output(text: str) -> str:
+    """Recognize credit-exhaustion / auth failures in provider output."""
+    low = text.lower()
+    if any(s in low for s in ("usage limit", "rate limit", "quota", "out of credits",
+                              "insufficient credit")):
+        return "exhausted"
+    if any(s in low for s in ("unauthorized", "not logged in", "authentication",
+                              "please log in", "invalid api key")):
+        return "auth-error"
+    return "ok"
+
+
+def load_state() -> dict:
+    p = state_path()
+    if not p.exists():
+        return {"teammates": {}}
+    try:
+        data = json.loads(p.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {"teammates": {}}
+    data.setdefault("teammates", {})
+    return data
+
+
+def save_state(state: dict) -> None:
+    p = state_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(state, indent=2, sort_keys=True))
+    tmp.replace(p)
+
+
+@contextmanager
+def state_lock():
+    """Serialize read-modify-write of the state file across processes."""
+    p = state_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    lock = p.with_suffix(".lock")
+    with open(lock, "w") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+def tmux(*args: str, check: bool = True, capture: bool = True) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(
+            ["tmux", *args],
+            check=check,
+            capture_output=capture,
+            text=True,
+        )
+    except FileNotFoundError as exc:  # tmux not installed
+        raise TeamctlError(
+            "tmux not found on PATH; install tmux or start inside a tmux session."
+        ) from exc
+
+
+def in_tmux() -> bool:
+    return bool(os.environ.get("TMUX"))
+
+
+def live_pane_ids() -> set[str]:
+    try:
+        out = tmux("list-panes", "-a", "-F", "#{pane_id}").stdout
+    except subprocess.CalledProcessError:
+        return set()
+    return {line.strip() for line in out.splitlines() if line.strip()}
+
+
+def reconcile(state: dict) -> dict:
+    """Drop teammates whose pane is gone so `list` reflects reality."""
+    live = live_pane_ids()
+    survivors = {
+        role: info
+        for role, info in state["teammates"].items()
+        if info.get("pane_id") in live
+    }
+    if len(survivors) != len(state["teammates"]):
+        state["teammates"] = survivors
+        save_state(state)
+    return state
+
+
+def interactive_flags(provider: str, model: str, effort: str) -> list[str]:
+    """Model/effort flags for an interactive launch."""
+    f: list[str] = []
+    if provider == "claude":
+        if model:
+            f += ["--model", model]
+        if effort:
+            f += ["--effort", effort]
+    elif provider == "grok":
+        if model:
+            f += ["-m", model]
+        if effort:
+            f += ["--effort", effort]
+    elif provider == "codex":
+        if model:
+            f += ["-m", model]
+        if effort:
+            f += ["-c", f'model_reasoning_effort="{effort}"']
+    return f
+
+
+def build_launch_line(provider: str, prompt: str, cwd: str,
+                      model: str = "", effort: str = "") -> str:
+    """The shell command a teammate pane runs. All values are shell-quoted."""
+    launch = list(PROVIDERS[provider]) + interactive_flags(provider, model, effort)
+    if prompt:
+        launch.append(prompt)
+    return f"cd {shlex.quote(cwd)} && exec {' '.join(shlex.quote(a) for a in launch)}"
+
+
+def _pane_size(pane_id: str) -> tuple[int, int]:
+    try:
+        out = tmux("display-message", "-p", "-t", pane_id,
+                   "#{pane_width} #{pane_height}").stdout.split()
+        return int(out[0]), int(out[1])
+    except (subprocess.CalledProcessError, ValueError, IndexError):
+        return 0, 0
+
+
+def _open_pane(cmd: str, existing: list[str]) -> str:
+    """Open a teammate as a PANE in the lead's window, keeping the lead on the
+    left and teammates in a grid of squares to its right.
+
+    The first teammate splits the lead pane horizontally (taking the right
+    half). Each later teammate splits the largest existing teammate pane,
+    choosing the split direction that keeps panes square-looking (a terminal
+    cell is ~2x taller than wide, so a pane reads as square when width is
+    about twice its height). Four teammates thus form a 2x2 grid beside the
+    lead; the lead pane itself is never re-split after the first."""
+    lead = os.environ.get("TMUX_PANE")
+    live = [p for p in existing if p in live_pane_ids()]
+
+    if not live:
+        target, flag = lead, "-h"
+    else:
+        target, best_area, w, h = None, -1, 0, 0
+        for p in live:
+            pw, ph = _pane_size(p)
+            if pw * ph > best_area:
+                target, best_area, w, h = p, pw * ph, pw, ph
+        if target is None:
+            target = lead
+            flag = "-h"
+        else:
+            flag = "-h" if w >= 2 * h else "-v"
+
+    argv = ["split-window", flag, "-P", "-F", "#{pane_id}"]
+    if target:
+        argv += ["-t", target]
+    argv.append(cmd)
+    return tmux(*argv).stdout.strip()
+
+
+def _set_pane_title(pane_id: str, role: str, model: str = "") -> None:
+    """Tag a teammate pane with its role/model so tmux can show a sticky
+    per-pane label. Uses per-pane user options @role/@model (which the
+    provider CLI can't clobber, unlike the pane title) — the tmux
+    pane-border-format / status bar read these. Also sets the title for the
+    benefit of other tools. Not rendered via #() shell commands, which some
+    tmux builds do not execute in status formats."""
+    title = f"{role} · {model}" if model else role
+    for opt, val in (("@role", role), ("@model", model)):
+        try:
+            tmux("set-option", "-p", "-t", pane_id, opt, val, check=False)
+        except subprocess.CalledProcessError:
+            pass
+    try:
+        tmux("select-pane", "-t", pane_id, "-T", title)
+    except subprocess.CalledProcessError:
+        pass  # pane titles are cosmetic
+
+
+def cmd_spawn(args: argparse.Namespace) -> int:
+    if args.provider not in PROVIDERS:
+        print(f"teamctl: unknown provider '{args.provider}'.", file=sys.stderr)
+        return 2
+
+    cwd = os.path.abspath(os.path.expanduser(args.cwd)) if args.cwd else os.getcwd()
+    d_model, d_effort = provider_defaults(args.provider)
+    model = args.model or d_model or ""
+    effort = args.effort or d_effort or ""
+    inner = build_launch_line(args.provider, args.prompt, cwd, model, effort)
+
+    # dry-run is a pure preview: no tmux and no state needed.
+    if args.dry_run:
+        print(inner)
+        return 0
+
+    if not in_tmux():
+        print("teamctl: not inside a tmux session; start one first.", file=sys.stderr)
+        return 2
+
+    with state_lock():
+        state = reconcile(load_state())
+        if args.role in state["teammates"]:
+            print(
+                f"teamctl: teammate '{args.role}' already exists "
+                f"(pane {state['teammates'][args.role]['pane_id']}). "
+                "Refusing to run two on the same role.",
+                file=sys.stderr,
+            )
+            return 1
+
+        existing = [i.get("pane_id", "") for i in state["teammates"].values()]
+        pane_id = _open_pane(inner, existing)
+        _set_pane_title(pane_id, args.role, model)
+
+        state["teammates"][args.role] = {
+            "provider": args.provider,
+            "pane_id": pane_id,
+            "cwd": cwd,
+            "model": model,
+            "effort": effort,
+            "prompt": args.prompt or "",
+            "mode": "interactive",
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        }
+        save_state(state)
+
+    print(f"spawned teammate '{args.role}' ({args.provider}"
+          f"{'/' + model if model else ''}) in pane {pane_id}")
+    return 0
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+    with state_lock():
+        state = reconcile(load_state())
+    mates = state["teammates"]
+    if args.json:
+        print(json.dumps(mates, indent=2, sort_keys=True))
+        return 0
+    if not mates:
+        print("no active teammates")
+        return 0
+    width = max(len(r) for r in mates)
+    print(f"{'ROLE'.ljust(width)}  PROVIDER  PANE     CREATED")
+    for role in sorted(mates):
+        i = mates[role]
+        print(
+            f"{role.ljust(width)}  {i['provider']:<8}  {i['pane_id']:<7}  {i.get('created_at', '')}"
+        )
+    return 0
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _descendants(pid: int) -> list[int]:
+    """All descendant PIDs of pid (portable via pgrep -P)."""
+    out, stack = [], [pid]
+    while stack:
+        parent = stack.pop()
+        res = subprocess.run(["pgrep", "-P", str(parent)],
+                             capture_output=True, text=True)
+        for line in res.stdout.split():
+            try:
+                child = int(line)
+            except ValueError:
+                continue
+            out.append(child)
+            stack.append(child)
+    return out
+
+
+def _kill_tree(pid: int) -> bool:
+    """TERM then KILL a process and all descendants; True once all are gone."""
+    pids = [pid] + _descendants(pid)
+    for p in pids:
+        try:
+            os.kill(p, 15)
+        except (ProcessLookupError, PermissionError):
+            pass
+    for _ in range(10):
+        if not any(_pid_alive(p) for p in pids):
+            return True
+        time.sleep(0.15)
+    # escalate
+    for p in pids:
+        if _pid_alive(p):
+            try:
+                os.kill(p, 9)
+            except (ProcessLookupError, PermissionError):
+                pass
+    for _ in range(4):
+        if not any(_pid_alive(p) for p in pids):
+            return True
+        time.sleep(0.15)
+    return not any(_pid_alive(p) for p in pids)
+
+
+def _pane_pid(pane_id: str) -> int | None:
+    try:
+        out = tmux("display-message", "-p", "-t", pane_id, "#{pane_pid}").stdout.strip()
+        return int(out) if out else None
+    except (subprocess.CalledProcessError, ValueError):
+        return None
+
+
+def _close_pane(pane_id: str) -> bool:
+    """Cleanly end a teammate: kill its whole process tree (not just the pane),
+    verify the process is gone, then close the pane. Returns True on success.
+
+    Killing a pane alone can orphan a shell-wrapped provider process, so the
+    process tree is terminated and death confirmed before the pane closes."""
+    if pane_id not in live_pane_ids():
+        return True
+    # graceful interrupt first, so the CLI can close its provider session
+    tmux("send-keys", "-t", pane_id, "C-c", check=False)
+    pid = _pane_pid(pane_id)
+    for _ in range(6):
+        if pane_id not in live_pane_ids():
+            break
+        time.sleep(0.15)
+    # kill the process tree and verify no survivors
+    if pid is not None and _pid_alive(pid):
+        if not _kill_tree(pid):
+            return False
+    # now close the (possibly still-open) pane
+    if pane_id in live_pane_ids():
+        tmux("kill-pane", "-t", pane_id, check=False)
+    for _ in range(4):
+        pane_gone = pane_id not in live_pane_ids()
+        proc_gone = pid is None or not _pid_alive(pid)
+        if pane_gone and proc_gone:
+            return True
+        time.sleep(0.15)
+    return (pane_id not in live_pane_ids()) and (pid is None or not _pid_alive(pid))
+
+
+def cmd_shutdown(args: argparse.Namespace) -> int:
+    with state_lock():
+        state = reconcile(load_state())
+        info = state["teammates"].get(args.role)
+        if not info:
+            print(f"teamctl: no active teammate '{args.role}'.", file=sys.stderr)
+            return 1
+        pane_id = info["pane_id"]
+        if not _close_pane(pane_id):
+            print(
+                f"teamctl: failed to close pane {pane_id}; leaving '{args.role}' tracked.",
+                file=sys.stderr,
+            )
+            return 1
+        del state["teammates"][args.role]
+        save_state(state)
+
+    print(f"shut down teammate '{args.role}' (pane {pane_id})")
+    return 0
+
+
+def cmd_send(args: argparse.Namespace) -> int:
+    with state_lock():
+        state = reconcile(load_state())
+        info = state["teammates"].get(args.role)
+        if not info:
+            print(f"teamctl: no active teammate '{args.role}'.", file=sys.stderr)
+            return 1
+        pane_id = info["pane_id"]
+
+    if pane_id not in live_pane_ids():
+        print(
+            f"teamctl: teammate '{args.role}' pane {pane_id} is gone.",
+            file=sys.stderr,
+        )
+        return 1
+
+    # `-l` sends the text literally (no key-name interpretation, no shell),
+    # then a separate C-m presses Enter so the teammate's CLI submits it.
+    typed = tmux("send-keys", "-t", pane_id, "-l", "--", args.message, check=False)
+    if typed.returncode != 0:
+        print(f"teamctl: failed to send to pane {pane_id}.", file=sys.stderr)
+        return 1
+    if not args.no_enter:
+        tmux("send-keys", "-t", pane_id, "C-m", check=False)
+
+    print(f"sent to '{args.role}' (pane {pane_id})")
+    return 0
+
+
+def _dispatch_pane(role: str, hd: Path, argv: list[str], cwd: str,
+                   provider: str, model: str) -> str:
+    """Run a headless provider in a watchable pane. stdout -> result.json (the
+    parseable source of truth); stderr -> pane AND error.log (watchable); a
+    status file is written on exit. The wrapper's PID is recorded for teardown."""
+    hcmd = " ".join(shlex.quote(a) for a in argv)
+    pid_f = hd / "pid"
+    res_f = hd / "result.json"
+    err_f = hd / "error.log"
+    sta_f = hd / "status"
+    banner = f"[teamctl] {provider} {model or ''} :: {role} — working…"
+    script = (
+        f"echo $$ > {shlex.quote(str(pid_f))}; "
+        f"cd {shlex.quote(cwd)} || exit 97; "
+        f"echo {shlex.quote(banner)}; "
+        f"{hcmd} > {shlex.quote(str(res_f))} "
+        f"2> >(tee {shlex.quote(str(err_f))} >&2); "
+        f"rc=${{PIPESTATUS[0]}}; "
+        f"printf 'DONE %s\\n' \"$rc\" > {shlex.quote(str(sta_f))}; "
+        f"echo \"[teamctl] {role} finished rc=$rc\"; sleep 2"
+    )
+    outer = "bash -c " + shlex.quote(script)
+    existing = [i.get("pane_id", "") for i in load_state()["teammates"].values()]
+    return _open_pane(outer, existing)
+
+
+def _resolve_dispatch(provider: str, task: str, context_file: str, model_arg: str,
+                      effort_arg: str, cwd_arg: str) -> tuple[str, str, str, str]:
+    """Resolve (cwd, model, effort, task) exactly the way dispatch does."""
+    cwd = os.path.abspath(os.path.expanduser(cwd_arg)) if cwd_arg else os.getcwd()
+    d_model, d_effort = provider_defaults(provider)
+    model = model_arg or d_model or ""
+    effort = effort_arg or d_effort or ""
+    if context_file:
+        ctx = Path(os.path.expanduser(context_file)).read_text()
+        task = f"{task}\n\n--- context ---\n{ctx}"
+    return cwd, model, effort, task
+
+
+def _do_dispatch(role: str, provider: str, task: str, context_file: str,
+                 model_arg: str, effort_arg: str, cwd_arg: str) -> int:
+    """Shared dispatch body used by `dispatch` and `route`."""
+    if not in_tmux():
+        print("teamctl: not inside a tmux session; start one first.", file=sys.stderr)
+        return 2
+
+    cwd, model, effort, task = _resolve_dispatch(
+        provider, task, context_file, model_arg, effort_arg, cwd_arg)
+    argv = headless_argv(provider, task, model, effort)
+
+    with state_lock():
+        state = reconcile(load_state())
+        if role in state["teammates"]:
+            print(f"teamctl: teammate '{role}' already exists.", file=sys.stderr)
+            return 1
+
+        hd = handoff_dir(role)
+        hd.mkdir(parents=True, exist_ok=True)
+        (hd / "task.md").write_text(task)
+        for stale in ("status", "result.json", "error.log", "pid"):
+            (hd / stale).unlink(missing_ok=True)
+
+        pane_id = _dispatch_pane(role, hd, argv, cwd, provider, model)
+        _set_pane_title(pane_id, role, model)
+
+        state["teammates"][role] = {
+            "provider": provider,
+            "pane_id": pane_id,
+            "cwd": cwd,
+            "model": model,
+            "effort": effort,
+            "mode": "dispatch",
+            "handoff": str(hd),
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        }
+        save_state(state)
+
+    print(f"dispatched '{role}' ({provider}"
+          f"{'/' + model if model else ''}) in pane {pane_id}")
+    return 0
+
+
+def cmd_dispatch(args: argparse.Namespace) -> int:
+    if args.provider not in PROVIDERS:
+        print(f"teamctl: unknown provider '{args.provider}'.", file=sys.stderr)
+        return 2
+    return _do_dispatch(args.role, args.provider, args.task, args.context_file,
+                        args.model, args.effort, args.cwd)
+
+
+def _read_status(hd: Path) -> tuple[str, int | None]:
+    sta = hd / "status"
+    if not sta.exists():
+        return "running", None
+    raw = sta.read_text().strip()
+    parts = raw.split()
+    if len(parts) == 2 and parts[0] == "DONE":
+        try:
+            return "done", int(parts[1])
+        except ValueError:
+            pass
+    return "done", None
+
+
+def _wrapper_pid(hd: Path) -> int | None:
+    """PID recorded by the dispatch wrapper, if present and parseable."""
+    pid_f = hd / "pid"
+    if not pid_f.exists():
+        return None
+    try:
+        return int(pid_f.read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _teammate_alive(info: dict, hd: Path) -> bool:
+    """True if the teammate pane still exists and/or the wrapper pid is live.
+
+    Status is only written when the wrapper exits normally, so a killed pane
+    or process would otherwise leave `result --wait` spinning until timeout.
+    """
+    pane_id = info.get("pane_id")
+    if pane_id and pane_id in live_pane_ids():
+        return True
+    pid = _wrapper_pid(hd)
+    if pid is not None and _pid_alive(pid):
+        return True
+    return False
+
+
+def cmd_result(args: argparse.Namespace) -> int:
+    with state_lock():
+        state = reconcile(load_state())
+        info = state["teammates"].get(args.role)
+    if not info:
+        print(f"teamctl: no teammate '{args.role}'.", file=sys.stderr)
+        return 1
+    hd = Path(info.get("handoff") or handoff_dir(args.role))
+
+    status, rc = _read_status(hd)
+    if status == "running" and args.wait:
+        deadline = args.timeout
+        waited = 0.0
+        while waited < deadline:
+            status, rc = _read_status(hd)
+            if status != "running":
+                break
+            if not _teammate_alive(info, hd):
+                # Race: wrapper may have written status on the way out.
+                status, rc = _read_status(hd)
+                if status != "running":
+                    break
+                print(
+                    f"{args.role}: failed (teammate died before writing status)",
+                    file=sys.stderr,
+                )
+                return 1
+            time.sleep(0.3)
+            waited += 0.3
+
+    if status == "running":
+        print(f"{args.role}: running")
+        return 0
+
+    result_txt = ""
+    res_f = hd / "result.json"
+    if res_f.exists():
+        result_txt = res_f.read_text()
+    err_txt = (hd / "error.log").read_text() if (hd / "error.log").exists() else ""
+
+    signal = classify_output(result_txt + "\n" + err_txt)
+    if signal != "ok":
+        _record_provider_signal(info["provider"], signal)
+
+    if rc == 0:
+        print(f"{args.role}: done")
+        try:
+            print(json.dumps(json.loads(result_txt), indent=2))
+        except (json.JSONDecodeError, ValueError):
+            print(result_txt.rstrip())
+        if signal != "ok":
+            print(f"[teamctl] note: provider signal = {signal}", file=sys.stderr)
+        return 0
+
+    print(f"{args.role}: failed (rc={rc}, signal={signal})", file=sys.stderr)
+    if err_txt.strip():
+        print(err_txt.rstrip()[-2000:], file=sys.stderr)
+    return 1
+
+
+def cmd_followup(args: argparse.Namespace) -> int:
+    with state_lock():
+        state = reconcile(load_state())
+        info = state["teammates"].get(args.role)
+    if not info:
+        print(f"teamctl: no teammate '{args.role}'.", file=sys.stderr)
+        return 1
+    if not in_tmux():
+        print("teamctl: not inside a tmux session.", file=sys.stderr)
+        return 2
+
+    provider = info["provider"]
+    cwd = info.get("cwd") or os.getcwd()
+    model = info.get("model") or ""
+    effort = info.get("effort") or ""
+    argv = resume_argv(provider, args.task, model, effort)
+    hd = Path(info.get("handoff") or handoff_dir(args.role))
+    hd.mkdir(parents=True, exist_ok=True)
+    for stale in ("status", "result.json", "error.log", "pid"):
+        (hd / stale).unlink(missing_ok=True)
+
+    with state_lock():
+        state = reconcile(load_state())
+        pane_id = _dispatch_pane(args.role, hd, argv, cwd, provider, model)
+        _set_pane_title(pane_id, args.role, model)
+        state["teammates"][args.role]["pane_id"] = pane_id
+        save_state(state)
+    print(f"follow-up sent to '{args.role}' in pane {pane_id}")
+    return 0
+
+
+def _record_provider_signal(provider: str, signal: str,
+                            resets_at: float | None = None) -> None:
+    """Cache a provider signal. Routing is not codified policy: the caller
+    decides at spawn time. A signal with a known resets_at auto-expires at
+    that moment so a stale 'exhausted' can never outlive the real window."""
+    cache = state_path().parent / "providers.json"
+    try:
+        data = json.loads(cache.read_text()) if cache.exists() else {}
+    except (OSError, json.JSONDecodeError):
+        data = {}
+    entry = {"signal": signal, "at": time.strftime("%Y-%m-%dT%H:%M:%S")}
+    if resets_at:
+        entry["resets_at"] = resets_at
+    data[provider] = entry
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    cache.write_text(json.dumps(data, indent=2, sort_keys=True))
+
+
+def _live_signal(entry: dict | None) -> str | None:
+    """The cached signal, unless its reset time has already passed."""
+    if not entry:
+        return None
+    resets_at = entry.get("resets_at")
+    if resets_at and resets_at <= time.time():
+        return None
+    return entry.get("signal")
+
+
+def _find_key(obj, key):
+    if isinstance(obj, dict):
+        if key in obj:
+            return obj[key]
+        for v in obj.values():
+            r = _find_key(v, key)
+            if r is not None:
+                return r
+    elif isinstance(obj, list):
+        for v in obj:
+            r = _find_key(v, key)
+            if r is not None:
+                return r
+    return None
+
+
+def codex_usage() -> dict | None:
+    """Latest {primary, secondary} rate-limit windows from Codex session logs.
+    Codex records real usage in `token_count` events: each window has
+    used_percent, window_minutes, and a resets_at unix timestamp."""
+    base = Path.home() / ".codex" / "sessions"
+    if not base.exists():
+        return None
+    logs = sorted(base.glob("*/*/*/*.jsonl"), key=lambda p: p.stat().st_mtime,
+                  reverse=True)
+    for log in logs[:8]:
+        last = None
+        try:
+            with open(log) as fh:
+                for line in fh:
+                    if '"rate_limits"' in line:
+                        try:
+                            d = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        rl = _find_key(d, "rate_limits")
+                        if isinstance(rl, dict):
+                            last = rl
+        except OSError:
+            continue
+        if last:
+            return last
+    return None
+
+
+def _fmt_reset(resets_at, now) -> str:
+    if not resets_at:
+        return "?"
+    when = time.strftime("%-I:%M %p", time.localtime(resets_at))
+    mins = int((resets_at - now) / 60)
+    if mins <= 0:
+        return f"{when} (now)"
+    return f"{when} (in {mins // 60}h{mins % 60:02d}m)"
+
+
+def cmd_usage(args: argparse.Namespace) -> int:
+    """Real provider usage %/reset where the provider exposes it locally.
+    Also refreshes the routing signal: Codex at 100% on its 5h window is
+    marked exhausted so `route` skips it until it resets."""
+    now = time.time()
+    rl = codex_usage()
+    codex = {}
+    if rl:
+        for key, label in (("primary", "5h"), ("secondary", "weekly")):
+            w = rl.get(key) or {}
+            if w.get("used_percent") is not None:
+                codex[label] = {"used_percent": w["used_percent"],
+                                "resets_at": w.get("resets_at")}
+        pw = rl.get("primary") or {}
+        if (pw.get("used_percent") or 0) >= 100 and (pw.get("resets_at") or 0) > now:
+            _record_provider_signal("codex", "exhausted",
+                                    resets_at=pw.get("resets_at"))
+
+    if args.json:
+        print(json.dumps({
+            "codex": codex or None,
+            "claude": None,
+            "grok": None,
+        }, indent=2))
+        return 0
+
+    print(f"{'PROVIDER':<8}  USAGE")
+    if codex:
+        for label, w in codex.items():
+            print(f"{'codex':<8}  {label}: {w['used_percent']:.0f}% used, "
+                  f"resets {_fmt_reset(w['resets_at'], now)}")
+    else:
+        print(f"{'codex':<8}  no local usage data found")
+    print(f"{'claude':<8}  account quota not exposed locally; live context shows "
+          "in Claude Code's own status line")
+    print(f"{'grok':<8}   no local usage data exposed")
+    return 0
+
+
+def cmd_providers(args: argparse.Namespace) -> int:
+    cache = state_path().parent / "providers.json"
+    try:
+        cached = json.loads(cache.read_text()) if cache.exists() else {}
+    except (OSError, json.JSONDecodeError):
+        cached = {}
+
+    rows = []
+    for prov in ("claude", "codex", "grok"):
+        installed = shutil.which(prov) is not None
+        authed = AUTH_PATHS[prov].exists()
+        if not installed:
+            status = "not-installed"
+        elif not authed:
+            status = "not-authed"
+        else:
+            status = "available"
+        last = cached.get(prov, {})
+        sig = _live_signal(last)
+        if sig in ("exhausted", "auth-error"):
+            status = f"{sig} (last seen {last.get('at', '?')})"
+            ra = last.get("resets_at")
+            if ra:
+                status += f", resets {_fmt_reset(ra, time.time())}"
+        rows.append((prov, status))
+
+    if args.json:
+        print(json.dumps({p: s for p, s in rows}, indent=2))
+        return 0
+    print(f"{'PROVIDER':<8}  STATUS")
+    for prov, status in rows:
+        print(f"{prov:<8}  {status}")
+    return 0
+
+
+ROUTABLE = ("claude", "codex", "grok")
+
+
+def _cached_signals() -> dict:
+    cache = state_path().parent / "providers.json"
+    try:
+        return json.loads(cache.read_text()) if cache.exists() else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def route_select(requested: list[str] | None = None
+                 ) -> tuple[str | None, list[str], dict[str, str]]:
+    """Pick the best available provider.
+
+    Returns (selected, preference, exclusions) where exclusions maps each
+    rejected candidate to a reason: unknown / not-installed / not-authed /
+    exhausted / auth-error. selected is None when no candidate survives.
+    """
+    candidates = requested if requested else list(ROUTABLE)
+    cached = _cached_signals()
+    exclusions: dict[str, str] = {}
+    survivors: list[str] = []
+    for prov in candidates:
+        if prov not in ROUTABLE:
+            exclusions[prov] = "unknown"
+            continue
+        if shutil.which(prov) is None:
+            exclusions[prov] = "not-installed"
+            continue
+        if not AUTH_PATHS[prov].exists():
+            exclusions[prov] = "not-authed"
+            continue
+        signal = _live_signal(cached.get(prov))
+        if signal in ("exhausted", "auth-error"):
+            exclusions[prov] = signal
+            continue
+        survivors.append(prov)
+
+    preference = (load_config().get("routing") or {}).get("preference")
+    if not isinstance(preference, list) or not preference:
+        preference = list(ROUTABLE)
+    ranked = sorted(
+        survivors,
+        key=lambda p: (preference.index(p) if p in preference else len(preference),
+                       survivors.index(p)),
+    )
+    return (ranked[0] if ranked else None), preference, exclusions
+
+
+def cmd_route(args: argparse.Namespace) -> int:
+    requested = [p.strip() for p in args.providers.split(",") if p.strip()] \
+        if args.providers else None
+    selected, preference, exclusions = route_select(requested)
+
+    if selected is None:
+        print("teamctl: route found no available provider:", file=sys.stderr)
+        for prov, reason in exclusions.items():
+            print(f"  {prov}: {reason}", file=sys.stderr)
+        return 1
+
+    reason = f"first available in preference {'>'.join(preference)}"
+    if exclusions:
+        skipped = ", ".join(f"{p}: {r}" for p, r in exclusions.items())
+        reason += f"; skipped {skipped}"
+    print(f"route: selected {selected} ({reason})")
+
+    if args.dry_run:
+        cwd, model, effort, task = _resolve_dispatch(
+            selected, args.task, "", args.model, args.effort, args.cwd)
+        argv = headless_argv(selected, task, model, effort)
+        print("dry-run: " + " ".join(shlex.quote(a) for a in argv))
+        return 0
+
+    return _do_dispatch(args.role, selected, args.task, "",
+                        args.model, args.effort, args.cwd)
+
+
+# --------------------------------------------------------------------------
+# `teamctl init` — onboarding wizard
+# --------------------------------------------------------------------------
+
+TMUX_MARKER_BEGIN = "# --- BEGIN teamctl ---"
+TMUX_MARKER_END = "# --- END teamctl ---"
+TMUX_BLOCK = TMUX_MARKER_BEGIN + """
+# Added by `teamctl init`. Reversible: delete this block (including the
+# BEGIN/END marker lines) and run `tmux source-file ~/.tmux.conf`.
+#
+# Sticky per-pane border label showing a teammate pane's "role · model",
+# read from the @role/@model per-pane user options teamctl sets at spawn.
+# Panes teamctl didn't spawn have no @model and get an empty label.
+# User options are used because provider CLIs overwrite pane titles, and
+# some tmux builds do not execute #() shell commands in status formats.
+set-option -g pane-border-status top
+set-option -g pane-border-format '#{?#{@model}, #{@role} · #{@model} ,}'
+# Append the active pane's "role · model" to the status bar. Guarded so
+# re-sourcing this file does not append the segment a second time.
+if-shell -F '#{?@teamctl_status_added,0,1}' {
+  set-option -g @teamctl_status_added 1
+  set-option -ga status-right ' #{?#{@model},│ #{@role} · #{@model} ,}'
+}
+""" + TMUX_MARKER_END + "\n"
+
+STATUSLINE_ENTRY = {"type": "command", "command": "~/.local/bin/claude-statusline"}
+
+
+def _input(prompt: str) -> str:
+    """Thin wrapper around input() so tests can script wizard answers."""
+    return input(prompt)
+
+
+def _ask(prompt: str, default: str = "") -> str:
+    try:
+        raw = _input(prompt).strip()
+    except EOFError:
+        return default
+    return raw or default
+
+
+def _ask_yn(prompt: str, default: bool = False) -> bool:
+    raw = _ask(prompt).lower()
+    if not raw:
+        return default
+    return raw in ("y", "yes")
+
+
+def _toml_escape(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _detect_providers() -> list[tuple[str, bool, bool]]:
+    """(provider, installed, authed) for every routable provider."""
+    return [(prov, shutil.which(prov) is not None, AUTH_PATHS[prov].exists())
+            for prov in ROUTABLE]
+
+
+def _render_config(providers_cfg: dict[str, dict[str, str]], verbosity: str) -> str:
+    lines = [
+        "# agent-team configuration (written by `teamctl init`)",
+        "# Delete this file to fall back to each provider CLI's own defaults.",
+        "",
+        "[output]",
+        f'verbosity = "{_toml_escape(verbosity)}"',
+    ]
+    for prov, vals in providers_cfg.items():
+        lines += ["", f"[providers.{prov}]"]
+        wrote = False
+        for key in ("model", "effort"):
+            if vals.get(key):
+                lines.append(f'{key} = "{_toml_escape(vals[key])}"')
+                wrote = True
+        if not wrote:
+            lines.append(f'# model = ""   # unset: {prov} uses its own defaults')
+            lines.append('# effort = ""')
+    return "\n".join(lines) + "\n"
+
+
+def cmd_init(args: argparse.Namespace) -> int:
+    home = Path.home()
+    changes: list[tuple[str, str]] = []
+
+    print("teamctl init — set up defaults and optional integrations.")
+    print("A summary of everything changed, with exact revert steps, is")
+    print("printed at the end. Optional steps default to 'no'.\n")
+
+    print("Provider CLIs:")
+    available: list[str] = []
+    for prov, installed, authed in _detect_providers():
+        if not installed:
+            status = "not installed"
+        elif not authed:
+            status = "installed, but not logged in (log in, then re-run `teamctl init`)"
+        else:
+            status = "available"
+            available.append(prov)
+        print(f"  {prov:<7} {status}")
+    print()
+
+    providers_cfg: dict[str, dict[str, str]] = {}
+    for prov in available:
+        if args.yes:
+            providers_cfg[prov] = {"model": "", "effort": ""}
+            continue
+        print(f"{prov}: choose defaults (leave blank to keep the CLI's own default).")
+        model = _ask(f"  default model for {prov}: ")
+        if prov == "grok":
+            print("  note: grok has no persistent effort setting of its own;")
+            print("  teamctl passes your choice per invocation via --effort.")
+        effort = _ask(f"  default effort for {prov} (e.g. low, medium, high): ")
+        providers_cfg[prov] = {"model": model, "effort": effort}
+
+    verbosity = "normal"
+    if not args.yes:
+        v = _ask("Output verbosity — terse / normal / detailed [normal]: ",
+                 "normal").lower()
+        if v in ("terse", "normal", "detailed"):
+            verbosity = v
+        else:
+            print(f"  unrecognized verbosity '{v}'; using 'normal'")
+
+    cfg_path = home / ".config" / "agent-team" / "config.toml"
+    backed_up = False
+    if cfg_path.exists():
+        shutil.copy2(cfg_path, cfg_path.with_name("config.toml.bak-teamctl"))
+        backed_up = True
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    cfg_path.write_text(_render_config(providers_cfg, verbosity))
+    print(f"\nwrote {cfg_path}"
+          + (" (previous file backed up to config.toml.bak-teamctl)" if backed_up else ""))
+    changes.append((
+        f"wrote {cfg_path}",
+        f"rm {cfg_path}"
+        + (f"  (or restore {cfg_path.with_name('config.toml.bak-teamctl')})"
+           if backed_up else ""),
+    ))
+
+    # -- optional: tmux pane borders + status-bar segment ------------------
+    want_tmux = False if args.yes else _ask_yn(
+        "Add teamctl pane-border/status-bar block to ~/.tmux.conf? [y/N] ")
+    if want_tmux:
+        conf = home / ".tmux.conf"
+        text = conf.read_text() if conf.exists() else ""
+        if TMUX_MARKER_BEGIN in text:
+            print(f"{conf} already contains the teamctl block — skipping.")
+        else:
+            if conf.exists():
+                bak = home / ".tmux.conf.bak-teamctl"
+                shutil.copy2(conf, bak)
+                print(f"backed up {conf} to {bak}")
+            with open(conf, "a") as fh:
+                if text and not text.endswith("\n"):
+                    fh.write("\n")
+                fh.write("\n" + TMUX_BLOCK)
+            print(f"appended teamctl block to {conf}")
+            print("apply it now with: tmux source-file ~/.tmux.conf")
+            changes.append((
+                f"appended a marker-guarded block to {conf}",
+                "delete the block between the '# --- BEGIN teamctl ---' and "
+                f"'# --- END teamctl ---' lines (or restore {home / '.tmux.conf.bak-teamctl'}), "
+                "then reset the live options: tmux set-option -gu pane-border-status; "
+                "tmux set-option -gu pane-border-format; tmux set-option -gu status-right; "
+                "tmux set-option -gu @teamctl_status_added",
+            ))
+
+    # -- optional: Claude Code status line ---------------------------------
+    want_statusline = False if args.yes else _ask_yn(
+        "Install claude-statusline for Claude Code's status line "
+        "(shows model · effort · ctx%)? [y/N] ")
+    if want_statusline:
+        dest = home / ".local" / "bin" / "claude-statusline"
+        src: Path | None = Path(__file__).resolve().parent / "claude-statusline"
+        if not src.exists():
+            found = shutil.which("claude-statusline")
+            src = Path(found) if found else None
+        if src is None:
+            print("could not find claude-statusline next to teamctl or on PATH — "
+                  "skipping this step.")
+        else:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            if src.resolve() != dest.resolve():
+                shutil.copy2(src, dest)
+            os.chmod(dest, 0o755)
+            print(f"installed {dest}")
+            changes.append((f"installed {dest}", f"rm {dest}"))
+
+            settings_path = home / ".claude" / "settings.json"
+            if settings_path.exists():
+                try:
+                    data = json.loads(settings_path.read_text())
+                except (json.JSONDecodeError, OSError):
+                    data = None
+                if not isinstance(data, dict):
+                    print(f"could not parse {settings_path} — leaving it untouched.")
+                    print('add this key yourself:  "statusLine": '
+                          + json.dumps(STATUSLINE_ENTRY))
+                elif "statusLine" in data:
+                    print(f"{settings_path} already has a statusLine key — "
+                          "leaving it as is.")
+                else:
+                    bak = Path(str(settings_path) + ".bak-teamctl")
+                    shutil.copy2(settings_path, bak)
+                    data["statusLine"] = dict(STATUSLINE_ENTRY)
+                    settings_path.write_text(json.dumps(data, indent=2) + "\n")
+                    print(f"added statusLine key to {settings_path} (backup: {bak})")
+                    changes.append((
+                        f"added a statusLine key to {settings_path}",
+                        f"restore {bak}, or delete the statusLine key",
+                    ))
+            else:
+                settings_path.parent.mkdir(parents=True, exist_ok=True)
+                settings_path.write_text(
+                    json.dumps({"statusLine": dict(STATUSLINE_ENTRY)}, indent=2) + "\n")
+                print(f"created {settings_path} with a statusLine key")
+                changes.append((f"created {settings_path}", f"rm {settings_path}"))
+
+    print("\nSummary of changes:")
+    for what, revert in changes:
+        print(f"  * {what}")
+        print(f"    revert: {revert}")
+    if not changes:
+        print("  nothing was changed")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="teamctl", description=__doc__)
+    p.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
+    sub = p.add_subparsers(dest="command", required=True)
+
+    ip = sub.add_parser("init", help="onboarding wizard: write config, offer optional integrations")
+    ip.add_argument("--yes", action="store_true",
+                    help="non-interactive: accept defaults, skip optional integrations")
+    ip.set_defaults(func=cmd_init)
+
+    sp = sub.add_parser("spawn", help="open a teammate in a new tmux pane")
+    sp.add_argument("role", help="descriptive role name, e.g. code-reviewer")
+    sp.add_argument("--provider", default="claude", help="claude|codex|grok|shell")
+    sp.add_argument("--prompt", default="", help="initial prompt seeding the session")
+    sp.add_argument("--model", default="", help="model for the teammate")
+    sp.add_argument("--effort", default="", help="effort/reasoning level")
+    sp.add_argument("--cwd", default="", help="working directory for the teammate")
+    sp.add_argument("--dry-run", action="store_true", help="print the launch line only")
+    sp.set_defaults(func=cmd_spawn)
+
+    lp = sub.add_parser("list", help="show active teammates")
+    lp.add_argument("--json", action="store_true", help="machine-readable output")
+    lp.set_defaults(func=cmd_list)
+
+    dp = sub.add_parser("shutdown", help="cleanly stop a teammate and close its pane")
+    dp.add_argument("role", help="role name to shut down")
+    dp.set_defaults(func=cmd_shutdown)
+
+    mp = sub.add_parser("send", help="send an instruction to a running teammate")
+    mp.add_argument("role", help="role name of the teammate to instruct")
+    mp.add_argument("message", help="instruction text to type into the teammate")
+    mp.add_argument("--no-enter", action="store_true",
+                    help="type the text without pressing Enter")
+    mp.set_defaults(func=cmd_send)
+
+    dsp = sub.add_parser("dispatch", help="hand a teammate a task headlessly (watchable)")
+    dsp.add_argument("role")
+    dsp.add_argument("--provider", default="claude", help="claude|codex|grok|shell")
+    dsp.add_argument("--task", required=True, help="the task/instruction")
+    dsp.add_argument("--context-file", default="", help="file whose contents are appended as context")
+    dsp.add_argument("--model", default="", help="override model")
+    dsp.add_argument("--effort", default="", help="override effort/reasoning level")
+    dsp.add_argument("--cwd", default="", help="working directory for the teammate")
+    dsp.set_defaults(func=cmd_dispatch)
+
+    rp = sub.add_parser("result", help="read back a dispatched teammate's result")
+    rp.add_argument("role")
+    rp.add_argument("--wait", action="store_true", help="block until the teammate finishes")
+    rp.add_argument("--timeout", type=float, default=600.0, help="max seconds to wait")
+    rp.set_defaults(func=cmd_result)
+
+    fp = sub.add_parser("followup", help="send another turn to the same teammate session")
+    fp.add_argument("role")
+    fp.add_argument("--task", required=True, help="the follow-up task")
+    fp.set_defaults(func=cmd_followup)
+
+    rt = sub.add_parser("route", help="pick the best available provider and dispatch")
+    rt.add_argument("role")
+    rt.add_argument("--task", required=True, help="the task/instruction")
+    rt.add_argument("--providers", default="",
+                    help="comma-separated candidate providers (default: claude,codex,grok)")
+    rt.add_argument("--model", default="", help="override model")
+    rt.add_argument("--effort", default="", help="override effort/reasoning level")
+    rt.add_argument("--cwd", default="", help="working directory for the teammate")
+    rt.add_argument("--dry-run", action="store_true",
+                    help="print selection + launch line without opening a pane")
+    rt.set_defaults(func=cmd_route)
+
+    pp = sub.add_parser("providers", help="show provider install/auth/credit status")
+    pp.add_argument("--json", action="store_true")
+    pp.set_defaults(func=cmd_providers)
+
+    up = sub.add_parser("usage", help="show real provider usage %%/reset where exposed")
+    up.add_argument("--json", action="store_true")
+    up.set_defaults(func=cmd_usage)
+
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        return args.func(args)
+    except TeamctlError as exc:
+        print(f"teamctl: {exc}", file=sys.stderr)
+        return 3
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

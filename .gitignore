@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.DS_Store
+
+# test artifacts (state files, provider-signal caches, live-test handoff dirs)
+tests/.test-*
+tests/.probe-*
+tests/providers.json
+tests/rt_mate/
+tests/orphan_mate/
+tests/kill_mate/
