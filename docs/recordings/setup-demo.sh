@@ -4,9 +4,9 @@
 #
 #   ./setup-demo.sh [git-revision]
 #
-# With a revision, the teamctl under test is taken from `git show REV:teamctl`
+# With a revision, the orchestrator under test is taken from `git show REV:orchestrator`
 # (record from pushed code, not a possibly-dirty working tree); without one,
-# the working-tree teamctl is used.
+# the working-tree orchestrator is used.
 #
 # Isolation guarantees — nothing touches the operator's real setup:
 #   - HOME is /tmp/teamhome (scratch, rebuilt every run)
@@ -14,7 +14,7 @@
 #     default server; the tape must always pass -S)
 #   - TEAMCTL_STATE points into the scratch home
 #   - real provider artifacts are reachable READ-ONLY via symlinks, so
-#     auth detection and `teamctl usage` show real data (teamctl only
+#     auth detection and `orchestrator usage` show real data (orchestrator only
 #     reads these paths)
 set -euo pipefail
 
@@ -31,11 +31,11 @@ mkdir -p "$DH/bin" "$DH/.local/state/agent-team" "$DH/.config/agent-team" "$DH/w
 
 REV="${1:-}"
 if [ -n "$REV" ]; then
-  git -C "$REPO" show "$REV:teamctl" > "$DH/bin/teamctl"
+  git -C "$REPO" show "$REV:orchestrator" > "$DH/bin/orchestrator"
 else
-  cp "$REPO/teamctl" "$DH/bin/teamctl"
+  cp "$REPO/orchestrator" "$DH/bin/orchestrator"
 fi
-chmod +x "$DH/bin/teamctl"
+chmod +x "$DH/bin/orchestrator"
 
 # read-only visibility into real provider auth/usage artifacts
 [ -e "$REAL_HOME/.codex" ] && ln -s "$REAL_HOME/.codex" "$DH/.codex"
@@ -61,14 +61,14 @@ EOF
 # panes exec an interactive non-login bash (.bashrc) — provide both.
 # The PATH re-pin matters: /etc/profile's path_helper (macOS) reorders
 # PATH and puts /usr/bin's python3 (3.9, no tomllib) ahead of homebrew,
-# which makes teamctl silently ignore the TOML config.
+# which makes orchestrator silently ignore the TOML config.
 {
   echo "export PATH=\"$DH/bin:/opt/homebrew/bin:\$PATH\""
   echo "PS1='\\[\\e[1;36m\\]\$\\[\\e[0m\\] '"
 } > "$DH/.bashrc"
 cp "$DH/.bashrc" "$DH/.bash_profile"
 
-# scratch tmux conf: the teamctl pane-border block (role · model labels)
+# scratch tmux conf: the orchestrator pane-border block (role · model labels)
 # plus a bare status bar (no hostname/clock leaking into the recording)
 cat > "$DH/tmux.conf" <<'EOF'
 set -g default-shell /bin/bash
@@ -89,4 +89,4 @@ export SHELL=/bin/bash
 cd $DH/work
 EOF
 
-echo "demo env ready at $DH (teamctl: ${REV:-working tree})"
+echo "demo env ready at $DH (orchestrator: ${REV:-working tree})"

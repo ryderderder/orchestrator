@@ -1,8 +1,8 @@
 # Agents: start here
 
-This repo is **teamctl** — provider-agnostic AI agent teams on tmux.
+This repo is **Orchestrator** — provider-agnostic AI agent teams on tmux.
 
-- If you are an agent **using or operating** teamctl (installing it,
+- If you are an agent **using or operating** Orchestrator (installing it,
   acting as a team lead, driving teammates): read
   **[docs/AGENT_GUIDE.md](docs/AGENT_GUIDE.md)** — the machine-oriented
   contract (syntax, exit codes, states, `--json` surfaces, recovery

@@ -1,5 +1,5 @@
 """v0.5.0 roster resurrect: reconcile captures crash-lost teammates in
-state["lost"]; `teamctl resurrect` rebuilds them — fresh sessions, said
+state["lost"]; `orchestrator resurrect` rebuilds them — fresh sessions, said
 honestly (interactive context is NOT restorable; dispatch mates resume
 exactly via followup, which never needed resurrecting).
 
@@ -19,7 +19,7 @@ from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-TEAMCTL = HERE.parent / "teamctl"
+TEAMCTL = HERE.parent / "orchestrator"
 
 loader = SourceFileLoader("teamctl_resurrect", str(TEAMCTL))
 spec = importlib.util.spec_from_loader("teamctl_resurrect", loader)
@@ -250,8 +250,8 @@ class ResurrectWorktreeTests(_ResurrectSandbox):
         self.assertEqual(new["worktree"]["branch"], wt["branch"])
         # no second branch was invented
         res = subprocess.run(["git", "-C", str(repo), "branch", "--list",
-                              "teamctl/*"], capture_output=True, text=True)
-        self.assertEqual(res.stdout.count("teamctl/"), 1)
+                              "orchestrator/*"], capture_output=True, text=True)
+        self.assertEqual(res.stdout.count("orchestrator/"), 1)
 
     def test_gone_worktree_reallocates_fresh_from_the_repo(self):
         repo = self._repo()
@@ -298,7 +298,7 @@ class SurfacesTests(_ResurrectSandbox):
         rc, out, _ = self.run_cli("list")
         self.assertEqual(rc, 0)
         self.assertIn("lost in a crash/reboot", out)
-        self.assertIn("teamctl resurrect", out)
+        self.assertIn("orchestrator resurrect", out)
 
     def test_doctor_flags_lost_teammates(self):
         self.seed_state({}, {"ghost": self._interactive("ghost")})

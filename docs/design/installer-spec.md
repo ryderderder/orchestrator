@@ -1,7 +1,7 @@
-I'll ground the design in teamctl's current setup flow and CLI voice, then write a copy-ready spec with exact ASCII mockups for Express and Custom.# teamctl Setup Experience — Design Spec
+I'll ground the design in Orchestrator's current setup flow and CLI voice, then write a copy-ready spec with exact ASCII mockups for Express and Custom.# Orchestrator Setup Experience — Design Spec
 
 **Status:** implementable  
-**Surfaces:** `teamctl init` (default = Express), `teamctl init --custom` / mid-Express “customize” path  
+**Surfaces:** `orchestrator init` (default = Express), `orchestrator init --custom` / mid-Express “customize” path  
 **Runtime:** pure terminal; primary path = stdlib `curses`; fallback = plain `input()` prompts  
 **Canvas (Custom):** 100×30 tmux pane (design at 100 cols × 30 rows; clip gracefully if smaller)  
 **Tone:** dark, atmospheric, confident — Grok Build energy, zero SaaS onboarding
@@ -26,13 +26,13 @@ The current wizard is a **serial questionnaire**: detect → per-provider model 
 | Key | Value | Rationale |
 |-----|-------|-----------|
 | `routing.preference` | available providers, **alphabetical** | Existing `--yes` behavior; documented as arbitrary, not a ranking |
-| `providers.*.model` | empty | CLI’s own default; teamctl never invents model ids |
+| `providers.*.model` | empty | CLI’s own default; orchestrator never invents model ids |
 | `providers.*.effort` | `"high"` | Matches README example config |
 | `output.verbosity` | `"normal"` | Safe middle |
 | `lead.delegation` | `"ask"` | Existing product default |
-| Optional integrations (tmux / statusline / lead) | **off** | Opt-in only; Custom screen 3 or later `teamctl lead on` |
+| Optional integrations (tmux / statusline / lead) | **off** | Opt-in only; Custom screen 3 or later `orchestrator lead on` |
 
-**Non-goals:** emoji, spinners that need unicode fonts beyond ASCII+box-drawing, multi-page essays, “Welcome to the teamctl family.”
+**Non-goals:** emoji, spinners that need unicode fonts beyond ASCII+box-drawing, multi-page essays, “Welcome to the Orchestrator family.”
 
 ---
 
@@ -96,7 +96,7 @@ Prefer **light single-line** Unicode box-drawing (UTF-8 terminals). ASCII fallba
 Top chrome, fixed:
 
 ```
-  teamctl  ·  custom
+  orchestrator  ·  custom
   1 models ── 2 posture ── 3 seal
          ^ current in fg_accent; done steps fg_ok; future fg_dim
 ```
@@ -132,7 +132,7 @@ If `NO_COLOR`, `TEAMCTL_PLAIN=1`, or non-TTY: print final frame only, no delays.
 8. `when does the lead hand work away`  
 9. `seal it`  
 10. `wrote the map` → path  
-11. `customize later: teamctl init --custom`  
+11. `customize later: orchestrator init --custom`  
 12. `no tty. plain path.` (degrade banner)
 
 **Avoid:** “Great choice!”, “You’re all set 🎉”, “Let’s get you onboarded”, “Almost there!”, exclamation spam.
@@ -165,9 +165,9 @@ content-validated against each CLI's own login artifacts — see the README
 ### 3.1 Entry
 
 ```
-teamctl init              # Express
-teamctl init --yes        # scripted: no chrome, config-only (keep)
-teamctl init --custom     # jump Custom
+orchestrator init              # Express
+orchestrator init --yes        # scripted: no chrome, config-only (keep)
+orchestrator init --custom     # jump Custom
 ```
 
 Express is the default when stdin/stdout is a TTY. No mode picker.
@@ -177,7 +177,7 @@ Express is the default when stdin/stdout is a TTY. No mode picker.
 1. Detect `claude` / `codex` / `grok` (installed + auth).  
 2. Build `providers_cfg` for **ready** only: `model=""`, `effort="high"`.  
 3. `preference = sorted(ready)`.  
-4. Write `~/.config/agent-team/config.toml` (backup existing → `config.toml.bak-teamctl`).  
+4. Write `~/.config/agent-team/config.toml` (backup existing → `config.toml.bak-orchestrator`).  
 5. Print Express frame.  
 6. Exit 0. Do **not** offer tmux/statusline/lead in Express.
 
@@ -205,7 +205,7 @@ If **zero** providers usable: still write a minimal config (verbosity + delegati
 
   wrote  ~/.config/agent-team/config.toml
 
-  customize →  teamctl init --custom
+  customize →  orchestrator init --custom
 ```
 
 ### 3.4 Exact mockup — all three ready
@@ -227,7 +227,7 @@ If **zero** providers usable: still write a minimal config (verbosity + delegati
 
   wrote  ~/.config/agent-team/config.toml
 
-  customize →  teamctl init --custom
+  customize →  orchestrator init --custom
 ```
 
 ### 3.5 Exact mockup — nothing installed
@@ -250,7 +250,7 @@ If **zero** providers usable: still write a minimal config (verbosity + delegati
   wrote  ~/.config/agent-team/config.toml
   install a provider CLI, then re-run
 
-  customize →  teamctl init --custom
+  customize →  orchestrator init --custom
 ```
 
 ### 3.6 Exact mockup — installed, not signed in
@@ -272,7 +272,7 @@ If **zero** providers usable: still write a minimal config (verbosity + delegati
 
   wrote  ~/.config/agent-team/config.toml
 
-  customize →  teamctl init --custom
+  customize →  orchestrator init --custom
 ```
 
 ### 3.7 ANSI sketch (implementer reference)
@@ -289,7 +289,7 @@ section:      ESC[38;5;252m defaults locked ESC[0m
 keys:         ESC[38;5;240m route/model/... ESC[0m
 values:       ESC[38;5;252m ... ESC[0m
 wrote:        ESC[38;5;114m wrote ESC[0m + path dim
-hint:         ESC[38;5;240m customize →  ESC[38;5;44m teamctl init --custom ESC[0m
+hint:         ESC[38;5;240m customize →  ESC[38;5;44m orchestrator init --custom ESC[0m
 ```
 
 ### 3.8 Spacing rules (copy exactly)
@@ -301,7 +301,7 @@ hint:         ESC[38;5;240m customize →  ESC[38;5;44m teamctl init --custom ES
 - Defaults keys left-aligned in a 10-char field (`route    `, `model    `, …) after 4-space indent.  
 - 1 blank line before `wrote`.  
 - 1 blank line before customize hint.  
-- No trailing “Summary of changes” essay in Express. (Revert path: file backup name only if re-running overwrites; print only if backup was made: dim line `prior config → config.toml.bak-teamctl` under `wrote`.)
+- No trailing “Summary of changes” essay in Express. (Revert path: file backup name only if re-running overwrites; print only if backup was made: dim line `prior config → config.toml.bak-orchestrator` under `wrote`.)
 
 ### 3.9 Optional mid-frame (scan) — not required if plain dump preferred
 
@@ -363,7 +363,7 @@ row  29    footer keys
 #### Mockup — Screen 1 (exact)
 
 ```text
-teamctl  ·  custom                                                    100 cols →
+orchestrator  ·  custom                                                    100 cols →
 1 models ── 2 posture ── 3 seal
 
   pick a model — or leave the CLI its secrets
@@ -384,7 +384,7 @@ teamctl  ·  custom                                                    100 cols 
     (provider default)
     custom…
 
-  · discovered via teamctl models · ids pass through verbatim
+  · discovered via orchestrator models · ids pass through verbatim
 
   ↑↓ move   enter choose   tab next provider   n next   p plain   q quit
 ```
@@ -416,7 +416,7 @@ teamctl  ·  custom                                                    100 cols 
 #### Mockup — Screen 2 (exact)
 
 ```text
-teamctl  ·  custom
+orchestrator  ·  custom
 1 models ── 2 posture ── 3 seal
 
   how hard · how loud · when to hand off
@@ -464,7 +464,7 @@ teamctl  ·  custom
 #### Mockup — Screen 3 (exact)
 
 ```text
-teamctl  ·  custom
+orchestrator  ·  custom
 1 models ── 2 posture ── 3 seal
 
   seal it
@@ -501,20 +501,20 @@ On successful write, tear down curses and print a **short post-frame** (reuse Ex
     ~/.config/agent-team/config.toml
 
   from here
-    teamctl providers
-    teamctl spawn reviewer --provider codex
-    teamctl settings
+    orchestrator providers
+    orchestrator spawn reviewer --provider codex
+    orchestrator settings
 ```
 
 If extras installed, append one line each, still terse:
 
 ```text
   + tmux block     source: tmux source-file ~/.tmux.conf
-  + statusline     teamctl statusline (Claude Code)
-  + lead mode      teamctl lead status
+  + statusline     orchestrator statusline (Claude Code)
+  + lead mode      orchestrator lead status
 ```
 
-No multi-line revert essay; mention: `revert notes: teamctl lead off · backups *.bak-teamctl`.
+No multi-line revert essay; mention: `revert notes: orchestrator lead off · backups *.bak-orchestrator`.
 
 ---
 
@@ -524,7 +524,7 @@ Use this as the canonical curses paint target (spaces matter; `|` = edge guides 
 
 ```text
 +--------------------------------------------------------------------------------------------------+
-|teamctl  ·  custom                                                                                |
+|orchestrator  ·  custom                                                                                |
 |1 models ── 2 posture ── 3 seal                                                                   |
 |                                                                                                  |
 |  pick a model — or leave the CLI its secrets                                                     |
@@ -541,7 +541,7 @@ Use this as the canonical curses paint target (spaces matter; `|` = edge guides 
 |    haiku                                                                                         |
 |    custom…                                                                                       |
 |                                                                                                  |
-|  · discovered via teamctl models · ids pass through verbatim                                     |
+|  · discovered via orchestrator models · ids pass through verbatim                                     |
 |                                                                                                  |
 |                                                                                                  |
 |                                                                                                  |
@@ -565,7 +565,7 @@ Trigger: not a TTY, `curses.error` on init, `TERM` in (`dumb`, `unknown`), or us
 **Shape:** few prompts, same defaults as Express, optional overrides — **not** the old per-field wall.
 
 ```text
-teamctl init — plain path
+orchestrator init — plain path
 
   claude  ready
   codex   ready
@@ -583,7 +583,7 @@ teamctl init — plain path
   write ~/.config/agent-team/config.toml? [Y/n] 
 ```
 
-No tmux/statusline/lead prompts here unless `TEAMCTL_INIT_EXTRAS=1` (env escape for power users). Point to `teamctl lead on` instead.
+No tmux/statusline/lead prompts here unless `TEAMCTL_INIT_EXTRAS=1` (env escape for power users). Point to `orchestrator lead on` instead.
 
 ---
 
@@ -655,7 +655,7 @@ No tmux/statusline/lead prompts here unless `TEAMCTL_INIT_EXTRAS=1` (env escape 
 
 - [ ] No emoji spam  
 - [ ] Status words: `ready` / `quiet` / `locked out`  
-- [ ] Customize hint exactly: `customize →  teamctl init --custom` (Express)
+- [ ] Customize hint exactly: `customize →  orchestrator init --custom` (Express)
 
 ---
 
@@ -663,7 +663,7 @@ No tmux/statusline/lead prompts here unless `TEAMCTL_INIT_EXTRAS=1` (env escape 
 
 | Old | New |
 |-----|-----|
-| “teamctl init — set up defaults and optional integrations.” | wordmark silence, then status |
+| “orchestrator init — set up defaults and optional integrations.” | wordmark silence, then status |
 | Per-provider mini-interrogation | Express: none; Custom: one model list |
 | Long delegation essay mid-prompt | One line gloss on focus |
 | Three optional Y/N after config | Extras only on Seal, all off |
@@ -673,7 +673,7 @@ No tmux/statusline/lead prompts here unless `TEAMCTL_INIT_EXTRAS=1` (env escape 
 
 ## 9. One-line product statement (for PR / README)
 
-> **`teamctl init` is a twelve-line dark room that finds your providers and locks sane defaults; `--custom` is a three-screen cockpit if you want to aim.**
+> **`orchestrator init` is a twelve-line dark room that finds your providers and locks sane defaults; `--custom` is a three-screen cockpit if you want to aim.**
 
 ---
 

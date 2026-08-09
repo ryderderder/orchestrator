@@ -1,7 +1,7 @@
-"""Tests for `teamctl statusline` (the folded-in statusLine command, its
-rate-limit cache) and `teamctl usage`'s Claude reporting.
+"""Tests for `orchestrator statusline` (the folded-in statusLine command, its
+rate-limit cache) and `orchestrator usage`'s Claude reporting.
 
-The statusline is exercised as a real subprocess (`teamctl statusline`)
+The statusline is exercised as a real subprocess (`orchestrator statusline`)
 against a throwaway HOME; the usage command reads its cache from the
 (TEAMCTL_STATE-overridden) state dir. Nothing here touches the real
 ~/.local/state or ~/.claude.
@@ -23,10 +23,10 @@ from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-TEAMCTL = HERE.parent / "teamctl"
+TEAMCTL = HERE.parent / "orchestrator"
 
-loader = SourceFileLoader("teamctl", str(TEAMCTL))
-spec = importlib.util.spec_from_loader("teamctl", loader)
+loader = SourceFileLoader("orchestrator", str(TEAMCTL))
+spec = importlib.util.spec_from_loader("orchestrator", loader)
 tc = importlib.util.module_from_spec(spec)
 loader.exec_module(tc)
 

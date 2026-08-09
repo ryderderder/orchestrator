@@ -8,11 +8,11 @@
 # Isolation guarantees — nothing touches the operator's real setup:
 #   - HOME is /tmp/demo (scratch, rebuilt every run)
 #   - TMUX_TMPDIR=/tmp/demo/.tmux-tmp so the installer's own
-#     `tmux new-session -A -s teamctl` starts a scratch server, never the
+#     `tmux new-session -A -s orchestrator` starts a scratch server, never the
 #     operator's real one
 #
 # Pre-seeded so the recording matches a normal logged-in machine:
-#   - empty ~/.claude.json and ~/.codex/auth.json (teamctl's documented
+#   - empty ~/.claude.json and ~/.codex/auth.json (orchestrator's documented
 #     login-artifact detection is presence-based)
 #   - a copy of the real codex models cache, so model suggestions in the
 #     recording are real output

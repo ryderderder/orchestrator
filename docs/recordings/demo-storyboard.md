@@ -57,19 +57,19 @@ editing. Target length **≤75s**; budget below.
 | # | t (target) | Lead pane action | What the viewer sees / learns |
 |---|---|---|---|
 | 0 | 0–4s | caption: `# one task: add --json to tinylog.py` then `# one team: three AI subscriptions` | the premise, in words, before anything moves |
-| 1 | 4–9s | `teamctl usage` | real usage %/reset times per provider — capacity is data here |
+| 1 | 4–9s | `orchestrator usage` | real usage %/reset times per provider — capacity is data here |
 | 2 | 9–12s | caption: `# cast: research->grok · build->claude · review->codex` | the routing decision, spelled out |
-| 3 | 12–16s | `teamctl dispatch researcher --provider grok --task "…recommend a JSON schema…"` | first pane opens: `researcher · grok-4.5` border label; lead prints `dispatched 'researcher' (grok…)` |
-| 4 | 16–20s | `teamctl dispatch builder --provider claude --model sonnet --task "…add the flag, print the diff…"` | second pane: `builder · sonnet` |
-| 5 | 20–24s | `teamctl dispatch reviewer --provider codex --effort low --task "…edge cases the flag must not break…"` | third pane: `reviewer · <codex default>` — **the money frame: three vendors' CLIs visibly working at once** |
-| 6 | 24–29s | `teamctl list` | ROLE/PROVIDER/PANE/STATE table, three rows `running` |
+| 3 | 12–16s | `orchestrator dispatch researcher --provider grok --task "…recommend a JSON schema…"` | first pane opens: `researcher · grok-4.5` border label; lead prints `dispatched 'researcher' (grok…)` |
+| 4 | 16–20s | `orchestrator dispatch builder --provider claude --model sonnet --task "…add the flag, print the diff…"` | second pane: `builder · sonnet` |
+| 5 | 20–24s | `orchestrator dispatch reviewer --provider codex --effort low --task "…edge cases the flag must not break…"` | third pane: `reviewer · <codex default>` — **the money frame: three vendors' CLIs visibly working at once** |
+| 6 | 24–29s | `orchestrator list` | ROLE/PROVIDER/PANE/STATE table, three rows `running` |
 | 7 | 29–36s | (hold, no typing) | panes stream; viewer just watches the team work |
-| 8 | 36–42s | `teamctl result researcher --wait` | grok's JSON recommendation, pretty-printed; its pane has closed itself; **--wait self-syncs the recording** |
-| 9 | 42–48s | `teamctl result reviewer --wait` | codex's JSON verdict list |
-| 10 | 48–56s | `teamctl result builder --wait` | claude's unified diff — the actual code change, held longest |
+| 8 | 36–42s | `orchestrator result researcher --wait` | grok's JSON recommendation, pretty-printed; its pane has closed itself; **--wait self-syncs the recording** |
+| 9 | 42–48s | `orchestrator result reviewer --wait` | codex's JSON verdict list |
+| 10 | 48–56s | `orchestrator result builder --wait` | claude's unified diff — the actual code change, held longest |
 | 11 | 56–59s | caption: `# schema from grok · diff from claude · edge cases from codex — synthesized` | the lead's synthesis moment |
-| 12 | 59–68s | `for r in researcher builder reviewer; do teamctl shutdown $r; done` | panes close one by one; process-tree-verified teardown |
-| 13 | 68–73s | `teamctl list` → `no active teammates`; caption: `# github.com/ryderderder/teamctl` | clean end state + pointer |
+| 12 | 59–68s | `for r in researcher builder reviewer; do orchestrator shutdown $r; done` | panes close one by one; process-tree-verified teardown |
+| 13 | 68–73s | `orchestrator list` → `no active teammates`; caption: `# github.com/ryderderder/orchestrator` | clean end state + pointer |
 
 Every beat is legible without audio: captions carry the narrative, pane
 border labels carry the who/what, and the lead pane's own command output
@@ -111,7 +111,7 @@ the provider's real output. Nothing is staged or pre-written.
 **Per take: roughly 10–30k tokens total, spread across three
 subscriptions** — minutes of one 5h window each; effectively pennies at
 API-equivalent rates. Budget 3–5 takes for a keeper (blind pacing means
-the first take usually has one timing seam). Check `teamctl usage` before
+the first take usually has one timing seam). Check `orchestrator usage` before
 a recording session; don't record on a nearly-exhausted window (a
 rate-limit error mid-take is a scrapped take *and* a recorded exhaustion
 signal in scratch state — harmless, but re-run setup).
@@ -125,7 +125,7 @@ own session logs*:
 
 - Scratch HOME at `/tmp/teamhome-live`, scratch tmux socket
   (`-S /tmp/teamhome-live/tmux.sock`), scratch `TEAMCTL_STATE`, scratch
-  config, seeded work dir — **teamctl never touches your real state, config
+  config, seeded work dir — **Orchestrator never touches your real state, config
   or tmux server.** (Same guarantees as the existing harness.)
 - Provider auth/session dirs (`~/.codex`, `~/.claude.json`, `~/.claude`,
   `~/.grok`) are symlinked into the scratch HOME. **Writes go through
@@ -137,7 +137,7 @@ own session logs*:
   smoke turn per provider *inside the scratch env* before rolling:
   `claude -p 'say ok' --output-format json`, `codex exec 'say ok'`,
   `grok -p 'say ok'` (adjust to each CLI's headless syntax as pinned in
-  teamctl's `headless_argv`). If a CLI balks at the scratch HOME (e.g.
+  Orchestrator's `headless_argv`). If a CLI balks at the scratch HOME (e.g.
   claude wanting more of `~/.claude` than the symlink set provides), add
   the missing symlink to `setup-demo-live.sh` and re-verify. The
   `ASSUMED` bit is exactly which dot-paths each CLI needs — the smoke test
@@ -152,9 +152,9 @@ own session logs*:
 
 ```sh
 cd docs/recordings                       # after these files merge into the repo
-./setup-demo-live.sh <pushed-revision>   # scratch env + seeded tinylog.py; pins teamctl to REV
+./setup-demo-live.sh <pushed-revision>   # scratch env + seeded tinylog.py; pins orchestrator to REV
 # preflight: smoke-test all three providers in the scratch env (section 6)
-teamctl usage                            # headroom check (real HOME is fine for this)
+orchestrator usage                            # headroom check (real HOME is fine for this)
 vhs demo-v2.tape                         # writes ./demo-v2.gif
 # review: length ≤75s, no type-ahead seams, all three panes visibly worked,
 # diff readable in beat 10, file size ≤4MB

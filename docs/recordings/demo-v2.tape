@@ -1,4 +1,4 @@
-# teamctl hero demo v2 — one real task through ALL THREE providers:
+# orchestrator hero demo v2 — one real task through ALL THREE providers:
 # research -> grok, implementation -> claude, review -> codex, in parallel.
 # REAL WORK: every teammate is the actual provider CLI editing/reading the
 # seeded tinylog.py. Expect ~10-30k tokens per take across the three
@@ -25,7 +25,7 @@ Hide
 Type "source /tmp/teamhome-live/env.sh && clear"
 Enter
 Sleep 1s
-Type "tmux -S /tmp/teamhome-live/tmux.sock -f /tmp/teamhome-live/tmux.conf new-session -s teamctl -n lead"
+Type "tmux -S /tmp/teamhome-live/tmux.sock -f /tmp/teamhome-live/tmux.conf new-session -s orchestrator -n lead"
 Enter
 Sleep 2s
 Type "clear; tmux clear-history"
@@ -43,7 +43,7 @@ Enter
 Sleep 1.5s
 
 # ---- beat 1: capacity is data ----------------------------------------------
-Type "teamctl usage"
+Type "orchestrator usage"
 Sleep 300ms
 Enter
 Sleep 4s
@@ -55,23 +55,23 @@ Enter
 Sleep 1.5s
 
 # ---- beats 3-5: three dispatches, three panes, three vendors ----------------
-Type `teamctl dispatch researcher --provider grok --task 'Recommend a JSON schema for the --json flag of the log CLI tinylog.py in this directory (read it first). One object per entry. Return ONLY JSON: {"shape": {...}, "rationale": "<=25 words"}.'`
+Type `orchestrator dispatch researcher --provider grok --task 'Recommend a JSON schema for the --json flag of the log CLI tinylog.py in this directory (read it first). One object per entry. Return ONLY JSON: {"shape": {...}, "rationale": "<=25 words"}.'`
 Sleep 300ms
 Enter
 Sleep 3s
 
-Type "teamctl dispatch builder --provider claude --model sonnet --task 'Add a --json flag to tinylog.py in this directory: one JSON object per log entry on stdout; default text output unchanged. Then print ONLY the unified diff of your change.'"
+Type "orchestrator dispatch builder --provider claude --model sonnet --task 'Add a --json flag to tinylog.py in this directory: one JSON object per log entry on stdout; default text output unchanged. Then print ONLY the unified diff of your change.'"
 Sleep 300ms
 Enter
 Sleep 3s
 
-Type `teamctl dispatch reviewer --provider codex --effort low --task 'Read tinylog.py. List edge cases a new --json output flag must not break (empty file, malformed lines, etc). Return ONLY JSON: {"edge_cases": ["..."]} - max 5 items, <=12 words each.'`
+Type `orchestrator dispatch reviewer --provider codex --effort low --task 'Read tinylog.py. List edge cases a new --json output flag must not break (empty file, malformed lines, etc). Return ONLY JSON: {"edge_cases": ["..."]} - max 5 items, <=12 words each.'`
 Sleep 300ms
 Enter
 Sleep 3s
 
 # ---- beat 6: the roster ------------------------------------------------------
-Type "teamctl list"
+Type "orchestrator list"
 Sleep 300ms
 Enter
 Sleep 3s
@@ -80,17 +80,17 @@ Sleep 3s
 Sleep 6s
 
 # ---- beats 8-10: results come home (each --wait self-synchronizes) ----------
-Type "teamctl result researcher --wait"
+Type "orchestrator result researcher --wait"
 Sleep 300ms
 Enter
 Sleep 5s
 
-Type "teamctl result reviewer --wait"
+Type "orchestrator result reviewer --wait"
 Sleep 300ms
 Enter
 Sleep 5s
 
-Type "teamctl result builder --wait"
+Type "orchestrator result builder --wait"
 Sleep 300ms
 Enter
 Sleep 7s
@@ -102,17 +102,17 @@ Enter
 Sleep 2s
 
 # ---- beat 12: clean teardown (each shutdown needs ~4s) -----------------------
-Type "for r in researcher builder reviewer; do teamctl shutdown $r; done"
+Type "for r in researcher builder reviewer; do orchestrator shutdown $r; done"
 Sleep 300ms
 Enter
 Sleep 13s
 
 # ---- beat 13: empty roster + pointer -----------------------------------------
-Type "teamctl list"
+Type "orchestrator list"
 Sleep 300ms
 Enter
 Sleep 2s
-Type "# your subscriptions, one team — github.com/ryderderder/teamctl"
+Type "# your subscriptions, one team — github.com/ryderderder/orchestrator"
 Sleep 300ms
 Enter
 Sleep 4s

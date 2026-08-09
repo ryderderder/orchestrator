@@ -11,7 +11,7 @@ the operator's real config, state, and tmux server are never touched.
 
 ```sh
 cd docs/recordings
-./setup-demo.sh <pushed-revision>   # fresh isolated env; pins teamctl to that rev
+./setup-demo.sh <pushed-revision>   # fresh isolated env; pins orchestrator to that rev
 vhs demo.tape                       # writes ./demo.gif (~50s, ~1.4MB)
 mv demo.gif ../assets/demo.gif
 ```
@@ -65,10 +65,10 @@ commented-out line under the install paragraph).
   `fcntl.ioctl(slave, termios.TIOCSCTTY, 0)`, then read the master with a
   timeout) — the read-only variant emits ~46 bytes, the `0<>` variant emits
   the full escape-sequence UI stream.
-- **Login-shell PATH resets break teamctl's config.** tmux launches
+- **Login-shell PATH resets break Orchestrator's config.** tmux launches
   default-shell as a *login* bash; on macOS `/etc/profile`'s `path_helper`
   reorders PATH so `/usr/bin/python3` (3.9 — no `tomllib`) shadows homebrew,
-  and teamctl then silently ignores `config.toml` (e.g. `route` falls back
+  and Orchestrator then silently ignores `config.toml` (e.g. `route` falls back
   to alphabetical order). The scratch rc files re-pin PATH; keep that line.
 - **Never trust `TMUX_TMPDIR` for isolation when `$TMUX` is set** (e.g. when
   driving takes from inside an agent's tmux pane): tmux follows `$TMUX`

@@ -22,7 +22,7 @@ from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-TEAMCTL = HERE.parent / "teamctl"
+TEAMCTL = HERE.parent / "orchestrator"
 
 loader = SourceFileLoader("teamctl_status", str(TEAMCTL))
 spec = importlib.util.spec_from_loader("teamctl_status", loader)
@@ -142,7 +142,7 @@ class PaneActivityTests(unittest.TestCase):
         self.assertEqual(state, "idle")
 
     def test_unknown_tui_degrades_to_idle(self):
-        # a provider teamctl has no patterns for: stable + unrecognized
+        # a provider orchestrator has no patterns for: stable + unrecognized
         # content must never produce a wrong strong claim
         self._feed("some strange tui ▓▓▓", "some strange tui ▓▓▓")
         state, _ = tc._pane_activity("%1", "shell", settle=0.01)
@@ -268,7 +268,7 @@ class NotifyHookTests(_StatusSandbox):
     def test_env_var_name_never_shadows_state_override(self):
         # the hook env carries TEAMCTL_MATE_STATE — NOT TEAMCTL_STATE,
         # which already means "state-file path override": a hook that
-        # calls teamctl back must keep resolving the right state file
+        # calls orchestrator back must keep resolving the right state file
         self.seed()
         self._install_hook()
         seen = {}
@@ -322,7 +322,7 @@ class LiveStatusTests(unittest.TestCase):
                                           / "state.json")
         self._wt = tc.worktree_settings
         tc.worktree_settings = lambda: {"enabled": False, "dir": "",
-                                        "branch_prefix": "teamctl/",
+                                        "branch_prefix": "orchestrator/",
                                         "cleanup": "auto"}
         out = tc.tmux("new-window", "-d", "-n", f"teamctl-st-{os.getpid()}",
                       "-P", "-F", "#{window_id} #{pane_id}").stdout.split()

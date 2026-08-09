@@ -1,4 +1,4 @@
-# teamctl install — the real one-liner in a clean throwaway HOME (see
+# orchestrator install — the real one-liner in a clean throwaway HOME (see
 # setup-install.sh): downloads, dependency/provider detection, tmux bootstrap,
 # express setup card. Blind timed pacing (vhs Wait is flaky inside tmux).
 # PRECONDITIONS for the final take:
@@ -21,7 +21,7 @@ Enter
 Sleep 1s
 Show
 
-Type "curl -fsSL https://raw.githubusercontent.com/ryderderder/teamctl/main/install.sh | bash"
+Type "curl -fsSL https://raw.githubusercontent.com/ryderderder/orchestrator/main/install.sh | bash"
 Sleep 800ms
 Enter
 

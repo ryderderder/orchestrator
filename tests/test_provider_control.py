@@ -20,7 +20,7 @@ from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-TEAMCTL = HERE.parent / "teamctl"
+TEAMCTL = HERE.parent / "orchestrator"
 
 loader = SourceFileLoader("teamctl_control", str(TEAMCTL))
 spec = importlib.util.spec_from_loader("teamctl_control", loader)
@@ -102,7 +102,7 @@ class EnabledFlagTests(_ControlSandbox):
                                   "--dry-run")
         self.assertEqual(rc, 2)
         self.assertIn("disabled", err)
-        self.assertIn("teamctl config providers.codex.enabled true", err)
+        self.assertIn("orchestrator config providers.codex.enabled true", err)
 
     def test_default_provider_skips_disabled_preference_head(self):
         self.write_config('[routing]\npreference = ["codex", "claude"]\n\n'
@@ -124,7 +124,7 @@ class EnabledFlagTests(_ControlSandbox):
         self.assertEqual(rc, 0)
         self.assertIn("grok", out)
         self.assertIn("disabled", out)
-        self.assertIn("re-enable: teamctl config providers.grok.enabled "
+        self.assertIn("re-enable: orchestrator config providers.grok.enabled "
                       "true", out)
         rc, out, _ = self.run_cli("providers", "--json")
         self.assertEqual(json.loads(out)["grok"]["state"], "disabled")
@@ -277,7 +277,7 @@ headless_args = ["{task}"]
 
 class StripEnvTests(_ControlSandbox):
     """v0.5.3 strip_env: env vars removed from the TEAMMATE's process
-    only (an `env -u` prefix on the command teamctl composes — no tmux
+    only (an `env -u` prefix on the command orchestrator composes — no tmux
     environment surgery, nothing else's env changes). Motivating case:
     agy refuses keychain auth whenever an inherited SSH_CONNECTION is
     present, and a tmux session created over SSH carries that marker for
@@ -372,7 +372,7 @@ headless_args = ["-c", "{task}"]
 """)
         self._wt = tc.worktree_settings
         tc.worktree_settings = lambda: {"enabled": False, "dir": "",
-                                        "branch_prefix": "teamctl/",
+                                        "branch_prefix": "orchestrator/",
                                         "cleanup": "auto"}
         out = tc.tmux("new-window", "-d", "-n", f"teamctl-se-{os.getpid()}",
                       "-P", "-F", "#{window_id} #{pane_id}").stdout.split()

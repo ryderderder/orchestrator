@@ -1,6 +1,6 @@
 """Tests for install.sh: dependency detection/offers, Windows guidance,
 the provider detection screen, and the install-source metadata that powers
-`teamctl update`.
+`orchestrator update`.
 
 Each test runs install.sh in a sandbox: throwaway HOME and bin dir, a
 restricted PATH containing only symlinks to the tools the script needs plus
@@ -101,7 +101,7 @@ class InstallShTestCase(unittest.TestCase):
         self.assertIn("WSL", r.stderr)
         self.assertIn("wsl --install", r.stderr)
         self.assertIn("Nothing was installed", r.stderr)
-        self.assertFalse((self.bin / "teamctl").exists())
+        self.assertFalse((self.bin / "orchestrator").exists())
 
     def test_wsl_is_greeted_as_supported_linux(self):
         # WSL presents as Linux (uname=Linux) — the Windows refusal must
@@ -155,7 +155,7 @@ class InstallShTestCase(unittest.TestCase):
         self.assertIn("no supported package manager", r.stdout)
         self.assertIn("github.com/tmux/tmux", r.stdout)
         # binaries installed regardless
-        self.assertTrue((self.bin / "teamctl").exists())
+        self.assertTrue((self.bin / "orchestrator").exists())
         # provider one-liners printed (no claude/codex/grok in sandbox)
         self.assertIn("claude.ai/install.sh", r.stdout)
         self.assertIn("chatgpt.com/codex/install.sh", r.stdout)
@@ -275,7 +275,7 @@ class InstallShTestCase(unittest.TestCase):
         self.assertIn("add it yourself", r.stderr)
         self.assertFalse((self.home / ".zshrc").exists())
 
-    # ---- install-source metadata for `teamctl update` -----------------------
+    # ---- install-source metadata for `orchestrator update` -----------------------
 
     def _meta(self):
         p = (self.home / ".local" / "state" / "agent-team"
@@ -294,9 +294,9 @@ class InstallShTestCase(unittest.TestCase):
                          INSTALL_SH.parent.resolve())
         # no git in the sandbox PATH -> the checkout counts as a local copy
         self.assertEqual(meta["source"], "local-copy")
-        # version matches the single source of truth in the teamctl file
+        # version matches the single source of truth in the orchestrator file
         v = re.search(r'^VERSION = "([^"]+)"',
-                      (INSTALL_SH.parent / "teamctl").read_text(),
+                      (INSTALL_SH.parent / "orchestrator").read_text(),
                       re.M).group(1)
         self.assertEqual(meta["version"], v)
 
@@ -319,7 +319,7 @@ class InstallShTestCase(unittest.TestCase):
         r = self.run_install("--no-init", answers="")
         self.assertEqual(r.returncode, 0)
         self.assertIn("providers:", r.stdout)
-        # teamctl's own lattice renders each provider honestly
+        # orchestrator's own lattice renders each provider honestly
         self.assertIn("not installed", r.stdout)
         self.assertIn("no provider CLI found", r.stdout)
         for url in ("claude.ai/install.sh", "chatgpt.com/codex/install.sh",
@@ -346,14 +346,14 @@ class InstallShTestCase(unittest.TestCase):
         self.fake_uname("Darwin")                           # no pkg mgr, no tmux
         r = self.run_install(answers="")
         self.assertEqual(r.returncode, 0)
-        self.assertIn("tmux new-session -A -s teamctl", r.stdout)
+        self.assertIn("tmux new-session -A -s orchestrator", r.stdout)
 
     def test_no_init_skips_bootstrap(self):
         self.fake_uname("Darwin")
         r = self.run_install("--no-init", answers="")
         self.assertEqual(r.returncode, 0)
         self.assertNotIn("new-session", r.stdout)
-        self.assertIn("teamctl init' any time", r.stdout)
+        self.assertIn("orchestrator init' any time", r.stdout)
 
     def test_already_inside_tmux_runs_init_directly(self):
         self.fake_uname("Darwin")
@@ -373,8 +373,8 @@ class InstallShTestCase(unittest.TestCase):
         self.assertEqual(r.returncode, 0)
         self.assertIn("entering tmux", r.stdout)
         log = self.pm_log()
-        self.assertIn("tmux new-session -A -s teamctl", log)
-        self.assertIn("teamctl init", log)
+        self.assertIn("tmux new-session -A -s orchestrator", log)
+        self.assertIn("orchestrator init", log)
         self.assertNotIn("--custom", log)               # default = express
 
     def test_custom_init_flag_bootstraps_rich_wizard(self):
@@ -384,7 +384,7 @@ class InstallShTestCase(unittest.TestCase):
         self.assertEqual(r.returncode, 0)
         self.assertIn("entering tmux", r.stdout)
         log = self.pm_log()
-        self.assertIn("tmux new-session -A -s teamctl", log)
+        self.assertIn("tmux new-session -A -s orchestrator", log)
         self.assertIn("init --custom", log)
 
 
@@ -423,7 +423,7 @@ class TmuxHandoffTests(unittest.TestCase):
             # (tmux refuses a literal /dev/tty as its client terminal)
             script = ('TTYDEV="$(tty 0<&2 2>/dev/null)" || TTYDEV=""; '
                       f"exec {shlex.quote(real_tmux)} -L {sock} "
-                      f"new-session -A -s teamctl {shlex.quote(inner)} "
+                      f"new-session -A -s orchestrator {shlex.quote(inner)} "
                       f'{redir} "$TTYDEV"')
             master, slave = pty.openpty()
 

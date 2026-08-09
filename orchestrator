@@ -1,32 +1,32 @@
 #!/usr/bin/env python3
-"""teamctl - minimal, provider-agnostic agent-teammate control on tmux.
+"""orchestrator - minimal, provider-agnostic agent-teammate control on tmux.
 
 Usage:
 
-    teamctl                      # bare: open the default lead session
-    teamctl init [--custom] [--yes]
-    teamctl settings
-    teamctl doctor
-    teamctl lead on|off|status [--hook] [--cli claude|codex|grok|gemini|all]
-    teamctl config [<dotted.key> [<value>]] [--menu]
-    teamctl models [provider]
-    teamctl spawn <role> [--provider claude|codex|grok|gemini|shell] [--prompt TEXT] [--cwd DIR]
-    teamctl list
-    teamctl status [role] [--json] [--watch [--interval N]]
-    teamctl send <role> "<instruction>" [--no-enter]
-    teamctl dispatch <role> --provider P --task "…" [--context-file F] [--model M] [--effort E]
-    teamctl result <role> [--wait]
-    teamctl followup <role> --task "…"
-    teamctl route <role> --task "…" [--providers claude,codex,grok,gemini] [--dry-run]
-    teamctl land <role> [--checkpoint-only] [--into BRANCH] [--dry-run] [--json]
-    teamctl worktree list|prune [--json] [--dry-run]
-    teamctl resurrect [role …] [--dry-run] [--yes]
-    teamctl providers
-    teamctl usage [--json] [--probe [provider|all]]
-    teamctl update [--check]
-    teamctl uninstall [--yes]
-    teamctl shutdown <role>
-    teamctl --version
+    orchestrator                      # bare: open the default lead session
+    orchestrator init [--custom] [--yes]
+    orchestrator settings
+    orchestrator doctor
+    orchestrator lead on|off|status [--hook] [--cli claude|codex|grok|gemini|all]
+    orchestrator config [<dotted.key> [<value>]] [--menu]
+    orchestrator models [provider]
+    orchestrator spawn <role> [--provider claude|codex|grok|gemini|shell] [--prompt TEXT] [--cwd DIR]
+    orchestrator list
+    orchestrator status [role] [--json] [--watch [--interval N]]
+    orchestrator send <role> "<instruction>" [--no-enter]
+    orchestrator dispatch <role> --provider P --task "…" [--context-file F] [--model M] [--effort E]
+    orchestrator result <role> [--wait]
+    orchestrator followup <role> --task "…"
+    orchestrator route <role> --task "…" [--providers claude,codex,grok,gemini] [--dry-run]
+    orchestrator land <role> [--checkpoint-only] [--into BRANCH] [--dry-run] [--json]
+    orchestrator worktree list|prune [--json] [--dry-run]
+    orchestrator resurrect [role …] [--dry-run] [--yes]
+    orchestrator providers
+    orchestrator usage [--json] [--probe [provider|all]]
+    orchestrator update [--check]
+    orchestrator uninstall [--yes]
+    orchestrator shutdown <role>
+    orchestrator --version
 
 Every teammate is a tmux pane running a provider CLI. The lead (this process)
 never edits a teammate's work; it only spawns, lists, and cleanly shuts down.
@@ -34,7 +34,7 @@ never edits a teammate's work; it only spawns, lists, and cleanly shuts down.
 Providers share one launch shape -- `<cmd> [flags] "<prompt>"` starts an
 interactive session seeded with the prompt -- so Claude Code, Codex, Grok,
 and Gemini CLI all get the same tmux + teammate capability, and a
-[providers.custom.*] config block teaches teamctl any other CLI that
+[providers.custom.*] config block teaches orchestrator any other CLI that
 speaks the same shape (no code change needed).
 
 State lives in a small JSON file (default ~/.local/state/agent-team/state.json,
@@ -92,10 +92,10 @@ VERSION = "0.5.3"
 #   headless           one-shot dispatch argv; absent -> dispatch/route
 #                      refuse (a spawn-only provider)
 #   resume             exact-session follow-up argv; absent -> followup
-#                      refuses (teamctl never guesses "most recent")
+#                      refuses (orchestrator never guesses "most recent")
 #   model_args         appended when a model is set
 #   effort_args        appended when an effort is set; None/missing means
-#                      the CLI has no effort control — teamctl DROPS the
+#                      the CLI has no effort control — orchestrator DROPS the
 #                      effort with a one-line stderr note, never silently
 #   resume_takes_model whether resume re-sends the model flags (codex: no;
 #                      effort is never re-sent on resume — v0.4.0 behavior)
@@ -136,8 +136,8 @@ PROVIDER_SPECS: dict[str, dict] = {
         "session_source": {"type": "result-json", "key": "session_id"},
         "auth_env": "ANTHROPIC_API_KEY",
         "login_hint": "claude auth login",
-        "wake_hint": "run one Claude Code turn with the teamctl statusline "
-                     "installed (`teamctl init`)",
+        "wake_hint": "run one Claude Code turn with the orchestrator statusline "
+                     "installed (`orchestrator init`)",
         # OBSERVED-ONLY TUI approval-dialog shapes (see waiting_patterns
         # note below): Claude Code permission prompts
         "waiting_patterns": [r"Do you want", r"❯\s*1\.",
@@ -160,7 +160,7 @@ PROVIDER_SPECS: dict[str, dict] = {
         "auth_env": "OPENAI_API_KEY",
         "login_hint": "codex login",
         "wake_hint": "usage appears after the first codex turn, or probe: "
-                     "`teamctl usage --probe codex`",
+                     "`orchestrator usage --probe codex`",
         "probe": {"argv": ["codex"], "command": "/status", "extra_enters": 1},
         "waiting_patterns": [r"(?i)\bapprove\b", r"\[y/[nN]\]",
                              r"(?i)allow command", r"❯\s*1\."],
@@ -178,7 +178,7 @@ PROVIDER_SPECS: dict[str, dict] = {
         "session_source": {"type": "result-json", "key": "sessionId"},
         "auth_env": "XAI_API_KEY",
         "login_hint": "grok login",
-        "wake_hint": "probe it: `teamctl usage --probe grok`",
+        "wake_hint": "probe it: `orchestrator usage --probe grok`",
         "probe": {"argv": ["grok"], "command": "/usage", "extra_enters": 1},
         "waiting_patterns": [r"(?i)\bapprove\b", r"\[y/[nN]\]",
                              r"(?i)\ballow\b.*\?", r"❯\s*1\."],
@@ -191,7 +191,7 @@ PROVIDER_SPECS: dict[str, dict] = {
         # `session_id` field is present on success AND error output (the
         # error JSON lands on stderr — _extract_session_id reads both
         # artifacts); `--resume` accepts "latest", a FULL UUID, or an
-        # index — teamctl uses the captured UUID ONLY (exact-session
+        # index — orchestrator uses the captured UUID ONLY (exact-session
         # rule), and the prompt must ride `-p` when resuming (issue
         # #14180). Sessions are PROJECT-SCOPED (keyed to the cwd), so
         # follow-ups must run from the dispatch cwd — cmd_followup
@@ -204,7 +204,7 @@ PROVIDER_SPECS: dict[str, dict] = {
                    "--output-format", "json"],
         "model_args": ["-m", "{model}"],
         # VERIFIED (0.46.0 --help): no per-invocation effort/thinking flag
-        # exists — thinking control lives in settings.json, which teamctl
+        # exists — thinking control lives in settings.json, which orchestrator
         # never mutates. --effort is dropped with a stderr note.
         "effort_args": None,
         "resume_takes_model": True,
@@ -242,7 +242,7 @@ PROVIDERS: dict[str, list[str]] = {
 }
 
 # names a [providers.custom.*] block may never claim: the built-ins, plus
-# words with fixed meanings in teamctl's own surfaces
+# words with fixed meanings in orchestrator's own surfaces
 _RESERVED_PROVIDER_NAMES = frozenset(PROVIDER_SPECS) | {"all", "probes",
                                                         "states", "custom"}
 
@@ -256,7 +256,7 @@ def _warn_custom_once(name: str, why: str) -> None:
     if key in _warned_custom_blocks:
         return
     _warned_custom_blocks.add(key)
-    print(f"teamctl: ignoring [providers.custom.{name}]: {why}",
+    print(f"orchestrator: ignoring [providers.custom.{name}]: {why}",
           file=sys.stderr)
 
 
@@ -452,7 +452,7 @@ def provider_supports_effort(name: str) -> bool:
 
 
 def _strip_env_argv(provider: str) -> list[str]:
-    """`env -u VAR …` argv prefix for providers whose spec asks teamctl to
+    """`env -u VAR …` argv prefix for providers whose spec asks orchestrator to
     remove variables from the TEAMMATE's environment (spec field
     strip_env; exposed to [providers.custom.*] blocks). Child-process
     level only — the user's session/tmux environment is never mutated.
@@ -490,7 +490,7 @@ def provider_enabled(name: str) -> bool:
 
 
 def _disabled_hint(name: str) -> str:
-    return (f"re-enable: teamctl config {_enabled_key(name)} true")
+    return (f"re-enable: orchestrator config {_enabled_key(name)} true")
 
 
 class TeamctlError(Exception):
@@ -524,14 +524,14 @@ def _reject_bad_role(role: str) -> bool:
     """True (and an explanation on stderr) when a role name is unusable."""
     if _role_ok(role):
         return False
-    print("teamctl: role names must start with a letter or digit and use "
+    print("orchestrator: role names must start with a letter or digit and use "
           "only letters, digits, '.', '_', '-' (max 64 chars, no '..') — "
           f"got {role!r}.", file=sys.stderr)
     return True
 
 
 # --------------------------------------------------------------------------
-# signed-in detection — reading each CLI's own login artifacts (teamctl
+# signed-in detection — reading each CLI's own login artifacts (orchestrator
 # never touches credentials). Every artifact below was VERIFIED against a
 # live signed-in install of all three CLIs (macOS, 2026-07) and the
 # signed-out shape was verified against sandboxed empty homes. Probes are
@@ -557,14 +557,14 @@ def _reject_bad_role(role: str) -> bool:
 # An exported provider API key (each spec's auth_env/auth_env_extra) also
 # counts as signed in: the CLI works with it even when no login artifact
 # exists. Custom providers with neither auth_env nor auth_files configured
-# are 'unprobed' — teamctl states that it cannot know, instead of guessing
+# are 'unprobed' — orchestrator states that it cannot know, instead of guessing
 # either way.
 # --------------------------------------------------------------------------
 
 _CORRUPT = object()  # a JSON artifact that exists but cannot be read/parsed
 
 # Signs of real grok CLI use, for the last-resort auth fallback. Bare
-# ~/.grok existence is NOT a login signal any more: `teamctl lead on`
+# ~/.grok existence is NOT a login signal any more: `orchestrator lead on`
 # creates that directory (AGENTS.md) on machines that never logged in.
 GROK_DIR_MARKERS = ("sessions", "config.toml", "agent_id",
                     "active_sessions.json")
@@ -618,7 +618,7 @@ def provider_auth_state(provider: str) -> tuple[str, str]:
 
     'unknown' means an auth artifact exists but could not be read — the
     honest answer, reported instead of guessing either way. 'unprobed'
-    means teamctl has nothing to consult (a custom provider with no
+    means orchestrator has nothing to consult (a custom provider with no
     auth_env/auth_files configured) — stated, never guessed."""
     home = Path.home()
     spec = provider_spec(provider) or {}
@@ -663,7 +663,7 @@ def provider_auth_state(provider: str) -> tuple[str, str]:
     # generic artifact probe (gemini and custom providers) — the same
     # discipline as the built-in branches above: a parseable, non-empty
     # JSON artifact means signed in; exists-but-unreadable means 'unknown';
-    # nothing found means signed out. A provider that gave teamctl nothing
+    # nothing found means signed out. A provider that gave orchestrator nothing
     # to consult is 'unprobed' — the honest non-answer.
     files = [Path(os.path.expanduser(p))
              for p in (spec.get("auth_files") or [])]
@@ -707,7 +707,7 @@ def config_path() -> Path:
 
 
 def load_config() -> dict:
-    """Preferences written by `teamctl init`; everything works without them."""
+    """Preferences written by `orchestrator init`; everything works without them."""
     path = config_path()
     if not path.exists() or tomllib is None:
         return {}
@@ -730,7 +730,7 @@ def available_providers() -> list[str]:
 
 
 def default_provider() -> str | None:
-    """Provider used when --provider is omitted. teamctl has no opinion of
+    """Provider used when --provider is omitted. orchestrator has no opinion of
     its own: the first entry of the user's [routing] preference wins; with
     no preference configured, the single available provider is used; with
     several (or none), there is NO default — the caller must ask the user."""
@@ -751,29 +751,29 @@ def _provider_or_fail(requested: str) -> str | None:
     Never silently picks among several providers: that choice is the user's."""
     if requested:
         if provider_spec(requested) is None:
-            print(f"teamctl: unknown provider '{requested}' (known: "
+            print(f"orchestrator: unknown provider '{requested}' (known: "
                   f"{', '.join(known_provider_names())}).", file=sys.stderr)
             return None
         if not provider_enabled(requested):
             # refuse, don't guess: disabling was the user's own choice and
             # the undo is one flip away
-            print(f"teamctl: provider '{requested}' is disabled in your "
+            print(f"orchestrator: provider '{requested}' is disabled in your "
                   f"config — {_disabled_hint(requested)}.", file=sys.stderr)
             return None
         return requested
     prov = default_provider()
     if prov is not None:
         if provider_spec(prov) is None:
-            print(f"teamctl: routing.preference starts with unknown provider "
-                  f"'{prov}' — fix it with `teamctl config routing.preference "
+            print(f"orchestrator: routing.preference starts with unknown provider "
+                  f"'{prov}' — fix it with `orchestrator config routing.preference "
                   "...`.", file=sys.stderr)
             return None
         return prov
     avail = available_providers()
-    print("teamctl: no --provider given and no default is configured "
+    print("orchestrator: no --provider given and no default is configured "
           f"(detected: {', '.join(avail) if avail else 'none'}). "
           "Pass --provider, or set your order once with: "
-          'teamctl config routing.preference "<first>,<second>,..."',
+          'orchestrator config routing.preference "<first>,<second>,..."',
           file=sys.stderr)
     return None
 
@@ -806,7 +806,7 @@ def _model_effort_args(spec: dict, provider: str, model: str,
         if spec.get("effort_args"):
             a += _expand_tokens(spec["effort_args"], effort=effort)
         elif not spec.get("quiet_flags"):
-            print(f"teamctl: note: {provider} has no effort flag — "
+            print(f"orchestrator: note: {provider} has no effort flag — "
                   "--effort ignored", file=sys.stderr)
     return a
 
@@ -915,7 +915,7 @@ def live_pane_ids() -> set[str]:
     return {line.strip() for line in out.splitlines() if line.strip()}
 
 
-# the newest N crash/reboot-lost teammates kept for `teamctl resurrect`
+# the newest N crash/reboot-lost teammates kept for `orchestrator resurrect`
 LOST_CAP = 20
 
 
@@ -930,13 +930,13 @@ def reconcile(state: dict) -> dict:
     completed result/session live on in the handoff dir. A dispatch teammate
     whose pane is gone is therefore FINISHED (or died mid-task), not
     vanished — it stays tracked, with its stale pane id cleared, until an
-    explicit `teamctl shutdown <role>` removes it. `result` and `followup`
+    explicit `orchestrator shutdown <role>` removes it. `result` and `followup`
     keep working from the handoff artifacts indefinitely.
 
-    An interactive teammate whose pane vanished WITHOUT `teamctl shutdown`
+    An interactive teammate whose pane vanished WITHOUT `orchestrator shutdown`
     (crash, reboot, user-closed pane — explicit shutdown deletes directly
     and never passes through this path) is moved to state["lost"] instead
-    of being silently forgotten: `teamctl resurrect` rebuilds the roster
+    of being silently forgotten: `orchestrator resurrect` rebuilds the roster
     from those records (capped at the newest LOST_CAP entries)."""
     live = live_pane_ids()
     survivors: dict[str, dict] = {}
@@ -1030,7 +1030,7 @@ def _window_panes(lead: str) -> list[str]:
 def _split_candidates(lead: str | None, existing: list[str]) -> list[str]:
     """Panes a new teammate may split: every pane in the lead's window except
     the lead itself — so teammates fold into the right-hand grid even when
-    non-teamctl panes (e.g. native agent panes) already occupy it, instead of
+    non-orchestrator panes (e.g. native agent panes) already occupy it, instead of
     carving slivers off the lead. Falls back to the tracked-teammate list,
     then (empty) to splitting the lead."""
     if lead:
@@ -1043,7 +1043,7 @@ def _split_candidates(lead: str | None, existing: list[str]) -> list[str]:
 
 def keep_finished_panes() -> bool:
     """[layout] keep_finished (default true): a finished dispatch teammate's
-    pane stays open — visibly done — until `teamctl shutdown <role>`. Set
+    pane stays open — visibly done — until `orchestrator shutdown <role>`. Set
     false for the old ephemeral behavior (pane self-closes ~2s after the
     task completes; the teammate stays tracked either way)."""
     raw = (load_config().get("layout") or {}).get("keep_finished", True)
@@ -1080,7 +1080,7 @@ def _open_pane(cmd: str, existing: list[str]) -> str:
 
     The first teammate splits the lead pane horizontally (taking the right
     half). Each later teammate splits the largest other pane in the window
-    (teamctl-tracked or not, so foreign panes fold into the same grid),
+    (orchestrator-tracked or not, so foreign panes fold into the same grid),
     choosing the split direction that keeps panes square-looking (a terminal
     cell is ~2x taller than wide, so a pane reads as square when width is
     about twice its height). Four teammates thus form a 2x2 grid beside the
@@ -1154,14 +1154,14 @@ def cmd_spawn(args: argparse.Namespace) -> int:
         return 0
 
     if not in_tmux():
-        print("teamctl: not inside a tmux session; start one first.", file=sys.stderr)
+        print("orchestrator: not inside a tmux session; start one first.", file=sys.stderr)
         return 2
 
     with state_lock():
         state = reconcile(load_state())
         if args.role in state["teammates"]:
             print(
-                f"teamctl: teammate '{args.role}' already exists "
+                f"orchestrator: teammate '{args.role}' already exists "
                 f"(pane {state['teammates'][args.role]['pane_id']}). "
                 "Refusing to run two on the same role.",
                 file=sys.stderr,
@@ -1172,7 +1172,7 @@ def cmd_spawn(args: argparse.Namespace) -> int:
             wt = _maybe_alloc_worktree(args.role, cwd,
                                        getattr(args, "worktree", None))
         except TeamctlError as exc:
-            print(f"teamctl: {exc}", file=sys.stderr)
+            print(f"orchestrator: {exc}", file=sys.stderr)
             return 2
         if wt:
             cwd = wt["path"]
@@ -1217,7 +1217,7 @@ def cmd_list(args: argparse.Namespace) -> int:
         print("no active teammates")
         if lost:
             print(f"{len(lost)} teammate(s) lost in a crash/reboot "
-                  f"({', '.join(sorted(lost))}) — rebuild: teamctl "
+                  f"({', '.join(sorted(lost))}) — rebuild: orchestrator "
                   "resurrect")
         return 0
     width = max(len(r) for r in mates)
@@ -1226,7 +1226,7 @@ def cmd_list(args: argparse.Namespace) -> int:
         i = mates[role]
         st = _mate_state(role, i, live)
         # fast needs-input flag for interactive mates (single capture, no
-        # settle wait — `teamctl status` runs the full busy/idle classifier)
+        # settle wait — `orchestrator status` runs the full busy/idle classifier)
         if st == "active" and (i.get("pane_id") or "") in live:
             hit = _match_waiting(_capture_pane(i["pane_id"]),
                                  _waiting_patterns(i.get("provider", "")))
@@ -1241,7 +1241,7 @@ def cmd_list(args: argparse.Namespace) -> int:
         )
     if lost:
         print(f"\n{len(lost)} teammate(s) lost in a crash/reboot "
-              f"({', '.join(sorted(lost))}) — rebuild: teamctl resurrect")
+              f"({', '.join(sorted(lost))}) — rebuild: orchestrator resurrect")
     return 0
 
 
@@ -1338,7 +1338,7 @@ def _fire_notify(role: str, new_state: str, prev_state: str) -> None:
     """Run the notify hook for one observed transition. Context via env:
     TEAMCTL_ROLE, TEAMCTL_MATE_STATE, TEAMCTL_PREV_STATE. (Deliberately
     NOT 'TEAMCTL_STATE' — that env var already means the state-file
-    override, and a hook that calls teamctl back must keep working.)
+    override, and a hook that calls orchestrator back must keep working.)
     Best-effort: a broken hook prints one line, never breaks status."""
     argv = _notify_argv()
     if not argv:
@@ -1350,13 +1350,13 @@ def _fire_notify(role: str, new_state: str, prev_state: str) -> None:
     try:
         subprocess.run(argv, env=env, capture_output=True, timeout=10)
     except (OSError, subprocess.SubprocessError) as exc:
-        print(f"teamctl: notify hook failed: {exc}", file=sys.stderr)
+        print(f"orchestrator: notify hook failed: {exc}", file=sys.stderr)
 
 
 def _observe_transitions(states: dict[str, str]) -> None:
     """Compare freshly-observed states against the persisted last-known
     ones; fire the notify hook per change. Honest limitation (documented):
-    teamctl has no daemon — transitions are observed only when status/
+    orchestrator has no daemon — transitions are observed only when status/
     list/--watch actually looks."""
     cache = _load_status_cache()
     changed = False
@@ -1415,7 +1415,7 @@ def cmd_status(args: argparse.Namespace) -> int:
 
     rows = observe()
     if args.role and not rows:
-        print(f"teamctl: no teammate '{args.role}'.", file=sys.stderr)
+        print(f"orchestrator: no teammate '{args.role}'.", file=sys.stderr)
         return 1
     _observe_transitions({r: s for r, (s, _d) in rows.items()})
     if args.json:
@@ -1549,14 +1549,14 @@ def cmd_shutdown(args: argparse.Namespace) -> int:
                 state["lost"] = lost
                 save_state(state)
                 print(f"cleared lost teammate '{args.role}' (it will no "
-                      "longer be offered by `teamctl resurrect`)")
+                      "longer be offered by `orchestrator resurrect`)")
                 return 0
-            print(f"teamctl: no active teammate '{args.role}'.", file=sys.stderr)
+            print(f"orchestrator: no active teammate '{args.role}'.", file=sys.stderr)
             return 1
         pane_id = info.get("pane_id") or ""
         if pane_id and not _close_pane(pane_id):
             print(
-                f"teamctl: failed to close pane {pane_id}; leaving '{args.role}' tracked.",
+                f"orchestrator: failed to close pane {pane_id}; leaving '{args.role}' tracked.",
                 file=sys.stderr,
             )
             return 1
@@ -1592,13 +1592,13 @@ def cmd_send(args: argparse.Namespace) -> int:
         state = reconcile(load_state())
         info = state["teammates"].get(args.role)
         if not info:
-            print(f"teamctl: no active teammate '{args.role}'.", file=sys.stderr)
+            print(f"orchestrator: no active teammate '{args.role}'.", file=sys.stderr)
             return 1
         pane_id = info["pane_id"]
 
     if pane_id not in live_pane_ids():
         print(
-            f"teamctl: teammate '{args.role}' pane {pane_id} is gone.",
+            f"orchestrator: teammate '{args.role}' pane {pane_id} is gone.",
             file=sys.stderr,
         )
         return 1
@@ -1607,7 +1607,7 @@ def cmd_send(args: argparse.Namespace) -> int:
     # then a separate C-m presses Enter so the teammate's CLI submits it.
     typed = tmux("send-keys", "-t", pane_id, "-l", "--", args.message, check=False)
     if typed.returncode != 0:
-        print(f"teamctl: failed to send to pane {pane_id}.", file=sys.stderr)
+        print(f"orchestrator: failed to send to pane {pane_id}.", file=sys.stderr)
         return 1
     if not args.no_enter:
         tmux("send-keys", "-t", pane_id, "C-m", check=False)
@@ -1621,14 +1621,14 @@ def cmd_send(args: argparse.Namespace) -> int:
 # directory (one shared object store), so parallel writers PHYSICALLY
 # cannot collide: the "never two teammates edit the same file" rule,
 # mechanically enforced. ON by default in a git repo; spawning elsewhere
-# degrades to the plain cwd with one honest note. `teamctl land <role>`
+# degrades to the plain cwd with one honest note. `orchestrator land <role>`
 # closes the loop (review → checkpoint → merge → cleanup), and shutdown
 # can never strand work: a worktree with anything un-landed is KEPT and
 # reported, never silently discarded — with the registry
 # (<state>/worktrees.json) as the durable record that outlives the
 # teammate's state entry.
 #
-# Git safety rule, enforced by construction and audited by tests: teamctl
+# Git safety rule, enforced by construction and audited by tests: orchestrator
 # NEVER passes -D, --force, or --hard to git. `git worktree remove` and
 # `git branch -d` refuse on anything unsaved/unmerged — git's own safety
 # is the backstop for any logic error in the checks here.
@@ -1646,7 +1646,7 @@ def worktree_settings() -> dict:
     if cleanup not in ("auto", "keep"):
         cleanup = "auto"
     return {"enabled": enabled, "dir": str(raw.get("dir") or ""),
-            "branch_prefix": str(raw.get("branch_prefix") or "teamctl/"),
+            "branch_prefix": str(raw.get("branch_prefix") or "orchestrator/"),
             "cleanup": cleanup}
 
 
@@ -1697,7 +1697,7 @@ def worktree_registry_path() -> Path:
 
 def load_worktree_registry() -> dict:
     """path -> {role, branch, repo, base_sha, created_at}. The durable
-    record of every teamctl-created worktree — it outlives the teammate's
+    record of every orchestrator-created worktree — it outlives the teammate's
     state entry so `land`/`worktree list|prune` keep working after a
     shutdown that preserved un-landed work (and after a reboot)."""
     try:
@@ -1731,7 +1731,7 @@ def _alloc_worktree(role: str, cwd: str) -> dict:
                f"refs/heads/{branch}") is not None:
         raise TeamctlError(
             f"branch {branch} already exists (un-landed work from a "
-            f"previous '{role}'?) — land it (`teamctl land {role}`), "
+            f"previous '{role}'?) — land it (`orchestrator land {role}`), "
             f"delete it yourself (`git -C {root} branch -D {branch}`), "
             "or spawn under another role")
     import hashlib
@@ -1740,7 +1740,7 @@ def _alloc_worktree(role: str, cwd: str) -> dict:
     if path.exists():
         raise TeamctlError(
             f"worktree path {path} already exists — clear it "
-            "(`teamctl worktree prune`) or spawn under another role")
+            "(`orchestrator worktree prune`) or spawn under another role")
     path.parent.mkdir(parents=True, exist_ok=True)
     res = _git(root, "worktree", "add", "-b", branch, str(path), "HEAD")
     if res is None or res.returncode != 0:
@@ -1847,7 +1847,7 @@ def _remove_worktree(wt: dict) -> tuple[bool, str]:
 def _shutdown_worktree(role: str, wt: dict) -> None:
     """Shutdown's strand-proofing: remove a worktree only when it provably
     holds nothing un-landed; otherwise KEEP it and print the way out. The
-    registry entry survives with it, so `teamctl land <role>` still works
+    registry entry survives with it, so `orchestrator land <role>` still works
     after the teammate is gone."""
     if worktree_settings()["cleanup"] == "keep":
         print(f"kept worktree: {_tilde(wt['path'])} (branch {wt['branch']}"
@@ -1864,8 +1864,8 @@ def _shutdown_worktree(role: str, wt: dict) -> None:
         return
     print(f"kept worktree with un-landed work: {_tilde(wt['path'])} "
           f"(branch {wt['branch']}, {detail})")
-    print(f"  land it:  teamctl land {role}    (works after shutdown too)")
-    print("  or list:  teamctl worktree list")
+    print(f"  land it:  orchestrator land {role}    (works after shutdown too)")
+    print("  or list:  orchestrator worktree list")
 
 
 def _find_worktree_for_role(role: str) -> tuple[dict | None, dict | None]:
@@ -1883,7 +1883,7 @@ def _find_worktree_for_role(role: str) -> tuple[dict | None, dict | None]:
         paths = ", ".join(m["path"] for m in matches)
         raise TeamctlError(
             f"'{role}' has worktrees in several repos ({paths}) — "
-            "`teamctl worktree list` and land/prune by hand")
+            "`orchestrator worktree list` and land/prune by hand")
     return (matches[0] if matches else None), info
 
 
@@ -1891,18 +1891,18 @@ def cmd_land(args: argparse.Namespace) -> int:
     """Close the worktree loop: review the diff, checkpoint anything
     uncommitted (with consent), merge the teammate's branch into the
     repo's checked-out branch, then clean up. Conflicts stop-and-report
-    (merge aborted, tree left clean) — teamctl never auto-resolves."""
+    (merge aborted, tree left clean) — orchestrator never auto-resolves."""
     role = args.role
     if _reject_bad_role(role):
         return 2
     try:
         wt, info = _find_worktree_for_role(role)
     except TeamctlError as exc:
-        print(f"teamctl: {exc}", file=sys.stderr)
+        print(f"orchestrator: {exc}", file=sys.stderr)
         return 2
     if wt is None:
-        print(f"teamctl: no worktree recorded for '{role}' — see "
-              "`teamctl worktree list`.", file=sys.stderr)
+        print(f"orchestrator: no worktree recorded for '{role}' — see "
+              "`orchestrator worktree list`.", file=sys.stderr)
         return 1
 
     # never land under a live teammate: a moving diff cannot be reviewed
@@ -1914,15 +1914,15 @@ def cmd_land(args: argparse.Namespace) -> int:
             alive = alive or (_read_status(hd)[0] == "running"
                               and _teammate_alive(info, hd))
         if alive:
-            print(f"teamctl: '{role}' is still active — landing under a "
+            print(f"orchestrator: '{role}' is still active — landing under a "
                   "live teammate risks a moving diff. Shut it down first: "
-                  f"`teamctl shutdown {role}`.", file=sys.stderr)
+                  f"`orchestrator shutdown {role}`.", file=sys.stderr)
             return 1
 
     repo, path, branch = wt["repo"], wt["path"], wt["branch"]
     base = wt.get("base_sha") or ""
     if not Path(path).exists():
-        print(f"teamctl: worktree {path} is gone — nothing to land "
+        print(f"orchestrator: worktree {path} is gone — nothing to land "
               f"(branch {branch} may still exist in {repo}).",
               file=sys.stderr)
         return 1
@@ -1962,14 +1962,14 @@ def cmd_land(args: argparse.Namespace) -> int:
                 f"as a checkpoint on {branch}? [Y/n] ", default=True):
             res = _git(path, "add", "-A")
             if res is None or res.returncode != 0:
-                print("teamctl: git add failed — nothing landed.",
+                print("orchestrator: git add failed — nothing landed.",
                       file=sys.stderr)
                 return 1
-            msg = f"teamctl checkpoint: {role} " \
+            msg = f"orchestrator checkpoint: {role} " \
                   + time.strftime("%Y-%m-%d %H:%M")
             res = _git(path, "commit", "-m", msg)
             if res is None or res.returncode != 0:
-                print("teamctl: checkpoint commit failed: "
+                print("orchestrator: checkpoint commit failed: "
                       + _git_fail_tail(res, "git commit failed"),
                       file=sys.stderr)
                 return 1
@@ -1981,42 +1981,42 @@ def cmd_land(args: argparse.Namespace) -> int:
     if args.checkpoint_only:
         outcome = {**plan, "landed": False, "checkpointed": dirty}
         print(json.dumps(outcome, indent=2) if args.json
-              else f"checkpoint done — land later with `teamctl land {role}`")
+              else f"checkpoint done — land later with `orchestrator land {role}`")
         return 0
 
     commits = _git_ok(repo, "rev-list", "--count", f"{base}..{branch}") \
         if base else None
     if commits == "0":
         print(f"nothing to land: {branch} adds no commits over its base — "
-              f"`teamctl shutdown {role}` / `teamctl worktree prune` "
+              f"`orchestrator shutdown {role}` / `orchestrator worktree prune` "
               "cleans it up.")
         return 0
 
-    # 2. integrate into the repo's checked-out branch — teamctl never
+    # 2. integrate into the repo's checked-out branch — orchestrator never
     #    switches the user's branches
     if not target:
-        print(f"teamctl: {repo} is on a detached HEAD — check out the "
+        print(f"orchestrator: {repo} is on a detached HEAD — check out the "
               "branch you want to land into, then re-run.", file=sys.stderr)
         return 1
     if args.into and args.into != target:
-        print(f"teamctl: {repo} has '{target}' checked out, not "
-              f"'{args.into}' — teamctl never switches your branches. "
+        print(f"orchestrator: {repo} has '{target}' checked out, not "
+              f"'{args.into}' — orchestrator never switches your branches. "
               f"Check out {args.into} first.", file=sys.stderr)
         return 1
     root_dirty = _git_ok(repo, "status", "--porcelain")
     if root_dirty:
-        print(f"teamctl: {repo} has uncommitted changes — commit or stash "
+        print(f"orchestrator: {repo} has uncommitted changes — commit or stash "
               "them first (landing merges into your checked-out branch).",
               file=sys.stderr)
         return 1
     res = _git(repo, "merge", "--no-ff", "-m",
-               f"teamctl land: {role} ({branch})", branch)
+               f"orchestrator land: {role} ({branch})", branch)
     if res is None or res.returncode != 0:
         _git(repo, "merge", "--abort")
-        print("teamctl: land hit merge conflicts — merge aborted, your "
+        print("orchestrator: land hit merge conflicts — merge aborted, your "
               "tree is untouched. Resolve by hand:\n"
               f"  git -C {repo} merge {branch}\n"
-              "then clean up with `teamctl worktree prune`.",
+              "then clean up with `orchestrator worktree prune`.",
               file=sys.stderr)
         return 1
 
@@ -2042,8 +2042,8 @@ def cmd_land(args: argparse.Namespace) -> int:
 
 
 def cmd_worktree(args: argparse.Namespace) -> int:
-    """`teamctl worktree list|prune` — the audit/recovery surface for
-    every worktree teamctl ever created."""
+    """`orchestrator worktree list|prune` — the audit/recovery surface for
+    every worktree orchestrator ever created."""
     reg = load_worktree_registry()
     with state_lock():
         state = reconcile(load_state())
@@ -2072,7 +2072,7 @@ def cmd_worktree(args: argparse.Namespace) -> int:
             print(json.dumps(rows, indent=2))
             return 0
         if not rows:
-            print("no teamctl worktrees.")
+            print("no orchestrator worktrees.")
             return 0
         for r in rows:
             owner = "live" if r["owner_alive"] else "orphan"
@@ -2109,7 +2109,7 @@ def cmd_worktree(args: argparse.Namespace) -> int:
     for r, msg in kept:
         print(f"kept {r['role']}: {_tilde(r['path'])} — {msg}")
     if not rows:
-        print("no teamctl worktrees.")
+        print("no orchestrator worktrees.")
     return 0
 
 
@@ -2131,7 +2131,7 @@ def _dispatch_pane(role: str, hd: Path, argv: list[str], cwd: str,
 
     With [layout] keep_finished (the default), the pane does NOT self-close
     on completion: the wrapper prints a completion banner and blocks until
-    `teamctl shutdown <role>` tears it down — finished work stays VISIBLE in
+    `orchestrator shutdown <role>` tears it down — finished work stays VISIBLE in
     the window, not just tracked in state. keep_finished=false restores the
     ephemeral behavior (pane closes ~2s after the task ends).
 
@@ -2146,19 +2146,19 @@ def _dispatch_pane(role: str, hd: Path, argv: list[str], cwd: str,
     res_f = q(str(hd / "result.json"))
     err_f = q(str(hd / "error.log"))
     sta_f = q(str(hd / "status"))
-    banner = f"[teamctl] {provider} {model or ''} :: {role} — working…"
+    banner = f"[orchestrator] {provider} {model or ''} :: {role} — working…"
     if keep_finished_panes():
         # `tail -f /dev/null` blocks portably (macOS sleep has no infinity);
         # shutdown's process-tree kill (or the pane's C-c) ends it.
         ending = (
-            f"printf '\\n[teamctl] {role} — DONE rc=%s%s · result captured · "
-            f"closes on: teamctl shutdown {role}\\n' "
+            f"printf '\\n[orchestrator] {role} — DONE rc=%s%s · result captured · "
+            f"closes on: orchestrator shutdown {role}\\n' "
             "\"$rc\" \"${cause:+ (SIG$cause)}\"; "
             "tail -f /dev/null"
         )
     else:
         ending = (
-            f"echo \"[teamctl] {role} finished rc=$rc${{cause:+ (SIG$cause)}}\"; "
+            f"echo \"[orchestrator] {role} finished rc=$rc${{cause:+ (SIG$cause)}}\"; "
             "sleep 2; kill $tailpid 2>/dev/null"
         )
     script = (
@@ -2199,7 +2199,7 @@ def _do_dispatch(role: str, provider: str, task: str, context_file: str,
     if _reject_bad_role(role):
         return 2
     if not in_tmux():
-        print("teamctl: not inside a tmux session; start one first.", file=sys.stderr)
+        print("orchestrator: not inside a tmux session; start one first.", file=sys.stderr)
         return 2
 
     cwd, model, effort, task = _resolve_dispatch(
@@ -2216,19 +2216,19 @@ def _do_dispatch(role: str, provider: str, task: str, context_file: str,
                 finished = (_read_status(hd0)[0] == "done"
                             or not existing_info.get("pane_id"))
             if finished:
-                print(f"teamctl: finished teammate '{role}' still holds this "
-                      f"role — read it with `teamctl result {role}`, continue "
-                      f"it with `teamctl followup {role}`, or clear it with "
-                      f"`teamctl shutdown {role}`.", file=sys.stderr)
+                print(f"orchestrator: finished teammate '{role}' still holds this "
+                      f"role — read it with `orchestrator result {role}`, continue "
+                      f"it with `orchestrator followup {role}`, or clear it with "
+                      f"`orchestrator shutdown {role}`.", file=sys.stderr)
             else:
-                print(f"teamctl: teammate '{role}' already exists.",
+                print(f"orchestrator: teammate '{role}' already exists.",
                       file=sys.stderr)
             return 1
 
         try:
             wt = _maybe_alloc_worktree(role, cwd, worktree_flag)
         except TeamctlError as exc:
-            print(f"teamctl: {exc}", file=sys.stderr)
+            print(f"orchestrator: {exc}", file=sys.stderr)
             return 2
         if wt:
             cwd = wt["path"]
@@ -2435,7 +2435,7 @@ def cmd_result(args: argparse.Namespace) -> int:
         state = reconcile(load_state())
         info = state["teammates"].get(args.role)
     if not info:
-        print(f"teamctl: no teammate '{args.role}'.", file=sys.stderr)
+        print(f"orchestrator: no teammate '{args.role}'.", file=sys.stderr)
         return 1
     hd = Path(info.get("handoff") or handoff_dir(args.role))
 
@@ -2488,7 +2488,7 @@ def cmd_result(args: argparse.Namespace) -> int:
         except (json.JSONDecodeError, ValueError):
             print(result_txt.rstrip())
         if signal != "ok":
-            print(f"[teamctl] note: provider signal = {signal}", file=sys.stderr)
+            print(f"[orchestrator] note: provider signal = {signal}", file=sys.stderr)
         return 0
 
     cause = _status_cause(hd)
@@ -2502,11 +2502,11 @@ def cmd_result(args: argparse.Namespace) -> int:
         # leaving the user staring at two empty files.
         prov = info.get("provider", "the provider")
         print(
-            f"[teamctl] no output captured: result.json and error.log are "
+            f"[orchestrator] no output captured: result.json and error.log are "
             f"both empty — {prov} died before writing anything.", file=sys.stderr)
         if rc is not None and rc > 128:
             print(
-                f"[teamctl] rc={rc} means it was killed by a signal"
+                f"[orchestrator] rc={rc} means it was killed by a signal"
                 f"{' (' + cause + ')' if cause else ''}. Common causes: an "
                 "out-of-memory kill, or macOS killing a broken/unsigned "
                 f"binary at exec. Check the CLI itself: run `{prov} "
@@ -2522,10 +2522,10 @@ def cmd_followup(args: argparse.Namespace) -> int:
         state = reconcile(load_state())
         info = state["teammates"].get(args.role)
     if not info:
-        print(f"teamctl: no teammate '{args.role}'.", file=sys.stderr)
+        print(f"orchestrator: no teammate '{args.role}'.", file=sys.stderr)
         return 1
     if not in_tmux():
-        print("teamctl: not inside a tmux session.", file=sys.stderr)
+        print("orchestrator: not inside a tmux session.", file=sys.stderr)
         return 2
 
     provider = info["provider"]
@@ -2539,8 +2539,8 @@ def cmd_followup(args: argparse.Namespace) -> int:
     # wrappers would race on the same handoff files.
     status, _ = _read_status(hd)
     if status == "running" and _teammate_alive(info, hd):
-        print(f"teamctl: '{args.role}' is still running — wait for "
-              f"`teamctl result {args.role} --wait` first.", file=sys.stderr)
+        print(f"orchestrator: '{args.role}' is still running — wait for "
+              f"`orchestrator result {args.role} --wait` first.", file=sys.stderr)
         return 1
 
     # capability check BEFORE touching the pane: a provider with no resume
@@ -2548,8 +2548,8 @@ def cmd_followup(args: argparse.Namespace) -> int:
     # teammate exactly as it was.
     spec = provider_spec(provider) or {}
     if not spec.get("resume"):
-        print(f"teamctl: provider '{provider}' cannot resume a session — "
-              "teamctl never guesses 'most recent'. Re-dispatch instead.",
+        print(f"orchestrator: provider '{provider}' cannot resume a session — "
+              "orchestrator never guesses 'most recent'. Re-dispatch instead.",
               file=sys.stderr)
         return 1
 
@@ -2569,8 +2569,8 @@ def cmd_followup(args: argparse.Namespace) -> int:
     if spec.get("session_source"):
         session_id = _capture_session_id(info, hd) or ""
         if not session_id:
-            print(f"teamctl: no session id captured for '{args.role}' — "
-                  "cannot resume its exact session (teamctl never guesses "
+            print(f"orchestrator: no session id captured for '{args.role}' — "
+                  "cannot resume its exact session (orchestrator never guesses "
                   "'most recent'). Re-dispatch instead.", file=sys.stderr)
             return 1
     argv = resume_argv(provider, args.task, model, effort, session_id)
@@ -2588,12 +2588,12 @@ def cmd_followup(args: argparse.Namespace) -> int:
 
 
 # --------------------------------------------------------------------------
-# `teamctl resurrect` — rebuild the roster after a crash/reboot.
+# `orchestrator resurrect` — rebuild the roster after a crash/reboot.
 #
 # reconcile captures dropped interactive teammates in state["lost"] (the
 # capture point IS the drop point — no parallel manifest that can drift);
 # resurrect respawns them fresh with everything state recorded (provider/
-# model/effort/cwd/prompt/worktree). Honesty first: teamctl never captured
+# model/effort/cwd/prompt/worktree). Honesty first: orchestrator never captured
 # an interactive session id (capture is artifact-based, dispatch-only) and
 # resuming "the most recent session in this cwd" would violate the
 # never-guess rule — so a resurrected teammate STARTS OVER and says so in
@@ -2602,7 +2602,7 @@ def cmd_followup(args: argparse.Namespace) -> int:
 # exact-session — indefinitely.
 # --------------------------------------------------------------------------
 
-RESURRECT_NOTE = ("[teamctl] resurrected after a crash/reboot — prior "
+RESURRECT_NOTE = ("[orchestrator] resurrected after a crash/reboot — prior "
                   "conversation context was NOT restored.")
 
 
@@ -2616,7 +2616,7 @@ def _resurrect_plan(role: str, info: dict,
     if info.get("mode") == "dispatch":
         return ("followup", "", None,
                 "a dispatch teammate needs no respawn: its artifacts are "
-                f"on disk — `teamctl result {role}` / `teamctl followup "
+                f"on disk — `orchestrator result {role}` / `orchestrator followup "
                 f"{role} --task …` resume the exact session")
     wt = info.get("worktree")
     if wt and Path(wt.get("path", "")).is_dir():
@@ -2630,7 +2630,7 @@ def _resurrect_plan(role: str, info: dict,
     if not cwd or not Path(cwd).is_dir():
         return ("error", "", None,
                 f"original cwd {cwd or '?'} no longer exists — respawn "
-                f"manually: `teamctl spawn {role} --cwd <dir>`")
+                f"manually: `orchestrator spawn {role} --cwd <dir>`")
     return ("respawn", cwd, None, "")
 
 
@@ -2644,7 +2644,7 @@ def cmd_resurrect(args: argparse.Namespace) -> int:
         return 0
     missing = [r for r in targets if r not in lost]
     if missing:
-        print(f"teamctl: not in the lost roster: {', '.join(missing)} "
+        print(f"orchestrator: not in the lost roster: {', '.join(missing)} "
               f"(lost: {', '.join(sorted(lost)) or 'none'}).",
               file=sys.stderr)
         return 1
@@ -2829,7 +2829,7 @@ def _fmt_age(seconds: float) -> str:
 
 
 def claude_usage() -> dict | None:
-    """Claude 5h/weekly windows, cached by `teamctl statusline`.
+    """Claude 5h/weekly windows, cached by `orchestrator statusline`.
 
     Claude Code pipes `rate_limits.five_hour/seven_day` (used_percentage,
     resets_at — documented statusLine fields, present for subscribers after
@@ -2958,9 +2958,9 @@ def provider_state(provider: str) -> tuple[str, str]:
 
 
 # --------------------------------------------------------------------------
-# `teamctl models` — best-effort model discovery. Model ids always pass
+# `orchestrator models` — best-effort model discovery. Model ids always pass
 # through to the provider CLI verbatim (the CLI is the validator), so new
-# models work without updating teamctl; discovery only powers suggestions.
+# models work without updating orchestrator; discovery only powers suggestions.
 # --------------------------------------------------------------------------
 
 def _grok_models_output() -> str | None:
@@ -3022,7 +3022,7 @@ def cmd_models(args: argparse.Namespace) -> int:
     providers = [args.provider] if args.provider else list(routable)
     for prov in providers:
         if prov not in routable:
-            print(f"teamctl: unknown provider '{prov}'.", file=sys.stderr)
+            print(f"orchestrator: unknown provider '{prov}'.", file=sys.stderr)
             return 2
     for prov in providers:
         print(f"{prov}:")
@@ -3068,13 +3068,13 @@ def cmd_models(args: argparse.Namespace) -> int:
             print("  model id (e.g. gemini-2.5-pro). GEMINI_MODEL and "
                   "settings.json model.name")
             print("  also work — the CLI is the validator.")
-        else:   # a custom provider: teamctl knows only what the block says
+        else:   # a custom provider: orchestrator knows only what the block says
             print("  no model discovery for a custom provider; --model "
                   "passes through its")
             print("  model_args verbatim (the CLI validates it).")
         print()
     print("model ids pass through to the provider CLI verbatim — new models "
-          "work without updating teamctl.")
+          "work without updating orchestrator.")
     return 0
 
 
@@ -3202,7 +3202,7 @@ def probe_provider(provider: str, spec: dict, timeout: float = 40.0
         # verified teardown; tmux removes the probe session automatically
         # once its last window dies.
         if pane_id and not _close_pane(pane_id):
-            print(f"teamctl: warning: probe pane {pane_id} did not shut "
+            print(f"orchestrator: warning: probe pane {pane_id} did not shut "
                   "down cleanly", file=sys.stderr)
 
 
@@ -3246,7 +3246,7 @@ def _run_probes(which: str) -> int:
     probes = probe_specs()
     if which == "claude":
         print("claude: probe skipped — the statusline cache is the "
-              "documented, cheaper source (install it via `teamctl init`).")
+              "documented, cheaper source (install it via `orchestrator init`).")
         return 0
     if which == "all":
         targets = [p for p in probes
@@ -3260,7 +3260,7 @@ def _run_probes(which: str) -> int:
             targets = []
             print(f"{which}: not installed — probe skipped.", file=sys.stderr)
     else:
-        print(f"teamctl: no probe defined for provider '{which}'.",
+        print(f"orchestrator: no probe defined for provider '{which}'.",
               file=sys.stderr)
         return 2
     for prov in targets:
@@ -3334,7 +3334,7 @@ def cmd_usage(args: argparse.Namespace) -> int:
 
     def _stale_note(age_seconds: float) -> str:
         if age_seconds > stale_after:
-            return " — stale, consider `teamctl usage --probe`"
+            return " — stale, consider `orchestrator usage --probe`"
         return ""
 
     native = {"codex": codex, "claude": claude}
@@ -3555,7 +3555,7 @@ def cmd_route(args: argparse.Namespace) -> int:
     selected, preference, exclusions, ranking = route_select(requested)
 
     if selected is None:
-        print("teamctl: route found no available provider:", file=sys.stderr)
+        print("orchestrator: route found no available provider:", file=sys.stderr)
         for prov, reason in exclusions.items():
             print(f"  {prov}: {reason}", file=sys.stderr)
         return 1
@@ -3571,13 +3571,13 @@ def cmd_route(args: argparse.Namespace) -> int:
         reason = (f"headroom: {rank_txt} used · preference tiebreak "
                   f"{'>'.join(preference)}")
         if any(stale for _p, _u, stale in ranking):
-            reason += " · refresh stale numbers: teamctl usage --probe"
+            reason += " · refresh stale numbers: orchestrator usage --probe"
     elif isinstance(configured, list) and configured:
         reason = f"first available in your preference {'>'.join(preference)}"
     else:
         reason = (f"first available in registry order "
                   f"{'>'.join(preference)} — an arbitrary order, not a "
-                  "recommendation; set yours with `teamctl config "
+                  "recommendation; set yours with `orchestrator config "
                   "routing.preference ...`")
     if exclusions:
         skipped = ", ".join(f"{p}: {r}" for p, r in exclusions.items())
@@ -3597,18 +3597,18 @@ def cmd_route(args: argparse.Namespace) -> int:
 
 
 # --------------------------------------------------------------------------
-# `teamctl init` — onboarding wizard
+# `orchestrator init` — onboarding wizard
 # --------------------------------------------------------------------------
 
-TMUX_MARKER_BEGIN = "# --- BEGIN teamctl ---"
-TMUX_MARKER_END = "# --- END teamctl ---"
+TMUX_MARKER_BEGIN = "# --- BEGIN orchestrator ---"
+TMUX_MARKER_END = "# --- END orchestrator ---"
 TMUX_BLOCK = TMUX_MARKER_BEGIN + """
-# Added by `teamctl init`. Reversible: delete this block (including the
+# Added by `orchestrator init`. Reversible: delete this block (including the
 # BEGIN/END marker lines) and run `tmux source-file ~/.tmux.conf`.
 #
 # Sticky per-pane border label showing a teammate pane's "role · model",
-# read from the @role/@model per-pane user options teamctl sets at spawn.
-# Panes teamctl didn't spawn have no @model and get an empty label.
+# read from the @role/@model per-pane user options orchestrator sets at spawn.
+# Panes orchestrator didn't spawn have no @model and get an empty label.
 # User options are used because provider CLIs overwrite pane titles, and
 # some tmux builds do not execute #() shell commands in status formats.
 set-option -g pane-border-status top
@@ -3622,27 +3622,31 @@ if-shell -F '#{?@teamctl_status_added,0,1}' {
 """ + TMUX_MARKER_END + "\n"
 
 STATUSLINE_ENTRY = {"type": "command",
-                    "command": "~/.local/bin/teamctl statusline"}
+                    "command": "~/.local/bin/orchestrator statusline"}
 
 
 def _legacy_statusline_commands() -> tuple[str, ...]:
-    """statusLine commands written by pre-v0.4.0 installs (the separate
-    claude-statusline script), in both tilde and expanded forms."""
+    """statusLine commands written by earlier installs — the pre-v0.4.0
+    claude-statusline script and the pre-rename `teamctl statusline` — in
+    both tilde and expanded forms."""
+    home_bin = Path.home() / ".local" / "bin"
     return ("~/.local/bin/claude-statusline",
-            str(Path.home() / ".local" / "bin" / "claude-statusline"))
+            str(home_bin / "claude-statusline"),
+            "~/.local/bin/teamctl statusline",
+            str(home_bin / "teamctl") + " statusline")
 
 
 def _our_statusline_commands() -> set[str]:
-    """Every statusLine command teamctl has ever written (for uninstall
+    """Every statusLine command orchestrator has ever written (for uninstall
     and migration matching)."""
     return set(_legacy_statusline_commands()) | {
         STATUSLINE_ENTRY["command"],
-        str(Path.home() / ".local" / "bin" / "teamctl") + " statusline",
+        str(Path.home() / ".local" / "bin" / "orchestrator") + " statusline",
     }
 
 
 def _migrate_legacy_statusline(bin_dir: Path | None = None) -> list[str]:
-    """v0.4.0 fold: the statusline became `teamctl statusline`. Rewrite an
+    """v0.4.0 fold: the statusline became `orchestrator statusline`. Rewrite an
     old claude-statusline wiring in settings.json and remove the orphaned
     script. Best-effort; returns human-readable notes ([] = nothing)."""
     notes: list[str] = []
@@ -3655,12 +3659,12 @@ def _migrate_legacy_statusline(bin_dir: Path | None = None) -> list[str]:
         sl = data.get("statusLine")
         if isinstance(sl, dict) \
                 and sl.get("command") in _legacy_statusline_commands():
-            bak = Path(str(sp) + ".bak-teamctl")
+            bak = Path(str(sp) + ".bak-orchestrator")
             try:
                 shutil.copy2(sp, bak)
                 data["statusLine"] = dict(STATUSLINE_ENTRY)
                 sp.write_text(json.dumps(data, indent=2) + "\n")
-                notes.append(f"statusLine in {sp} now runs `teamctl "
+                notes.append(f"statusLine in {sp} now runs `orchestrator "
                              f"statusline` (backup: {bak})")
             except OSError:
                 pass
@@ -3670,7 +3674,7 @@ def _migrate_legacy_statusline(bin_dir: Path | None = None) -> list[str]:
         if legacy.exists():
             legacy.unlink()
             notes.append(f"removed the orphaned {legacy} (its job moved "
-                         "into `teamctl statusline`)")
+                         "into `orchestrator statusline`)")
     except OSError:
         pass
     return notes
@@ -3718,7 +3722,7 @@ def _render_config(providers_cfg: dict[str, dict[str, str]], verbosity: str,
                    preference: list[str] | None = None,
                    delegation: str = "ask") -> str:
     lines = [
-        "# agent-team configuration (written by `teamctl init`)",
+        "# agent-team configuration (written by `orchestrator init`)",
         "# Delete this file to fall back to each provider CLI's own defaults.",
         "",
         "[output]",
@@ -3743,7 +3747,7 @@ def _render_config(providers_cfg: dict[str, dict[str, str]], verbosity: str,
             "",
             "[routing]",
             "# your auto-routing order (also the --provider default);",
-            "# reorder any time: teamctl config routing.preference \"a,b,c\"",
+            "# reorder any time: orchestrator config routing.preference \"a,b,c\"",
             f"preference = {_toml_value(list(preference))}",
             "# strategy: headroom (most remaining quota wins; preference",
             "# breaks ties) | preference (strict order)",
@@ -3764,7 +3768,7 @@ def _render_config(providers_cfg: dict[str, dict[str, str]], verbosity: str,
 
 # --------------------------------------------------------------------------
 # setup experience — three paths, one config schema. Canonical design:
-# docs/design/installer-spec.md ("teamctl Setup Experience", Grok 4.5).
+# docs/design/installer-spec.md ("orchestrator Setup Experience", Grok 4.5).
 #
 #   express (default `init`)  zero questions; wordmark frame; sane defaults
 #   custom  (`init --custom`) 3-screen curses cockpit: models → posture → seal
@@ -4052,7 +4056,7 @@ def _cockpit_rows(screen: int, state: dict, ready: list[str],
                                    else f"custom{g['more']}")})
             rows.append({"kind": "blank"})
         rows.append({"kind": "info",
-                     "text": f"{g['dot']} discovered via teamctl models "
+                     "text": f"{g['dot']} discovered via orchestrator models "
                              f"{g['dot']} ids pass through verbatim"})
     elif screen == 2:
         rows.append({"kind": "header", "text": "effort",
@@ -4118,7 +4122,7 @@ def _paint_cockpit(stdscr, screen: int, rows: list[dict], sel: int,
     h, w = stdscr.getmaxyx()
     if h < len(rows) + 4 or w < 70:
         raise _RichUnusable("terminal too small for the cockpit")
-    _addstr(stdscr, 0, 0, "teamctl", _cattr("primary") | curses.A_BOLD)
+    _addstr(stdscr, 0, 0, "orchestrator", _cattr("primary") | curses.A_BOLD)
     _addstr(stdscr, 0, 7, f"  {g['dot']}  ", _cattr("dim"))
     _addstr(stdscr, 0, 12, "custom", _cattr("accent"))
     x = 0
@@ -4342,27 +4346,27 @@ def _apply_cockpit(state: dict, ready: list[str]) -> int:
     print("    " + _fg("dim", _tilde(cfg_path)))
     if backed_up:
         print("    " + _fg("dim",
-                           f"prior config {g['arrow']} config.toml.bak-teamctl"))
+                           f"prior config {g['arrow']} config.toml.bak-orchestrator"))
     print()
     print("  from here")
     spawn_prov = state["route"][0] if state["route"] else "claude"
-    for cmd_line in ("teamctl providers",
-                     f"teamctl spawn reviewer --provider {spawn_prov}",
-                     "teamctl settings"):
+    for cmd_line in ("orchestrator providers",
+                     f"orchestrator spawn reviewer --provider {spawn_prov}",
+                     "orchestrator settings"):
         print("    " + _fg("primary", cmd_line))
     installed = [("tmux block", "source: tmux source-file ~/.tmux.conf")
                  if ex["tmux"] else None,
-                 ("statusline", "teamctl statusline (Claude Code)")
+                 ("statusline", "orchestrator statusline (Claude Code)")
                  if ex["statusline"] else None,
-                 ("lead mode", "teamctl lead status")
+                 ("lead mode", "orchestrator lead status")
                  if ex["lead"] else None]
     installed = [x for x in installed if x]
     if installed:
         print()
         for name, note in installed:
             print(f"  + {name:<14} {note}")
-        print("  " + _fg("dim", f"revert notes: teamctl lead off {g['dot']} "
-                                "backups *.bak-teamctl"))
+        print("  " + _fg("dim", f"revert notes: orchestrator lead off {g['dot']} "
+                                "backups *.bak-orchestrator"))
     return 0
 
 
@@ -4382,7 +4386,7 @@ def _snap(value: str, allowed: tuple, default: str) -> str:
 def _plain_init(args: argparse.Namespace) -> int:
     rows = _detect_providers()
     ready = sorted(_usable(rows))
-    print("teamctl init — plain path")
+    print("orchestrator init — plain path")
     print()
     for prov, state in rows:
         print(f"  {prov:<7} {state}")
@@ -4421,7 +4425,7 @@ def _plain_init(args: argparse.Namespace) -> int:
                                            changes)
     g = _out_glyphs()
     print(f"  wrote {_tilde(path)}"
-          + (f"  (prior {g['arrow']} config.toml.bak-teamctl)"
+          + (f"  (prior {g['arrow']} config.toml.bak-orchestrator)"
              if backed_up else ""))
 
     if os.environ.get("TEAMCTL_INIT_EXTRAS") == "1":
@@ -4434,7 +4438,7 @@ def _plain_init(args: argparse.Namespace) -> int:
                 "  with per-prompt hook? [Y/n] ", default=True))
     else:
         print(f"  extras (tmux borders {g['dot']} statusline {g['dot']} lead "
-              "mode): teamctl init --custom, or teamctl lead on")
+              "mode): orchestrator init --custom, or orchestrator lead on")
     return 0
 
 
@@ -4464,7 +4468,7 @@ def _init_express(args: argparse.Namespace) -> int:
 
     if getattr(args, "yes", False):      # scripted: machine-readable, no chrome
         print(f"wrote {cfg_path}"
-              + (" (backup: config.toml.bak-teamctl)" if backed_up else ""))
+              + (" (backup: config.toml.bak-orchestrator)" if backed_up else ""))
         return 0
 
     g = _out_glyphs()
@@ -4494,7 +4498,7 @@ def _init_express(args: argparse.Namespace) -> int:
     out.append("  " + _fg("ok", "wrote") + "  " + _fg("dim", _tilde(cfg_path)))
     if backed_up:
         out.append("  " + _fg("dim", f"prior config {g['arrow']} "
-                                     "config.toml.bak-teamctl"))
+                                     "config.toml.bak-orchestrator"))
     if not ready:
         if any(state == "locked out" for _p, state in rows):
             out.append("  " + _fg("dim", "log a provider in, then re-run"))
@@ -4503,7 +4507,7 @@ def _init_express(args: argparse.Namespace) -> int:
                                   "install a provider CLI, then re-run"))
     out.append("")
     out.append("  " + _fg("dim", f"customize {g['arrow']}  ")
-               + _fg("soft", "teamctl init --custom"))
+               + _fg("soft", "orchestrator init --custom"))
     if upd_line:
         out.append("  " + _fg("dim", f"{g['dot']} {upd_line}"))
     # installer first-run (A2): the curl|bash path lands the user inside
@@ -4511,7 +4515,7 @@ def _init_express(args: argparse.Namespace) -> int:
     # So the very first landing actually ENABLES lead mode (reversible; it
     # is just the manager identity in each CLI's instructions file, not a
     # running/billable session) and the frame shows the moves. Gated to the
-    # installer (TEAMCTL_FIRST_RUN) so a standalone `teamctl init` keeps its
+    # installer (TEAMCTL_FIRST_RUN) so a standalone `orchestrator init` keeps its
     # tight spec-§7 frame and never enables lead mode behind the user.
     if os.environ.get("TEAMCTL_FIRST_RUN") == "1":
         lead_clis = _enable_lead_mode_quiet() if ready else []
@@ -4533,7 +4537,7 @@ def _enable_lead_mode_quiet() -> list[str]:
     """Install lead mode for every detected CLI, suppressing the per-file
     chatter (the express frame prints its own one-line summary). Returns
     the CLIs that now carry the lead identity. Idempotent and reversible
-    (`teamctl lead off`); no interactive hook prompt."""
+    (`orchestrator lead off`); no interactive hook prompt."""
     selected = _lead_selected_clis("")
     changes: list[tuple[str, str]] = []
     buf = io.StringIO()
@@ -4555,27 +4559,27 @@ def _first_run_orientation(preference: list[str], lead_clis: list[str],
                            g: dict) -> list[str]:
     """The 'you're in tmux — here's your first move' block for the curl|bash
     first run (A2). Lead mode is already ENABLED by the caller, so this tells
-    the user to just type `teamctl` to open the lead chat, shows one real
+    the user to just type `orchestrator` to open the lead chat, shows one real
     spawn example, and orients them in tmux. Provider-agnostic."""
     prov = preference[0] if preference else "<provider>"
     lines = ["",
              "  " + _fg("soft", "you're in tmux") + _fg("dim",
                        " — your team tiles into the panes on the right")]
     lines.append("    " + _fg("dim", "talk to your lead  ")
-                 + _fg("primary", "teamctl")
+                 + _fg("primary", "orchestrator")
                  + _fg("dim", "   (opens your lead chat right here)"))
     if preference:
         lines.append("    " + _fg("dim", "or spawn one now   ")
                      + _fg("primary",
-                           f"teamctl spawn reviewer --provider {prov}"))
+                           f"orchestrator spawn reviewer --provider {prov}"))
     else:
         lines.append("    " + _fg("dim", "sign a provider in, then  ")
-                     + _fg("primary", "teamctl"))
+                     + _fg("primary", "orchestrator"))
     if lead_clis:
         pretty = ", ".join(lead_clis)
         lines.append("  " + _fg("ok", "lead mode on")
                      + _fg("dim", f"  {pretty}  {g['dot']}  reverse: "
-                                  "teamctl lead off"))
+                                  "orchestrator lead off"))
     return lines
 
 
@@ -4620,7 +4624,7 @@ def _write_wizard_config(providers_cfg: dict[str, dict[str, str]],
     cfg_path = Path.home() / ".config" / "agent-team" / "config.toml"
     backed_up = False
     if cfg_path.exists():
-        shutil.copy2(cfg_path, cfg_path.with_name("config.toml.bak-teamctl"))
+        shutil.copy2(cfg_path, cfg_path.with_name("config.toml.bak-orchestrator"))
         backed_up = True
     cfg_path.parent.mkdir(parents=True, exist_ok=True)
     cfg_path.write_text(
@@ -4628,7 +4632,7 @@ def _write_wizard_config(providers_cfg: dict[str, dict[str, str]],
     changes.append((
         f"wrote {cfg_path}",
         f"rm {cfg_path}"
-        + (f"  (or restore {cfg_path.with_name('config.toml.bak-teamctl')})"
+        + (f"  (or restore {cfg_path.with_name('config.toml.bak-orchestrator')})"
            if backed_up else ""),
     ))
     return cfg_path, backed_up
@@ -4639,22 +4643,22 @@ def _install_tmux_block(changes: list[tuple[str, str]]) -> None:
     conf = home / ".tmux.conf"
     text = conf.read_text() if conf.exists() else ""
     if TMUX_MARKER_BEGIN in text:
-        print(f"{conf} already contains the teamctl block — skipping.")
+        print(f"{conf} already contains the orchestrator block — skipping.")
         return
     if conf.exists():
-        bak = home / ".tmux.conf.bak-teamctl"
+        bak = home / ".tmux.conf.bak-orchestrator"
         shutil.copy2(conf, bak)
         print(f"backed up {conf} to {bak}")
     with open(conf, "a") as fh:
         if text and not text.endswith("\n"):
             fh.write("\n")
         fh.write("\n" + TMUX_BLOCK)
-    print(f"appended teamctl block to {conf}")
+    print(f"appended orchestrator block to {conf}")
     print("apply it now with: tmux source-file ~/.tmux.conf")
     changes.append((
         f"appended a marker-guarded block to {conf}",
-        "delete the block between the '# --- BEGIN teamctl ---' and "
-        f"'# --- END teamctl ---' lines (or restore {home / '.tmux.conf.bak-teamctl'}), "
+        "delete the block between the '# --- BEGIN orchestrator ---' and "
+        f"'# --- END orchestrator ---' lines (or restore {home / '.tmux.conf.bak-orchestrator'}), "
         "then reset the live options: tmux set-option -gu pane-border-status; "
         "tmux set-option -gu pane-border-format; tmux set-option -gu status-right; "
         "tmux set-option -gu @teamctl_status_added",
@@ -4662,12 +4666,12 @@ def _install_tmux_block(changes: list[tuple[str, str]]) -> None:
 
 
 def _install_statusline(changes: list[tuple[str, str]]) -> None:
-    """Wire Claude Code's statusLine to `teamctl statusline` (since the
+    """Wire Claude Code's statusLine to `orchestrator statusline` (since the
     v0.4.0 fold there is no separate file to copy — the statusline is a
-    teamctl subcommand). Legacy wirings/files are migrated first."""
+    orchestrator subcommand). Legacy wirings/files are migrated first."""
     for note in _migrate_legacy_statusline():
         print(note)
-        changes.append((note, "restore the .bak-teamctl backup"))
+        changes.append((note, "restore the .bak-orchestrator backup"))
 
     settings_path = Path.home() / ".claude" / "settings.json"
     if settings_path.exists():
@@ -4683,12 +4687,12 @@ def _install_statusline(changes: list[tuple[str, str]]) -> None:
                 and data["statusLine"].get("command") \
                 in _our_statusline_commands():
             print(f"{settings_path} statusLine already runs "
-                  "`teamctl statusline` — nothing to do.")
+                  "`orchestrator statusline` — nothing to do.")
         elif "statusLine" in data:
-            print(f"{settings_path} already has a (non-teamctl) statusLine "
+            print(f"{settings_path} already has a (non-orchestrator) statusLine "
                   "key — leaving it as is.")
         else:
-            bak = Path(str(settings_path) + ".bak-teamctl")
+            bak = Path(str(settings_path) + ".bak-orchestrator")
             shutil.copy2(settings_path, bak)
             data["statusLine"] = dict(STATUSLINE_ENTRY)
             settings_path.write_text(json.dumps(data, indent=2) + "\n")
@@ -4718,7 +4722,7 @@ def _install_lead(changes: list[tuple[str, str]], want_hook: bool) -> None:
             _lead_install_hook(changes)
 
 # --------------------------------------------------------------------------
-# `teamctl lead` — durable manager identity for a Claude Code lead agent.
+# `orchestrator lead` — durable manager identity for a Claude Code lead agent.
 #
 # Three tiers, individually reversible, all marker-guarded or key-guarded:
 #   1. skill      ~/.claude/skills/teamctl-lead/SKILL.md — discoverable; Claude
@@ -4734,27 +4738,27 @@ LEAD_MD_BEGIN = "<!-- BEGIN teamctl-lead -->"
 LEAD_MD_END = "<!-- END teamctl-lead -->"
 
 LEAD_CLAUDE_BLOCK = LEAD_MD_BEGIN + """
-## teamctl lead mode
-<!-- Added by `teamctl lead on`; remove with `teamctl lead off`. -->
-You are the LEAD of a teamctl agent team (teammates run as tmux panes to
+## orchestrator lead mode
+<!-- Added by `orchestrator lead on`; remove with `orchestrator lead off`. -->
+You are the LEAD of a orchestrator agent team (teammates run as tmux panes to
 your right). Keep this chat free and responsive for the user's dynamic
-tasks: delegate all non-trivial work to teammates via `teamctl
+tasks: delegate all non-trivial work to teammates via `orchestrator
 spawn`/`dispatch`/`route`. Before spawning a teammate or planning anything
-large, run `teamctl usage` and `teamctl providers`, then choose
+large, run `orchestrator usage` and `orchestrator providers`, then choose
 provider/model/effort from that live data, the user's preferences
-(~/.config/agent-team/config.toml — see `teamctl config`), and task fit.
+(~/.config/agent-team/config.toml — see `orchestrator config`), and task fit.
 Use descriptive role names; never point two teammates at the same file;
-land a writing teammate's worktree when it finishes (`teamctl land
-<role>`); shut each teammate down (`teamctl shutdown <role>`) the moment
-its job is done — zero idle teammates. Keep the toolchain current: when teamctl or
+land a writing teammate's worktree when it finishes (`orchestrator land
+<role>`); shut each teammate down (`orchestrator shutdown <role>`) the moment
+its job is done — zero idle teammates. Keep the toolchain current: when orchestrator or
 any provider CLI reports an available update, surface it to the user
-promptly (e.g. `teamctl update`) instead of silently ignoring it.
-Delegation posture: honor `teamctl config lead.delegation` (ask / always /
+promptly (e.g. `orchestrator update`) instead of silently ignoring it.
+Delegation posture: honor `orchestrator config lead.delegation` (ask / always /
 manual; missing = ask). ask = the FIRST time non-trivial work comes up in
-a session, ask once whether to use teamctl agent teams (parallel
+a session, ask once whether to use orchestrator agent teams (parallel
 teammates; taps the user's other AI subscriptions and uses more, and
 different, resources) or stay single-agent; offer to remember the answer
-("always" / "never" -> `teamctl config lead.delegation always|manual`)
+("always" / "never" -> `orchestrator config lead.delegation always|manual`)
 and do not re-ask that session. manual = single-agent unless the user
 asks. Whatever the posture, a genuinely large task (multi-file,
 parallelizable, long-running) earns ONE offer per session to spin up a
@@ -4765,30 +4769,30 @@ instructions always override these rules.
 LEAD_SKILL_MD = """\
 ---
 name: teamctl-lead
-description: Lead-agent discipline for running an agent team with teamctl. Use when delegating work, spawning or shutting down teammates, planning multi-agent or parallel efforts, choosing a provider/model/effort for a task, or checking team capacity, usage, and provider availability.
+description: Lead-agent discipline for running an agent team with orchestrator. Use when delegating work, spawning or shutting down teammates, planning multi-agent or parallel efforts, choosing a provider/model/effort for a task, or checking team capacity, usage, and provider availability.
 ---
 
-# teamctl lead mode
+# orchestrator lead mode
 
-You are the LEAD agent of a teamctl agent team. Your pane is the user's
+You are the LEAD agent of a orchestrator agent team. Your pane is the user's
 main chat; teammates are tmux panes tiled to your right.
 
 ## Standing rules
 
 1. **Stay responsive.** Keep this main chat free for the user's dynamic
-   tasks. Delegate all non-trivial work to teammates (`teamctl spawn`,
-   `teamctl dispatch`, `teamctl route`); handle only trivial replies and
+   tasks. Delegate all non-trivial work to teammates (`orchestrator spawn`,
+   `orchestrator dispatch`, `orchestrator route`); handle only trivial replies and
    one-line edits yourself.
 2. **Decide capacity from live data, not habit.** Before spawning a
    teammate, planning a multi-agent effort, or dispatching anything large:
-   run `teamctl usage` (real usage %/reset times where the provider
-   exposes them) and `teamctl providers` (installed / authed / exhausted).
+   run `orchestrator usage` (real usage %/reset times where the provider
+   exposes them) and `orchestrator providers` (installed / authed / exhausted).
    Pick the provider, model, and effort from that live data, the user's
    preferences (`~/.config/agent-team/config.toml`, adjustable via
-   `teamctl config`), and task fit — light/cheap models for mechanical
-   work, heavyweight for hard reasoning. `teamctl route` automates the
-   pick and `teamctl models` shows what each provider currently offers.
-   Keep the numbers fresh: occasionally run `teamctl usage --probe all`
+   `orchestrator config`), and task fit — light/cheap models for mechanical
+   work, heavyweight for hard reasoning. `orchestrator route` automates the
+   pick and `orchestrator models` shows what each provider currently offers.
+   Keep the numbers fresh: occasionally run `orchestrator usage --probe all`
    (each provider's own usage command, in a hidden background tmux
    session the user never sees) — do a check-in before any large
    dispatch wave.
@@ -4797,83 +4801,83 @@ main chat; teammates are tmux panes tiled to your right.
 4. **One owner per file.** Never point two teammates at the same file; use
    extra teammates as reviewers of a single owner's work.
 5. **Zero idle teammates — and land before you leave.** A writing
-   teammate's worktree branch is merged back with `teamctl land <role>`
+   teammate's worktree branch is merged back with `orchestrator land <role>`
    (review with `--dry-run` first); then shut each teammate down the
-   moment its job is done (`teamctl shutdown <role>`). Shutdown never
+   moment its job is done (`orchestrator shutdown <role>`). Shutdown never
    discards un-landed work, but landing it is your job. Check
-   `teamctl status` before assuming a silent teammate is working — a
+   `orchestrator status` before assuming a silent teammate is working — a
    `needs-input` teammate is blocked on an approval you can answer with
-   `teamctl send`.
-6. **Keep the toolchain current.** When teamctl or any provider CLI
+   `orchestrator send`.
+6. **Keep the toolchain current.** When orchestrator or any provider CLI
    reports an available update, surface it to the user promptly (e.g.
-   `teamctl update`) rather than silently ignoring it — and apply it only
+   `orchestrator update`) rather than silently ignoring it — and apply it only
    with the user's go-ahead.
 7. **The user overrides everything.** The user's explicit instructions
    always take precedence over these rules.
 
 ## Command reference
 
-    teamctl spawn <role> --provider claude|codex|grok|gemini [--model M] [--effort E] [--prompt TEXT]
-    teamctl dispatch <role> --provider P --task "…"   # headless, watchable pane
-    teamctl result <role> --wait                      # read the result back
-    teamctl followup <role> --task "…"                # another turn, same session
-    teamctl route <role> --task "…"                   # auto-pick: most headroom wins
-    teamctl send <role> "…"                           # type into a live teammate
-    teamctl status [role] [--json]                    # busy / needs-input / idle
-    teamctl land <role> [--dry-run]                   # merge a worktree branch back
-    teamctl worktree list|prune                       # audit teammate worktrees
-    teamctl resurrect [--dry-run]                     # rebuild after a crash/reboot
-    teamctl list / teamctl usage / teamctl providers
-    teamctl shutdown <role>                           # always, as soon as done
+    orchestrator spawn <role> --provider claude|codex|grok|gemini [--model M] [--effort E] [--prompt TEXT]
+    orchestrator dispatch <role> --provider P --task "…"   # headless, watchable pane
+    orchestrator result <role> --wait                      # read the result back
+    orchestrator followup <role> --task "…"                # another turn, same session
+    orchestrator route <role> --task "…"                   # auto-pick: most headroom wins
+    orchestrator send <role> "…"                           # type into a live teammate
+    orchestrator status [role] [--json]                    # busy / needs-input / idle
+    orchestrator land <role> [--dry-run]                   # merge a worktree branch back
+    orchestrator worktree list|prune                       # audit teammate worktrees
+    orchestrator resurrect [--dry-run]                     # rebuild after a crash/reboot
+    orchestrator list / orchestrator usage / orchestrator providers
+    orchestrator shutdown <role>                           # always, as soon as done
 
 ## Delegation posture
 
-Read the user's posture from `teamctl config lead.delegation`
+Read the user's posture from `orchestrator config lead.delegation`
 (ask / always / manual; missing or unreadable = ask). The per-prompt hook
 also echoes the live value as `delegation=<value>`.
 
-- **always** — delegate non-trivial work to teamctl teammates by default.
-- **manual** — work single-agent; use teamctl only when the user asks.
+- **always** — delegate non-trivial work to orchestrator teammates by default.
+- **manual** — work single-agent; use orchestrator only when the user asks.
 - **ask** — the FIRST time non-trivial or code-executing work comes up in
-  a session, ask once, plainly: "Want me to use teamctl agent teams for
+  a session, ask once, plainly: "Want me to use orchestrator agent teams for
   work like this (parallel teammates, can tap your other AI
   subscriptions — uses more, and different, resources), or stick to
   regular single-agent work?" Then offer to make it permanent: "I can
   remember this — say 'always', 'never' (manual), or I'll ask again next
   session." Persist an answer with
-  `teamctl config lead.delegation always|manual` and confirm it back.
+  `orchestrator config lead.delegation always|manual` and confirm it back.
   One and done — never re-ask in the same session.
 
 **Escalation valve (all postures, including manual):** when a task is
 genuinely large — multi-file, parallelizable, long-running, or one that
 would block this chat for a long time — you may suggest ONCE per session:
-"This is big — want me to spin up a teamctl team for it?" Never nag; a no
+"This is big — want me to spin up a orchestrator team for it?" Never nag; a no
 is final for that session.
 
 ## Chat-based settings menu
 
-When the user asks for the teamctl menu, settings, or preferences:
+When the user asks for the orchestrator menu, settings, or preferences:
 
-1. Run `teamctl config` and read the current dotted keys.
+1. Run `orchestrator config` and read the current dotted keys.
 2. Present them to the user as a numbered menu in chat.
-3. Apply each change with `teamctl config <dotted.key> <value>`
-   (comma-separated values become lists), then re-run `teamctl config`
+3. Apply each change with `orchestrator config <dotted.key> <value>`
+   (comma-separated values become lists), then re-run `orchestrator config`
    and confirm the new value back to the user before moving on.
 
 There is also a full interactive cockpit the user can run directly in a
-terminal: **`teamctl settings`** — an arrow-key dark-room editor over the
+terminal: **`orchestrator settings`** — an arrow-key dark-room editor over the
 same config (space/←/→ cycle choices, enter to edit, save with backup).
 Point the user at it when they'd rather drive the settings themselves;
-without a TTY it prints the current values plus the matching `teamctl
+without a TTY it prints the current values plus the matching `orchestrator
 config` one-liners.
 
 ## Lead mode tiers
 
-This identity is installed by `teamctl lead on` in three tiers: this skill
+This identity is installed by `orchestrator lead on` in three tiers: this skill
 (discoverable), a marker-guarded CLAUDE.md block (always in context), and a
 UserPromptSubmit hook (recommended — it re-injects the standing rule on
 every prompt, so it keeps firing even after context compaction drops older
-text). `teamctl lead status` shows the tiers; `teamctl lead off` removes
+text). `orchestrator lead status` shows the tiers; `orchestrator lead off` removes
 all three.
 """
 
@@ -4884,8 +4888,8 @@ LEAD_HOOK_COMMAND = (
     "d=$(sed -n 's/^delegation *= *\"\\(.*\\)\"/\\1/p' "
     "~/.config/agent-team/config.toml 2>/dev/null | head -1); "
     "echo \"[teamctl-lead] delegation=${d:-ask} | Standing rule: delegate "
-    "non-trivial work to teamctl teammates per the posture - check teamctl "
-    "usage and teamctl providers before spawning, and shut each teammate "
+    "non-trivial work to orchestrator teammates per the posture - check orchestrator "
+    "usage and orchestrator providers before spawning, and shut each teammate "
     "down the moment it is done.\""
 )
 
@@ -4905,12 +4909,12 @@ def _lead_hook_entry() -> dict:
 def _print_controls() -> None:
     """The 'how do I drive this later' footer shown after init / lead on /
     lead status — from the shell or from a chat with a lead agent."""
-    print("\nControls — adjust teamctl any time:")
-    print("  from your shell:  teamctl settings           (preferences cockpit)")
-    print("                    teamctl lead on|off|status  (manager identity)")
-    print('  from a chat:      tell your lead agent "open the teamctl menu" —')
+    print("\nControls — adjust orchestrator any time:")
+    print("  from your shell:  orchestrator settings           (preferences cockpit)")
+    print("                    orchestrator lead on|off|status  (manager identity)")
+    print('  from a chat:      tell your lead agent "open the orchestrator menu" —')
     print("                    with lead mode on it presents your settings and")
-    print("                    applies changes via `teamctl config`.")
+    print("                    applies changes via `orchestrator config`.")
 
 
 def _lead_paths() -> dict[str, Path]:
@@ -4980,17 +4984,17 @@ def _lead_install_skill(changes: list[tuple[str, str]]) -> None:
         if skill_md.read_text() == LEAD_SKILL_MD:
             print(f"{skill_md} already installed — skipping.")
             return
-        bak = skill_md.with_name("SKILL.md.bak-teamctl")
+        bak = skill_md.with_name("SKILL.md.bak-orchestrator")
         shutil.copy2(skill_md, bak)
         skill_md.write_text(LEAD_SKILL_MD)
         print(f"updated {skill_md} (previous version backed up to {bak})")
         changes.append((f"updated {skill_md}",
-                        f"restore {bak}, or run `teamctl lead off`"))
+                        f"restore {bak}, or run `orchestrator lead off`"))
         return
     skill_md.parent.mkdir(parents=True, exist_ok=True)
     skill_md.write_text(LEAD_SKILL_MD)
     print(f"installed skill {skill_md}")
-    changes.append((f"installed {skill_md}", "teamctl lead off"))
+    changes.append((f"installed {skill_md}", "orchestrator lead off"))
 
 
 def _extract_lead_block(text: str) -> str:
@@ -5016,19 +5020,19 @@ def _lead_install_block(cli: str, changes: list[tuple[str, str]]) -> None:
             print(f"{cm} already contains the current teamctl-lead block "
                   "— skipping.")
             return
-        # stale block from an older teamctl: refresh it in place (like the
+        # stale block from an older orchestrator: refresh it in place (like the
         # skill file), leaving everything around it untouched
-        bak = Path(str(cm) + ".bak-teamctl")
+        bak = Path(str(cm) + ".bak-orchestrator")
         shutil.copy2(cm, bak)
         replacement = (LEAD_CLAUDE_BLOCK if current.endswith("\n")
                        else LEAD_CLAUDE_BLOCK.rstrip("\n"))
         cm.write_text(text.replace(current, replacement, 1))
         print(f"updated the teamctl-lead block in {cm} (backup: {bak})")
         changes.append((f"updated the teamctl-lead block in {cm}",
-                        f"restore {bak}, or run `teamctl lead off`"))
+                        f"restore {bak}, or run `orchestrator lead off`"))
         return
     if cm.exists():
-        bak = Path(str(cm) + ".bak-teamctl")
+        bak = Path(str(cm) + ".bak-orchestrator")
         shutil.copy2(cm, bak)
         print(f"backed up {cm} to {bak}")
     cm.parent.mkdir(parents=True, exist_ok=True)
@@ -5041,7 +5045,7 @@ def _lead_install_block(cli: str, changes: list[tuple[str, str]]) -> None:
     print(f"appended teamctl-lead block to {cm}")
     changes.append((
         f"appended a marker-guarded block to {cm}",
-        f"run `teamctl lead off`, or delete the block between the "
+        f"run `orchestrator lead off`, or delete the block between the "
         f"'{LEAD_MD_BEGIN}' and '{LEAD_MD_END}' lines",
     ))
 
@@ -5053,7 +5057,7 @@ def _lead_install_hook(changes: list[tuple[str, str]]) -> None:
         sp.write_text(json.dumps(
             {"hooks": {"UserPromptSubmit": [_lead_hook_entry()]}}, indent=2) + "\n")
         print(f"created {sp} with a teamctl-lead UserPromptSubmit hook")
-        changes.append((f"created {sp}", f"teamctl lead off  (or rm {sp})"))
+        changes.append((f"created {sp}", f"orchestrator lead off  (or rm {sp})"))
         return
 
     try:
@@ -5077,13 +5081,13 @@ def _lead_install_hook(changes: list[tuple[str, str]]) -> None:
         print(f"hooks.UserPromptSubmit in {sp} has an unexpected shape — "
               "leaving it untouched.")
         return
-    bak = Path(str(sp) + ".bak-teamctl")
+    bak = Path(str(sp) + ".bak-orchestrator")
     shutil.copy2(sp, bak)
     ups.append(_lead_hook_entry())
     sp.write_text(json.dumps(data, indent=2) + "\n")
     print(f"added teamctl-lead UserPromptSubmit hook to {sp} (backup: {bak})")
     changes.append((f"added a teamctl-lead hook to {sp}",
-                    f"restore {bak}, or run `teamctl lead off`"))
+                    f"restore {bak}, or run `orchestrator lead off`"))
 
 
 def _lead_remove_skill(removed: list[str], left: list[str]) -> None:
@@ -5203,14 +5207,14 @@ def cmd_lead(args: argparse.Namespace) -> int:
         print(f"  hook          {st['hook']:<14}  UserPromptSubmit in "
               f"{p['settings']} (Claude Code mechanism)")
         print(f"\n  delegation posture: {delegation_posture()}   (change: "
-              "teamctl config lead.delegation ask|always|manual)")
+              "orchestrator config lead.delegation ask|always|manual)")
         _print_controls()
         return 0
 
     if args.action == "on":
         selected = _lead_selected_clis(args.cli)
         changes: list[tuple[str, str]] = []
-        print("teamctl lead on — install the lead-agent identity "
+        print("orchestrator lead on — install the lead-agent identity "
               f"({', '.join(selected)}).\n")
         if "claude" in selected:
             _lead_install_skill(changes)
@@ -5243,7 +5247,7 @@ def cmd_lead(args: argparse.Namespace) -> int:
             print(f"    revert: {revert}")
         if not changes:
             print("  nothing was changed (already installed)")
-        print("undo everything any time with: teamctl lead off")
+        print("undo everything any time with: orchestrator lead off")
         _print_controls()
         return 0
 
@@ -5259,7 +5263,7 @@ def cmd_lead(args: argparse.Namespace) -> int:
         _lead_remove_block(cli, removed, left)
     if "claude" in selected:
         _lead_remove_hook(removed, left)
-    print("teamctl lead off:")
+    print("orchestrator lead off:")
     for line in removed:
         print(f"  removed: {line}")
     for line in left:
@@ -5270,18 +5274,18 @@ def cmd_lead(args: argparse.Namespace) -> int:
 
 
 # --------------------------------------------------------------------------
-# `teamctl statusline` — the Claude Code statusLine command. Folded into
-# teamctl in v0.4.0 (previously the separate claude-statusline script):
+# `orchestrator statusline` — the Claude Code statusLine command. Folded into
+# orchestrator in v0.4.0 (previously the separate claude-statusline script):
 # one binary to install, update, and uninstall. Reads the session JSON
 # Claude Code pipes to stdin and prints `model · effort · ctx N%`; the
 # stdin JSON also carries rate_limits.five_hour/seven_day (documented
-# statusLine fields), which are cached for `teamctl usage`. This runs on
+# statusLine fields), which are cached for `orchestrator usage`. This runs on
 # every Claude Code render, so main() dispatches it BEFORE argparse is
 # even built (~46ms end-to-end, interpreter included — measured).
 # --------------------------------------------------------------------------
 
 def _statusline_dump_usage(data: dict) -> None:
-    """Best-effort cache of rate_limits for `teamctl usage`. Never raises."""
+    """Best-effort cache of rate_limits for `orchestrator usage`. Never raises."""
     try:
         rl = data.get("rate_limits")
         if not isinstance(rl, dict):
@@ -5334,11 +5338,11 @@ def cmd_statusline() -> int:
 
 
 # --------------------------------------------------------------------------
-# `teamctl update` — self-update from the recorded install source.
+# `orchestrator update` — self-update from the recorded install source.
 #
 # install.sh records where this copy came from (install-meta.json in the
 # state dir: source, repo, ref, src_dir, bin_dir, version). `update`
-# re-fetches teamctl from that source and atomically replaces the
+# re-fetches orchestrator from that source and atomically replaces the
 # installed copy; user config (~/.config/agent-team/) and
 # state are never touched. Reachability degrades honestly, route by route:
 #
@@ -5353,7 +5357,7 @@ def cmd_statusline() -> int:
 # hang or a stack trace.
 # --------------------------------------------------------------------------
 
-UPDATE_FILES = ("teamctl",)   # one binary since the v0.4.0 statusline fold
+UPDATE_FILES = ("orchestrator",)   # one binary since the v0.4.0 statusline fold
 
 UPDATE_CHECK_SECONDS = 24 * 3600      # background check: at most once a day
 
@@ -5518,7 +5522,7 @@ def _fetch_from_source(meta: dict, names: list[str]
 def _installed_version(bin_dir: Path) -> str:
     """Version of the installed copy (falling back to this running one)."""
     try:
-        v = _source_version((bin_dir / "teamctl").read_text())
+        v = _source_version((bin_dir / "orchestrator").read_text())
         if v:
             return v
     except OSError:
@@ -5529,7 +5533,7 @@ def _installed_version(bin_dir: Path) -> str:
 def _apply_update(meta: dict, files: dict[str, str]) -> Path:
     """Atomically replace the installed artifacts; returns the bin dir.
     Refuses a download that does not compile. Config/state untouched."""
-    compile(files["teamctl"], "teamctl", "exec")
+    compile(files["orchestrator"], "orchestrator", "exec")
     bin_dir = Path(str(meta.get("bin_dir") or "~/.local/bin")).expanduser()
     bin_dir.mkdir(parents=True, exist_ok=True)
     for name, text in files.items():
@@ -5539,7 +5543,7 @@ def _apply_update(meta: dict, files: dict[str, str]) -> Path:
         os.chmod(tmp, 0o755)
         tmp.replace(dest)
     meta = dict(meta)
-    meta["version"] = _source_version(files["teamctl"]) or meta.get("version")
+    meta["version"] = _source_version(files["orchestrator"]) or meta.get("version")
     meta["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
     mp = install_meta_path()
     mp.parent.mkdir(parents=True, exist_ok=True)
@@ -5629,7 +5633,7 @@ def _update_notice() -> str | None:
         return None
     latest = _read_update_cache().get("latest")
     if latest and _version_key(str(latest)) > _version_key(VERSION):
-        return f"teamctl {latest} available — teamctl update"
+        return f"orchestrator {latest} available — orchestrator update"
     return None
 
 
@@ -5660,7 +5664,7 @@ def _session_update_line() -> str | None:
     files, _via, _tried = _fetch_from_source(meta, list(UPDATE_FILES))
     if not files:
         return notice + " (auto-update could not reach the source)"
-    latest = _source_version(files["teamctl"])
+    latest = _source_version(files["orchestrator"])
     bin_dir = Path(str(meta.get("bin_dir") or "~/.local/bin")).expanduser()
     if not latest or _version_key(latest) <= _version_key(
             _installed_version(bin_dir)):
@@ -5671,7 +5675,7 @@ def _session_update_line() -> str | None:
     except (OSError, SyntaxError, ValueError):
         return notice + " (auto-update failed — run it by hand)"
     _write_update_cache(latest)
-    return f"auto-updated teamctl → {latest}"
+    return f"auto-updated orchestrator → {latest}"
 
 
 def cmd_update(args: argparse.Namespace) -> int:
@@ -5680,14 +5684,14 @@ def cmd_update(args: argparse.Namespace) -> int:
     if getattr(args, "refresh_cache", False):
         # hidden flag: the detached daily check. Silent; always exits 0.
         if meta is not None:
-            files, _via, _tried = _fetch_from_source(meta, ["teamctl"])
+            files, _via, _tried = _fetch_from_source(meta, ["orchestrator"])
             if files:
-                _write_update_cache(_source_version(files["teamctl"]))
+                _write_update_cache(_source_version(files["orchestrator"]))
         return 0
 
     if meta is None:
-        print("teamctl: no install metadata found — this copy predates "
-              "`teamctl update` or was not installed by install.sh.\n"
+        print("orchestrator: no install metadata found — this copy predates "
+              "`orchestrator update` or was not installed by install.sh.\n"
               "Re-run the installer once from your original source (it now "
               "records the source, so future updates are one command):\n"
               "  ./install.sh --no-init            # from a checkout\n"
@@ -5697,18 +5701,18 @@ def cmd_update(args: argparse.Namespace) -> int:
 
     bin_dir = Path(str(meta.get("bin_dir") or "~/.local/bin")).expanduser()
     installed = _installed_version(bin_dir)
-    names = ["teamctl"] if args.check else list(UPDATE_FILES)
+    names = ["orchestrator"] if args.check else list(UPDATE_FILES)
     files, via, tried = _fetch_from_source(meta, names)
     if files is None:
-        print(f"teamctl: could not reach the install source "
+        print(f"orchestrator: could not reach the install source "
               f"({meta.get('source', '?')}):", file=sys.stderr)
         for reason in tried:
             print(f"  {reason}", file=sys.stderr)
         print("  the installed copy is untouched.", file=sys.stderr)
         return 1
-    latest = _source_version(files["teamctl"])
+    latest = _source_version(files["orchestrator"])
     if not latest:
-        print("teamctl: the fetched teamctl has no version string — "
+        print("orchestrator: the fetched orchestrator has no version string — "
               "refusing to install it.", file=sys.stderr)
         return 1
     _write_update_cache(latest)
@@ -5716,7 +5720,7 @@ def cmd_update(args: argparse.Namespace) -> int:
     if args.check:
         print(f"installed {installed} · latest {latest} (via {via})")
         if _version_key(latest) > _version_key(installed):
-            print("update available — run `teamctl update`")
+            print("update available — run `orchestrator update`")
         else:
             print("up to date")
         return 0
@@ -5728,13 +5732,13 @@ def cmd_update(args: argparse.Namespace) -> int:
     try:
         bin_dir = _apply_update(meta, files)
     except (SyntaxError, ValueError):
-        print("teamctl: the fetched teamctl does not compile — refusing to "
+        print("orchestrator: the fetched orchestrator does not compile — refusing to "
               "install it. The installed copy is untouched.", file=sys.stderr)
         return 1
     except OSError as exc:
-        print(f"teamctl: could not write the update: {exc}", file=sys.stderr)
+        print(f"orchestrator: could not write the update: {exc}", file=sys.stderr)
         return 1
-    print(f"updated teamctl {installed} {_out_glyphs()['arrow']} {latest} "
+    print(f"updated orchestrator {installed} {_out_glyphs()['arrow']} {latest} "
           f"in {bin_dir} (via {via})")
     print("config and state untouched (~/.config/agent-team, "
           "~/.local/state/agent-team)")
@@ -5742,24 +5746,25 @@ def cmd_update(args: argparse.Namespace) -> int:
 
 
 def cmd_uninstall(args: argparse.Namespace) -> int:
-    """Reverse what install.sh and `teamctl init` set up: the installed
+    """Reverse what install.sh and `orchestrator init` set up: the installed
     binary (plus a legacy claude-statusline), the ~/.tmux.conf marker
     block, our statusLine wiring, and the install/update metadata —
     backups first, exactly like the installer made them. Config, state,
     and lead mode are left in place, with their removal commands printed
-    (`teamctl lead off` reverses lead mode on its own)."""
+    (`orchestrator lead off` reverses lead mode on its own)."""
     meta = load_install_meta() or {}
     bin_dir = Path(str(meta.get("bin_dir") or "~/.local/bin")).expanduser()
     if not getattr(args, "yes", False):
-        if not _ask_yn(f"remove teamctl from {bin_dir}? [y/N] "):
+        if not _ask_yn(f"remove orchestrator from {bin_dir}? [y/N] "):
             print("nothing removed.")
             return 0
 
     removed: list[str] = []
     left: list[str] = []
 
-    # 1. binaries (claude-statusline is the pre-v0.4.0 companion script)
-    for name in ("teamctl", "claude-statusline"):
+    # 1. binaries (claude-statusline is the pre-v0.4.0 companion script;
+    #    teamctl is the pre-rename name of this one)
+    for name in ("orchestrator", "teamctl", "claude-statusline"):
         p = bin_dir / name
         try:
             if p.exists():
@@ -5788,7 +5793,7 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
             if not skip:
                 kept.append(line)
         conf.write_text("".join(kept))
-        removed.append(f"teamctl block from {conf} (backup: {bak})")
+        removed.append(f"orchestrator block from {conf} (backup: {bak})")
         print("if tmux is running, reload the config and reset the options "
               "the block set:")
         print("  tmux source-file ~/.tmux.conf")
@@ -5797,7 +5802,7 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
         print("  tmux set-option -gu status-right; "
               "tmux set-option -gu @teamctl_status_added")
 
-    # 3. statusLine key — only if it points at teamctl (any era)
+    # 3. statusLine key — only if it points at orchestrator (any era)
     sp = Path.home() / ".claude" / "settings.json"
     if sp.exists():
         try:
@@ -5816,7 +5821,7 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
                 sp.write_text(json.dumps(data, indent=2) + "\n")
                 removed.append(f"statusLine key from {sp} (backup: {bak})")
             elif "statusLine" in data:
-                left.append(f"statusLine in {sp} is not teamctl's; "
+                left.append(f"statusLine in {sp} is not orchestrator's; "
                             "left untouched")
 
     # 4. install/update metadata (written by install.sh / the update check)
@@ -5828,14 +5833,14 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
         except OSError as exc:
             left.append(f"{p}: {exc}")
 
-    print("teamctl uninstall:")
+    print("orchestrator uninstall:")
     for line in removed:
         print(f"  removed: {line}")
     for line in left:
         print(f"  left alone: {line}")
     if not removed:
         print("  nothing to remove.")
-    print("note: lead mode (if installed) reverses with `teamctl lead off` "
+    print("note: lead mode (if installed) reverses with `orchestrator lead off` "
           "— run it BEFORE deleting the binary next time, or remove the "
           "marker blocks by hand.")
     print("note: per-user data was left in place; remove it with:")
@@ -5844,10 +5849,10 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
 
 
 # --------------------------------------------------------------------------
-# bare `teamctl` — the front door. With no subcommand on a real terminal it
+# bare `orchestrator` — the front door. With no subcommand on a real terminal it
 # launches the user's default lead session: the default chat provider,
 # model, and effort (from [lead] chat_* in config, falling back to the
-# routing preference), with lead mode enabled, in the teamctl tmux session.
+# routing preference), with lead mode enabled, in the orchestrator tmux session.
 # Provider-agnostic: whichever CLI the user prefers becomes the front door.
 # --------------------------------------------------------------------------
 
@@ -5868,13 +5873,13 @@ def _resolve_chat() -> tuple[str | None, str, str, str]:
     prov, model, effort = _chat_defaults()
     if prov and provider_spec(prov) is None:
         return None, "", "", (f"[lead] chat_provider is '{prov}', which is "
-                              "not a known provider — fix it with `teamctl "
-                              "settings` or `teamctl config lead.chat_provider "
+                              "not a known provider — fix it with `orchestrator "
+                              "settings` or `orchestrator config lead.chat_provider "
                               f"{'|'.join(routable_providers())}`.")
     if prov and not provider_enabled(prov):
         return None, "", "", (f"[lead] chat_provider '{prov}' is disabled in "
                               f"your config — {_disabled_hint(prov)}, or pick "
-                              "another with `teamctl config "
+                              "another with `orchestrator config "
                               "lead.chat_provider <name>`.")
     if not prov:
         prov = default_provider()
@@ -5884,25 +5889,25 @@ def _resolve_chat() -> tuple[str | None, str, str, str]:
         if avail:
             return None, "", "", (
                 "no default chat provider set and several are available "
-                f"({', '.join(avail)}). Pick one: `teamctl config "
-                "lead.chat_provider <name>` (or `teamctl settings`).")
+                f"({', '.join(avail)}). Pick one: `orchestrator config "
+                "lead.chat_provider <name>` (or `orchestrator settings`).")
         return None, "", "", (
-            "no provider is signed in. Sign one in, then run `teamctl` "
-            "again — see `teamctl providers`.")
+            "no provider is signed in. Sign one in, then run `orchestrator` "
+            "again — see `orchestrator providers`.")
 
     state, _note = provider_state(prov)
     if state == "not installed":
         return None, "", "", (
-            f"{prov} is not installed. Install it (see `teamctl providers`), "
-            "or pick another with `teamctl config lead.chat_provider <name>`.")
+            f"{prov} is not installed. Install it (see `orchestrator providers`), "
+            "or pick another with `orchestrator config lead.chat_provider <name>`.")
     if state == "locked out":
         return None, "", "", (
             f"{prov} is installed but signed out — sign in with "
-            f"`{login_hint(prov)}`, then run `teamctl`.")
+            f"`{login_hint(prov)}`, then run `orchestrator`.")
     if state == "unknown":
         return None, "", "", (
             f"{prov}'s login state can't be read — check the CLI, or pick "
-            "another with `teamctl config lead.chat_provider <name>`.")
+            "another with `orchestrator config lead.chat_provider <name>`.")
 
     d_model, d_effort = provider_defaults(prov)
     return prov, (model or d_model or ""), (effort or d_effort or ""), ""
@@ -5915,15 +5920,15 @@ def _launch_plan(in_tmux_flag: bool, provider: str, model: str,
 
     mode 'exec' — already in tmux: replace this process with the provider
     CLI (the front door IS the lead chat). mode 'new-session' — outside
-    tmux: attach-or-create the 'teamctl' session running the provider."""
+    tmux: attach-or-create the 'orchestrator' session running the provider."""
     argv = list(PROVIDERS[provider]) + interactive_flags(provider, model,
                                                           effort)
     if in_tmux_flag:
         return {"mode": "exec", "argv": argv, "provider": provider,
                 "model": model, "effort": effort}
     launch = build_launch_line(provider, "", cwd, model, effort)
-    return {"mode": "new-session", "session": "teamctl", "launch": launch,
-            "argv": ["tmux", "new-session", "-A", "-s", "teamctl", launch],
+    return {"mode": "new-session", "session": "orchestrator", "launch": launch,
+            "argv": ["tmux", "new-session", "-A", "-s", "orchestrator", launch],
             "provider": provider, "model": model, "effort": effort}
 
 
@@ -5941,11 +5946,11 @@ def _ensure_lead_mode(provider: str) -> None:
     _lead_install_block(provider, changes)
     if changes:
         print(_fg("dim", f"· enabled lead mode for {provider} "
-                         "(reverse: teamctl lead off)"))
+                         "(reverse: orchestrator lead off)"))
 
 
 def cmd_launch(args: argparse.Namespace) -> int:
-    """Bare `teamctl`: open the default lead session."""
+    """Bare `orchestrator`: open the default lead session."""
     # first run with no config → funnel through express init, then launch
     if not config_path().exists():
         print(_fg("dim", "first run — configuring defaults…\n"))
@@ -5962,14 +5967,14 @@ def cmd_launch(args: argparse.Namespace) -> int:
         if lost:
             print(_fg("warn", f"· {len(lost)} teammate(s) lost in a "
                               f"crash/reboot ({', '.join(sorted(lost))}) "
-                              "— rebuild: teamctl resurrect "
+                              "— rebuild: orchestrator resurrect "
                               "(preview: --dry-run)"))
     except TeamctlError:
         pass    # no tmux yet — the launch path below explains that itself
 
     provider, model, effort, err = _resolve_chat()
     if provider is None:
-        print(f"teamctl: {err}", file=sys.stderr)
+        print(f"orchestrator: {err}", file=sys.stderr)
         return 1
 
     cwd = os.getcwd()
@@ -5980,7 +5985,7 @@ def cmd_launch(args: argparse.Namespace) -> int:
         if plan["mode"] == "exec":
             print(f"launch: {tag} in this tmux pane (lead chat)")
         else:
-            print(f"launch: {tag} in tmux session 'teamctl'")
+            print(f"launch: {tag} in tmux session 'orchestrator'")
         print("  " + " ".join(shlex.quote(a) for a in plan["argv"]))
         return 0
 
@@ -5988,19 +5993,19 @@ def cmd_launch(args: argparse.Namespace) -> int:
     _ensure_lead_mode(provider)
 
     if plan["mode"] == "new-session" and shutil.which("tmux") is None:
-        print("teamctl: tmux is not installed — the lead session needs it. "
+        print("orchestrator: tmux is not installed — the lead session needs it. "
               "Install tmux, or run your provider CLI directly.",
               file=sys.stderr)
         return 2
     try:
         os.execvp(plan["argv"][0], plan["argv"])
     except OSError as exc:                         # pragma: no cover - exec
-        print(f"teamctl: could not launch {provider}: {exc}", file=sys.stderr)
+        print(f"orchestrator: could not launch {provider}: {exc}", file=sys.stderr)
         return 2
 
 
 # --------------------------------------------------------------------------
-# `teamctl doctor` — one-shot environment health check. Each check returns
+# `orchestrator doctor` — one-shot environment health check. Each check returns
 # ("ok" | "warn" | "fail", detail); the worst status sets the exit code
 # (ok 0, warn 1, fail 2). The check functions are pure enough to test with
 # a sandboxed HOME + monkeypatched `which`.
@@ -6010,7 +6015,7 @@ def wsl_environment(osrelease: str = "/proc/sys/kernel/osrelease",
                     version: str = "/proc/version") -> str | None:
     """'WSL2 (Ubuntu)' / 'WSL (Ubuntu)' / 'WSL2' / None.
 
-    WSL presents as Linux and teamctl is SUPPORTED there — this is
+    WSL presents as Linux and orchestrator is SUPPORTED there — this is
     awareness (doctor's environment line, the installer's greeting),
     never gating. Signal: /proc/sys/kernel/osrelease and /proc/version
     carry 'microsoft' ('…-microsoft-standard-WSL2' on WSL2,
@@ -6032,7 +6037,7 @@ def wsl_environment(osrelease: str = "/proc/sys/kernel/osrelease",
 
 
 def _check_environment() -> tuple[str, str]:
-    """Where teamctl is running. WSL runs as Linux and is supported; its
+    """Where orchestrator is running. WSL runs as Linux and is supported; its
     one genuine rough edge — provider browser sign-ins from a GUI-less
     shell — gets pre-empted here."""
     wsl = wsl_environment()
@@ -6061,16 +6066,16 @@ def _check_python() -> tuple[str, str]:
     label = f"{v.major}.{v.minor}.{v.micro}"
     if v >= (3, 11):
         return "ok", f"{label} (tomllib present)"
-    return "fail", f"{label} — teamctl needs 3.11+ (tomllib)"
+    return "fail", f"{label} — orchestrator needs 3.11+ (tomllib)"
 
 
 def _check_tmux() -> tuple[str, str]:
     ver = _tmux_version()
     if ver is None:
         if shutil.which("tmux") is None:
-            return "fail", "not installed — teamctl needs tmux"
+            return "fail", "not installed — orchestrator needs tmux"
         return "warn", "installed but `tmux -V` did not report a version"
-    # known-quirk learnings encoded as advice, not failures — teamctl
+    # known-quirk learnings encoded as advice, not failures — orchestrator
     # already works around both (per-pane @options for labels; the
     # read-write tty fd in the installer):
     #  - some 3.x builds don't execute #() in status formats (we use
@@ -6101,7 +6106,7 @@ def _check_providers() -> tuple[str, str]:
 def _check_config() -> tuple[str, str]:
     path = config_path()
     if not path.exists():
-        return "warn", "no config yet — run `teamctl init`"
+        return "warn", "no config yet — run `orchestrator init`"
     if tomllib is None:
         return "warn", "cannot parse (Python < 3.11)"
     try:
@@ -6134,7 +6139,7 @@ def _check_statusline() -> tuple[str, str]:
         return "ok", "n/a (Claude Code not installed)"
     sp = Path.home() / ".claude" / "settings.json"
     if not sp.exists():
-        return "warn", "Claude Code has no settings.json — `teamctl init` "\
+        return "warn", "Claude Code has no settings.json — `orchestrator init` "\
                        "wires the statusline"
     try:
         data = json.loads(sp.read_text())
@@ -6143,34 +6148,34 @@ def _check_statusline() -> tuple[str, str]:
     sl = data.get("statusLine")
     cmd = sl.get("command") if isinstance(sl, dict) else None
     if cmd == STATUSLINE_ENTRY["command"] or cmd == \
-            str(Path.home() / ".local" / "bin" / "teamctl") + " statusline":
-        return "ok", "wired to `teamctl statusline`"
+            str(Path.home() / ".local" / "bin" / "orchestrator") + " statusline":
+        return "ok", "wired to `orchestrator statusline`"
     if cmd in _legacy_statusline_commands():
-        return "warn", "wired to the pre-v0.4.0 script — `teamctl update` "\
+        return "warn", "wired to the pre-v0.4.0 script — `orchestrator update` "\
                        "migrates it"
     if cmd:
-        return "ok", "a non-teamctl statusLine is set (left alone)"
-    return "warn", "not wired — `teamctl init` adds it"
+        return "ok", "a non-orchestrator statusLine is set (left alone)"
+    return "warn", "not wired — `orchestrator init` adds it"
 
 
 def _check_install_meta() -> tuple[str, str]:
     if load_install_meta() is not None:
-        return "ok", "recorded — `teamctl update` knows the source"
-    return "warn", "missing — re-run install.sh so `teamctl update` works"
+        return "ok", "recorded — `orchestrator update` knows the source"
+    return "warn", "missing — re-run install.sh so `orchestrator update` works"
 
 
 def _check_lost() -> tuple[str, str]:
-    """Teammates lost to a crash/reboot, waiting for `teamctl resurrect`."""
+    """Teammates lost to a crash/reboot, waiting for `orchestrator resurrect`."""
     lost = load_state().get("lost") or {}
     if lost:
         names = ", ".join(sorted(lost)[:4]) + ("…" if len(lost) > 4 else "")
         return "warn", (f"{len(lost)} lost teammate(s) ({names}) — "
-                        "rebuild with `teamctl resurrect`")
+                        "rebuild with `orchestrator resurrect`")
     return "ok", "none"
 
 
 def _check_worktrees() -> tuple[str, str]:
-    """Orphaned teamctl worktrees (owner gone, work possibly un-landed)."""
+    """Orphaned orchestrator worktrees (owner gone, work possibly un-landed)."""
     reg = load_worktree_registry()
     if not reg:
         return "ok", "none"
@@ -6185,7 +6190,7 @@ def _check_worktrees() -> tuple[str, str]:
         return "warn", (f"{len(orphans)} orphaned worktree(s) "
                         f"({', '.join(sorted(orphans)[:4])}"
                         f"{'…' if len(orphans) > 4 else ''}) — "
-                        "`teamctl worktree list`, land or prune")
+                        "`orchestrator worktree list`, land or prune")
     return "ok", f"{len(reg)} active, none orphaned"
 
 
@@ -6233,7 +6238,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     g = _out_glyphs()
     mark = {"ok": ("ok", g["dot"]), "warn": ("warn", "!"),
             "fail": ("bad", g["chev"])}
-    print(_fg("accent", "teamctl doctor") + _fg("dim", "  · environment "
+    print(_fg("accent", "orchestrator doctor") + _fg("dim", "  · environment "
                                                 "health"))
     print()
     for name, status, detail in rows:
@@ -6259,13 +6264,13 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 
 # --------------------------------------------------------------------------
-# `teamctl config` — show and adjust ~/.config/agent-team/config.toml
+# `orchestrator config` — show and adjust ~/.config/agent-team/config.toml
 # --------------------------------------------------------------------------
 
 _MISSING = object()
 
 CONFIG_HEADER = [
-    "# agent-team configuration (managed by `teamctl init` / `teamctl config`)",
+    "# agent-team configuration (managed by `orchestrator init` / `orchestrator config`)",
     "# Delete this file to fall back to each provider CLI's own defaults.",
 ]
 
@@ -6372,7 +6377,7 @@ def _load_config_strict(path: Path) -> dict:
     except ValueError as exc:  # tomllib.TOMLDecodeError subclasses ValueError
         raise TeamctlError(
             f"could not parse {path}: {exc}. Fix the file or re-run "
-            "`teamctl init` to rewrite it.")
+            "`orchestrator init` to rewrite it.")
 
 
 def _write_config_file(data: dict) -> Path | None:
@@ -6383,7 +6388,7 @@ def _write_config_file(data: dict) -> Path | None:
     path = config_path()
     bak = None
     if path.exists():
-        bak = path.with_name("config.toml.bak-teamctl")
+        bak = path.with_name("config.toml.bak-orchestrator")
         shutil.copy2(path, bak)
     path.parent.mkdir(parents=True, exist_ok=True)
     body = "\n".join(CONFIG_HEADER + _dump_toml(data)).rstrip("\n") + "\n"
@@ -6394,7 +6399,7 @@ def _write_config_file(data: dict) -> Path | None:
 
 
 # enum-valued config keys the rich menu can cycle with Left/Right; anything
-# else gets a free-text edit (parsed exactly like `teamctl config k v`).
+# else gets a free-text edit (parsed exactly like `orchestrator config k v`).
 _MENU_ENUMS: dict[str, tuple[str, ...]] = {
     "lead.delegation": ("ask", "always", "manual"),
     "output.verbosity": ("normal", "terse", "detailed"),
@@ -6458,7 +6463,7 @@ def _config_menu_curses(path: Path) -> int | None:
                 curses.textpad.rectangle(stdscr, 1, 1, 1 + box_h, 1 + box_w)
             except curses.error:
                 pass
-            _addstr(stdscr, 1, 3, f" teamctl settings · {path} ",
+            _addstr(stdscr, 1, 3, f" orchestrator settings · {path} ",
                     _pair(1) | curses.A_BOLD)
             for i, (key, val) in enumerate(flat):
                 sel_here = (i == sel)
@@ -6530,7 +6535,7 @@ def _config_menu_curses(path: Path) -> int | None:
 def _config_menu() -> int:
     path = config_path()
     if not path.exists():
-        print(f"no config at {path} — run `teamctl init` to create one.")
+        print(f"no config at {path} — run `orchestrator init` to create one.")
         return 1
     if _use_rich_ui():
         rc = _config_menu_curses(path)
@@ -6580,13 +6585,13 @@ def cmd_config(args: argparse.Namespace) -> int:
 
     if args.menu:
         if args.key or args.value:
-            print("teamctl: --menu takes no key/value arguments.", file=sys.stderr)
+            print("orchestrator: --menu takes no key/value arguments.", file=sys.stderr)
             return 2
         return _config_menu()
 
     if args.key is None:  # bare: pretty-print current settings
         if not path.exists():
-            print(f"no config at {path} — run `teamctl init` to create one.")
+            print(f"no config at {path} — run `orchestrator init` to create one.")
             return 1
         flat = _flatten_config(_load_config_strict(path))
         print(f"# {path}")
@@ -6599,11 +6604,11 @@ def cmd_config(args: argparse.Namespace) -> int:
 
     if args.value is None:  # read one key
         if not path.exists():
-            print(f"no config at {path} — run `teamctl init` to create one.")
+            print(f"no config at {path} — run `orchestrator init` to create one.")
             return 1
         val = _get_dotted(_load_config_strict(path), args.key)
         if val is _MISSING:
-            print(f"teamctl: '{args.key}' is not set.", file=sys.stderr)
+            print(f"orchestrator: '{args.key}' is not set.", file=sys.stderr)
             return 1
         if isinstance(val, dict):
             for k, v in _flatten_config(val, args.key):
@@ -6623,14 +6628,14 @@ def cmd_config(args: argparse.Namespace) -> int:
 
 
 # --------------------------------------------------------------------------
-# `teamctl settings` — the re-runnable settings cockpit: a curated,
-# section-grouped editor over the SAME config.toml `teamctl config` writes.
+# `orchestrator settings` — the re-runnable settings cockpit: a curated,
+# section-grouped editor over the SAME config.toml `orchestrator config` writes.
 # init is the first-run wizard; settings is its human face for later edits.
 #
 # The MODEL layer (settings_catalog / _settings_cycle / _settings_plain) is
 # pure and headless-testable; the curses VIEW reuses the cockpit palette and
 # glyphs. No TTY / no curses → the plain degrade prints current values plus
-# the matching `teamctl config <key> <value>` one-liners (same philosophy as
+# the matching `orchestrator config <key> <value>` one-liners (same philosophy as
 # the installer's plain path).
 # --------------------------------------------------------------------------
 
@@ -6657,7 +6662,7 @@ _SETTINGS_DEFAULTS = {
 # come from _menu_choices (shared with `config --menu`) so the two editors
 # never disagree about what a key accepts.
 _SETTINGS_ROWS = (
-    ("lead.chat_provider", "default chat", "provider (bare `teamctl`)"),
+    ("lead.chat_provider", "default chat", "provider (bare `orchestrator`)"),
     ("lead.chat_model", "default chat", "model"),
     ("lead.chat_effort", "default chat", "effort"),
     ("routing.preference", "routing", "provider order"),
@@ -6733,7 +6738,7 @@ def _settings_cycle(row: dict, delta: int):
 
 
 def _settings_plain(data: dict) -> list[str]:
-    """No-TTY degrade: current values + the `teamctl config` one-liner that
+    """No-TTY degrade: current values + the `orchestrator config` one-liner that
     changes each — the scriptable path spelled out."""
     lines = [f"# {config_path()}",
              "# current settings — change any with the command shown:"]
@@ -6751,7 +6756,7 @@ def _settings_plain(data: dict) -> list[str]:
         else:
             example = v
         lines.append(f"  {row['label']:<26} {val}")
-        lines.append(f"    teamctl config {row['key']} "
+        lines.append(f"    orchestrator config {row['key']} "
                      f"{shlex.quote(str(example))}")
     return lines
 
@@ -6798,7 +6803,7 @@ def _settings_curses(data: dict) -> int | None:
                 scroll[0] = fidx - body_h + 1
             scroll[0] = max(0, min(scroll[0], max(0, len(render) - body_h)))
             stdscr.erase()
-            _addstr(stdscr, 0, 1, "teamctl", _cattr("primary") | curses.A_BOLD)
+            _addstr(stdscr, 0, 1, "orchestrator", _cattr("primary") | curses.A_BOLD)
             _addstr(stdscr, 0, 9, f"{g['dot']}  settings", _cattr("accent"))
             _addstr(stdscr, 1, 1, str(config_path()), _cattr("dim"))
             if scroll[0] > 0:
@@ -6892,13 +6897,13 @@ def cmd_settings(args: argparse.Namespace) -> int:
     for line in _settings_plain(data):
         print(line)
     if not path.exists():
-        print("\n(no config yet — run `teamctl init`, or set any key above "
+        print("\n(no config yet — run `orchestrator init`, or set any key above "
               "to create one)")
     return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="teamctl", description=__doc__)
+    p = argparse.ArgumentParser(prog="orchestrator", description=__doc__)
     p.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     sub = p.add_subparsers(dest="command", required=True)
 
@@ -6931,8 +6936,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     lnp = sub.add_parser(
         "launch",
-        help="open the default lead session (also what bare `teamctl` does "
-             "on a terminal): the default chat provider, in the teamctl "
+        help="open the default lead session (also what bare `orchestrator` does "
+             "on a terminal): the default chat provider, in the orchestrator "
              "tmux session, with lead mode on")
     lnp.add_argument("--dry-run", action="store_true",
                      help="print the launch plan without starting anything")
@@ -6941,7 +6946,7 @@ def build_parser() -> argparse.ArgumentParser:
     stp = sub.add_parser(
         "settings",
         help="interactive settings cockpit (dark-room curses UI over the "
-             "same config; degrades to current values + `teamctl config` "
+             "same config; degrades to current values + `orchestrator config` "
              "one-liners without a TTY)")
     stp.set_defaults(func=cmd_settings)
 
@@ -7064,7 +7069,7 @@ def build_parser() -> argparse.ArgumentParser:
                                  "after shutdown/reboot too)")
     ld.add_argument("--into", default="",
                     help="assert the target branch (must already be "
-                         "checked out — teamctl never switches branches)")
+                         "checked out — orchestrator never switches branches)")
     ld.add_argument("--checkpoint-only", action="store_true",
                     dest="checkpoint_only",
                     help="commit uncommitted work on the teammate's "
@@ -7081,7 +7086,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     wp = sub.add_parser(
         "worktree",
-        help="list or prune teamctl-created worktrees (the audit/recovery "
+        help="list or prune orchestrator-created worktrees (the audit/recovery "
              "surface — never removes anything with un-landed work)")
     wp.add_argument("action", choices=["list", "prune"])
     wp.add_argument("--json", action="store_true",
@@ -7114,7 +7119,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     ud = sub.add_parser(
         "update",
-        help="update teamctl from its recorded install source "
+        help="update orchestrator from its recorded install source "
              "(--check: just compare versions)")
     ud.add_argument("--check", action="store_true",
                     help="print installed vs latest and exit; change nothing")
@@ -7135,7 +7140,7 @@ def build_parser() -> argparse.ArgumentParser:
     mo = sub.add_parser("models",
                         help="best-effort model discovery per provider (ids "
                              "always pass through verbatim — new models need "
-                             "no teamctl update)")
+                             "no orchestrator update)")
     mo.add_argument("provider", nargs="?", default="",
                     help="any routable provider (default: all)")
     mo.set_defaults(func=cmd_models)
@@ -7143,13 +7148,13 @@ def build_parser() -> argparse.ArgumentParser:
     slp = sub.add_parser(
         "statusline",
         help="Claude Code statusLine command: reads session JSON on stdin, "
-             "prints 'model · effort · ctx N%%' (wired by `teamctl init`)")
+             "prints 'model · effort · ctx N%%' (wired by `orchestrator init`)")
     slp.set_defaults(func=lambda _a: cmd_statusline())
 
     unp = sub.add_parser(
         "uninstall",
-        help="remove teamctl's binary, tmux block, statusLine wiring and "
-             "metadata (config/state kept; lead mode via `teamctl lead off`)")
+        help="remove orchestrator's binary, tmux block, statusLine wiring and "
+             "metadata (config/state kept; lead mode via `orchestrator lead off`)")
     unp.add_argument("--yes", action="store_true",
                      help="do not ask for confirmation")
     unp.set_defaults(func=cmd_uninstall)
@@ -7164,9 +7169,9 @@ def main(argv: list[str] | None = None) -> int:
     # `--help` documents it)
     if argv[:1] == ["statusline"]:
         return cmd_statusline()
-    # bare `teamctl` on a real terminal is the front door: open the default
+    # bare `orchestrator` on a real terminal is the front door: open the default
     # lead session. Piped/CI (no tty) keeps the usage text unchanged, so
-    # scripts and `teamctl | cat` behave exactly as before.
+    # scripts and `orchestrator | cat` behave exactly as before.
     if not argv:
         try:
             interactive = sys.stdin.isatty() and sys.stdout.isatty()
@@ -7178,7 +7183,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return args.func(args)
     except TeamctlError as exc:
-        print(f"teamctl: {exc}", file=sys.stderr)
+        print(f"orchestrator: {exc}", file=sys.stderr)
         return 3
 
 

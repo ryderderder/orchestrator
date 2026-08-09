@@ -22,7 +22,7 @@ from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-TEAMCTL = HERE.parent / "teamctl"
+TEAMCTL = HERE.parent / "orchestrator"
 
 loader = SourceFileLoader("teamctl_registry", str(TEAMCTL))
 spec = importlib.util.spec_from_loader("teamctl_registry", loader)
@@ -79,7 +79,7 @@ class _SandboxHome(unittest.TestCase):
 
 
 class GeminiAdapterGoldens(unittest.TestCase):
-    """The exact argv teamctl emits for gemini — pinned like the other
+    """The exact argv orchestrator emits for gemini — pinned like the other
     providers' goldens in test_adapter_goldens."""
 
     def test_headless_argv(self):
@@ -92,7 +92,7 @@ class GeminiAdapterGoldens(unittest.TestCase):
              "-m", "gemini-2.5-pro"])
 
     def test_resume_argv_is_exact_uuid(self):
-        # --resume takes "latest"/index too — teamctl must ONLY ever emit
+        # --resume takes "latest"/index too — orchestrator must ONLY ever emit
         # the captured uuid (exact-session rule), with the prompt on -p
         # (the only prompt channel that works with --resume, issue #14180)
         a = tc.resume_argv("gemini", TASK, "", "", SID)
@@ -527,7 +527,7 @@ class TextOnlyProviderShapeTests(_SandboxHome):
 
     def test_env_auth_is_positive_only_for_customs(self):
         self.write_config(TEXT_CLI_BLOCK)
-        # unset env: the CLI may hold its own login (keyring) — teamctl
+        # unset env: the CLI may hold its own login (keyring) — orchestrator
         # says 'unprobed', keeps it routable (D9), never claims signed-out
         state, note = tc.provider_auth_state("textcli")
         self.assertEqual(state, "unprobed")

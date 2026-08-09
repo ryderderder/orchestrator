@@ -46,11 +46,11 @@ lie about what's on screen). Total target **~27s**.
 |---|---|---|---|
 | 0 | 0–3s | caption: `# fresh machine → working AI team, one line` | the premise |
 | 1 | 3–6s | type the curl one-liner, Enter | the entire ask |
-| 2 | 6–9s | (installer runs) | `installed ~/.local/bin/teamctl (downloaded)` ×2 — visible receipts |
+| 2 | 6–9s | (installer runs) | `installed ~/.local/bin/orchestrator (downloaded)` ×2 — visible receipts |
 | 3 | 9–13s | (installer continues) | `providers:` block — the state lattice in the wild: e.g. `claude ready · codex ready · grok locked out` plus official install hints for anything missing. Honest, informative, no cherry-picking |
-| 4 | 13–15s | (installer continues) | `entering tmux (session 'teamctl') and running the express setup…` — **the installer self-captions the swap**; hold a beat so it can be read |
-| 5 | 15–22s | (tmux swap → express frame) | **the reveal: the twelve-line dark room** — wordmark, provider states, `defaults locked`, `wrote …config.toml`, `customize → teamctl init --custom`. Longest hold in the GIF; this is the centerpiece |
-| 6 | 22–26s | type `teamctl list` at the landed prompt | `no active teammates` — **proof of life**: we really are in a working, configured session |
+| 4 | 13–15s | (installer continues) | `entering tmux (session 'orchestrator') and running the express setup…` — **the installer self-captions the swap**; hold a beat so it can be read |
+| 5 | 15–22s | (tmux swap → express frame) | **the reveal: the twelve-line dark room** — wordmark, provider states, `defaults locked`, `wrote …config.toml`, `customize → orchestrator init --custom`. Longest hold in the GIF; this is the centerpiece |
+| 6 | 22–26s | type `orchestrator list` at the landed prompt | `no active teammates` — **proof of life**: we really are in a working, configured session |
 | 7 | 26–29s | caption: `# you're in. spawn your first teammate.` | the handoff to the viewer |
 
 Every beat legible without audio; stage-matched sleeps replace the single
@@ -89,7 +89,7 @@ cd docs/recordings
 ./setup-install.sh                    # fresh /tmp/demo every take
 vhs install-v2.tape                   # writes ./install-v2.gif
 # review: ≤30s, no type-ahead seams, express frame fully rendered and held,
-# `teamctl list` answered, file size well under 4MB
+# `orchestrator list` answered, file size well under 4MB
 mv install-v2.gif ../assets/install.gif
 ```
 

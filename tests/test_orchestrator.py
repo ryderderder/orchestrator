@@ -1,4 +1,4 @@
-"""Tests for the teamctl agent-teammate control CLI.
+"""Tests for the orchestrator agent-teammate control CLI.
 
 Pure logic (state, reconcile, dry-run, duplicate guard, provider registry,
 routing, the init wizard) runs anywhere. Live spawn/list/shutdown against
@@ -20,11 +20,11 @@ from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-TEAMCTL = HERE.parent / "teamctl"
+TEAMCTL = HERE.parent / "orchestrator"
 
-# teamctl has no .py extension, so load it via an explicit source loader.
-loader = SourceFileLoader("teamctl", str(TEAMCTL))
-spec = importlib.util.spec_from_loader("teamctl", loader)
+# orchestrator has no .py extension, so load it via an explicit source loader.
+loader = SourceFileLoader("orchestrator", str(TEAMCTL))
+spec = importlib.util.spec_from_loader("orchestrator", loader)
 tc = importlib.util.module_from_spec(spec)
 loader.exec_module(tc)
 
@@ -810,7 +810,7 @@ class ProbeRunTests(unittest.TestCase):
                          "reset_notes": []}}))
         rc, out, _ = self._usage()
         self.assertEqual(rc, 0)
-        self.assertIn("stale, consider `teamctl usage --probe`", out)
+        self.assertIn("stale, consider `orchestrator usage --probe`", out)
 
 
 @unittest.skipUnless(os.environ.get("TMUX"), "requires a live tmux session")
@@ -1212,7 +1212,7 @@ class HeadroomRouteTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn("route: selected codex", out)      # codex unknown -> 0%
         self.assertIn("grok 90% (stale probe)", out)
-        self.assertIn("teamctl usage --probe", out)
+        self.assertIn("orchestrator usage --probe", out)
 
 
 class _LatticeHome(_AuthSandbox, unittest.TestCase):
@@ -1405,7 +1405,7 @@ class ProviderStateTests(_LatticeHome):
 
 
 class LatticeRenderTests(_LatticeHome):
-    """`teamctl providers` and `teamctl usage` speak the lattice."""
+    """`orchestrator providers` and `orchestrator usage` speak the lattice."""
 
     def test_providers_full_lattice_rows(self):
         self.installed |= {"claude", "codex"}
@@ -1468,7 +1468,7 @@ class LatticeRenderTests(_LatticeHome):
         rc, out, _ = self._run("usage")
         self.assertEqual(rc, 0)
         self.assertIn("quiet — signed in, no usage data yet", out)
-        self.assertIn("teamctl usage --probe grok", out)
+        self.assertIn("orchestrator usage --probe grok", out)
 
     def test_usage_locked_out_provider_gets_login_hint(self):
         self.installed.add("codex")
@@ -1478,7 +1478,7 @@ class LatticeRenderTests(_LatticeHome):
 
 
 class UpdateMachineryTests(_LatticeHome):
-    """`teamctl update`: version ordering, install metadata, --check and
+    """`orchestrator update`: version ordering, install metadata, --check and
     apply against a mocked source — no network, no real binaries."""
 
     def setUp(self):
@@ -1501,13 +1501,13 @@ class UpdateMachineryTests(_LatticeHome):
     def _seed_bin(self, version="0.4.0"):
         bin_dir = self.home / "bin"
         bin_dir.mkdir(exist_ok=True)
-        (bin_dir / "teamctl").write_text(
+        (bin_dir / "orchestrator").write_text(
             f'#!/usr/bin/env python3\nVERSION = "{version}"\n')
         return bin_dir
 
     def _mock_fetch(self, teamctl_text):
         # one artifact since the v0.4.0 statusline fold
-        files = {"teamctl": teamctl_text}
+        files = {"orchestrator": teamctl_text}
         self._orig_fetch = tc._fetch_from_source
         tc._fetch_from_source = lambda meta, names: (
             {n: files[n] for n in names}, "mock", [])
@@ -1555,10 +1555,10 @@ class UpdateMachineryTests(_LatticeHome):
         self._mock_fetch(new_teamctl)
         rc, out, _ = self._run("update")
         self.assertEqual(rc, 0)
-        self.assertIn("updated teamctl 0.4.0", out)
+        self.assertIn("updated orchestrator 0.4.0", out)
         self.assertIn("0.5.0", out)
-        self.assertEqual((bin_dir / "teamctl").read_text(), new_teamctl)
-        self.assertTrue(os.access(bin_dir / "teamctl", os.X_OK))
+        self.assertEqual((bin_dir / "orchestrator").read_text(), new_teamctl)
+        self.assertTrue(os.access(bin_dir / "orchestrator", os.X_OK))
         # user config byte-for-byte untouched
         self.assertEqual((cfg / "config.toml").read_text(),
                          '[output]\nverbosity = "terse"\n')
@@ -1569,23 +1569,23 @@ class UpdateMachineryTests(_LatticeHome):
     def test_apply_refuses_a_broken_download(self):
         self._write_meta()
         bin_dir = self._seed_bin("0.4.0")
-        before = (bin_dir / "teamctl").read_text()
+        before = (bin_dir / "orchestrator").read_text()
         self._mock_fetch('VERSION = "9.9.9"\ndef broken(\n')
         rc, _, err = self._run("update")
         self.assertEqual(rc, 1)
         self.assertIn("does not compile", err)
         self.assertNotIn("Traceback", err)
-        self.assertEqual((bin_dir / "teamctl").read_text(), before)
+        self.assertEqual((bin_dir / "orchestrator").read_text(), before)
 
     def test_apply_when_already_current_is_a_noop(self):
         self._write_meta()
         bin_dir = self._seed_bin("0.5.0")
-        before = (bin_dir / "teamctl").read_text()
+        before = (bin_dir / "orchestrator").read_text()
         self._mock_fetch('VERSION = "0.5.0"\n')
         rc, out, _ = self._run("update")
         self.assertEqual(rc, 0)
         self.assertIn("already up to date", out)
-        self.assertEqual((bin_dir / "teamctl").read_text(), before)
+        self.assertEqual((bin_dir / "orchestrator").read_text(), before)
 
     def test_unreachable_source_lists_reasons_no_traceback(self):
         self._write_meta()
@@ -1625,13 +1625,13 @@ class UpdateMachineryTests(_LatticeHome):
         tc._fetch_via_curl = probe("curl")
         tc._fetch_via_local = probe("local")
         try:
-            tc._fetch_from_source({"source": "curl"}, ["teamctl"])
+            tc._fetch_from_source({"source": "curl"}, ["orchestrator"])
             self.assertEqual(calls, ["curl", "gh"])
             calls.clear()
-            tc._fetch_from_source({"source": "git-clone"}, ["teamctl"])
+            tc._fetch_from_source({"source": "git-clone"}, ["orchestrator"])
             self.assertEqual(calls, ["git", "gh", "curl"])
             calls.clear()
-            tc._fetch_from_source({"source": "local-copy"}, ["teamctl"])
+            tc._fetch_from_source({"source": "local-copy"}, ["orchestrator"])
             self.assertEqual(calls, ["local", "git", "gh", "curl"])
         finally:
             (tc._fetch_via_git, tc._fetch_via_gh, tc._fetch_via_curl,
@@ -1654,7 +1654,7 @@ class UpdatePromptTests(_LatticeHome):
     def test_notice_when_cache_knows_newer(self):
         self._cache("99.0.0")
         self.assertEqual(tc._update_notice(),
-                         "teamctl 99.0.0 available — teamctl update")
+                         "orchestrator 99.0.0 available — orchestrator update")
 
     def test_no_notice_without_cache_or_when_current(self):
         self.assertIsNone(tc._update_notice())
@@ -1671,14 +1671,14 @@ class UpdatePromptTests(_LatticeHome):
         for cmd in ("providers", "usage"):
             rc, out, _ = self._run(cmd)
             self.assertEqual(rc, 0)
-            self.assertIn("teamctl 99.0.0 available — teamctl update", out,
+            self.assertIn("orchestrator 99.0.0 available — orchestrator update", out,
                           cmd)
 
     def test_express_frame_shows_the_notice(self):
         self._cache("99.0.0")
         rc, out, _ = self._run("init")
         self.assertEqual(rc, 0)
-        self.assertIn("teamctl 99.0.0 available — teamctl update", out)
+        self.assertIn("orchestrator 99.0.0 available — orchestrator update", out)
 
     def test_auto_mode_applies_at_session_start(self):
         self._config('[update]\nmode = "auto"\n')
@@ -1687,19 +1687,19 @@ class UpdatePromptTests(_LatticeHome):
             {"source": "curl", "bin_dir": str(self.home / "bin")}))
         bin_dir = self.home / "bin"
         bin_dir.mkdir()
-        (bin_dir / "teamctl").write_text('VERSION = "0.4.0"\n')
+        (bin_dir / "orchestrator").write_text('VERSION = "0.4.0"\n')
         new = '#!/usr/bin/env python3\nVERSION = "9.9.9"\n'
         orig = tc._fetch_from_source
         tc._fetch_from_source = lambda meta, names: (
-            {n: (new if n == "teamctl" else "# sl\n") for n in names},
+            {n: (new if n == "orchestrator" else "# sl\n") for n in names},
             "mock", [])
         try:
             rc, out, _ = self._run("init")
         finally:
             tc._fetch_from_source = orig
         self.assertEqual(rc, 0)
-        self.assertIn("auto-updated teamctl", out)
-        self.assertEqual((bin_dir / "teamctl").read_text(), new)
+        self.assertIn("auto-updated orchestrator", out)
+        self.assertEqual((bin_dir / "orchestrator").read_text(), new)
 
     def test_init_rerun_preserves_update_settings(self):
         # the wizard never asks about updates, so re-running it must not
@@ -1748,7 +1748,7 @@ class UpdatePromptTests(_LatticeHome):
 
 
 class LaunchTests(_LatticeHome):
-    """Bare `teamctl` front door: default-chat resolution, honest failures,
+    """Bare `orchestrator` front door: default-chat resolution, honest failures,
     and the in-tmux vs outside-tmux launch plan — all headless (the exec is
     driven by --dry-run / _launch_plan, never actually run)."""
 
@@ -1812,7 +1812,7 @@ class LaunchTests(_LatticeHome):
         self.assertEqual(plan["mode"], "new-session")
         self.assertEqual(plan["argv"][:4],
                          ["tmux", "new-session", "-A", "-s"])
-        self.assertIn("teamctl", plan["argv"])
+        self.assertIn("orchestrator", plan["argv"])
         self.assertIn("gpt-5.6", plan["launch"])
 
     def test_launch_plan_inside_tmux_execs_in_pane(self):
@@ -1844,7 +1844,7 @@ class LaunchTests(_LatticeHome):
 
 
 class InitTests(_AuthSandbox, unittest.TestCase):
-    """`teamctl init` (express) and `init --custom` (rich wizard, exercised
+    """`orchestrator init` (express) and `init --custom` (rich wizard, exercised
     through its scripted line-prompt fallback: redirected stdio is not a
     tty, so the curses path degrades exactly as documented), run entirely
     against a throwaway HOME."""
@@ -1919,7 +1919,7 @@ class InitTests(_AuthSandbox, unittest.TestCase):
     def test_installer_first_run_enables_lead_and_shows_orientation(self):
         # A2: the curl|bash first run (TEAMCTL_FIRST_RUN=1) actually ENABLES
         # lead mode (the headline feature, no longer dark) and the frame
-        # tells the user to type `teamctl` to talk to their lead, shows a
+        # tells the user to type `orchestrator` to talk to their lead, shows a
         # real spawn example, and — A3 — re-prints a DURABLE PATH note (the
         # bare installer warning is wiped by the tmux takeover).
         os.environ["TEAMCTL_FIRST_RUN"] = "1"
@@ -1932,7 +1932,7 @@ class InitTests(_AuthSandbox, unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn("you're in tmux", out)
         self.assertIn("talk to your lead", out)
-        self.assertIn("teamctl spawn reviewer --provider claude", out)
+        self.assertIn("orchestrator spawn reviewer --provider claude", out)
         self.assertIn("lead mode on", out)
         self.assertIn("/home/u/.local/bin is not on your PATH", out)
         # lead mode was really installed, not just advertised
@@ -1993,7 +1993,7 @@ class InitTests(_AuthSandbox, unittest.TestCase):
         self.assertNotIn("locked out", out)             # absent != signed out
         self.assertIn("defaults locked", out)
         self.assertIn("customize", out)
-        self.assertIn("teamctl init --custom", out)
+        self.assertIn("orchestrator init --custom", out)
         # spec §7: final output 12–18 lines (+1 per provider beyond the
         # original three — the frame gained a gemini row in v0.5.0)
         lines = out.rstrip("\n").split("\n")
@@ -2068,7 +2068,7 @@ class InitTests(_AuthSandbox, unittest.TestCase):
         rc, _ = self._run_init(["sonnet", "", "", "", "y"], "--custom")
         self.assertEqual(rc, 0)
         self.assertEqual(self._config()["providers"]["claude"]["model"], "sonnet")
-        bak = self.home / ".config" / "agent-team" / "config.toml.bak-teamctl"
+        bak = self.home / ".config" / "agent-team" / "config.toml.bak-orchestrator"
         self.assertTrue(bak.exists())
         self.assertIn('model = "opus"', bak.read_text())
 
@@ -2077,7 +2077,7 @@ class InitTests(_AuthSandbox, unittest.TestCase):
         self.assertEqual(rc, 0)
         rc, _ = self._run_init(None)
         self.assertEqual(rc, 0)
-        bak = self.home / ".config" / "agent-team" / "config.toml.bak-teamctl"
+        bak = self.home / ".config" / "agent-team" / "config.toml.bak-orchestrator"
         self.assertTrue(bak.exists())
         self.assertIn('model = "opus"', bak.read_text())
 
@@ -2110,7 +2110,7 @@ class InitTests(_AuthSandbox, unittest.TestCase):
         self.assertEqual(text.count(tc.TMUX_MARKER_END), 1)
         self.assertIn("set -g mouse on", text)          # original preserved
         self.assertIn("pane-border-format", text)
-        self.assertTrue((self.home / ".tmux.conf.bak-teamctl").exists())
+        self.assertTrue((self.home / ".tmux.conf.bak-orchestrator").exists())
         # second accept must not duplicate the block
         rc, out = self._run_init_extras(
             ["", "", "", "", "y", "y", "n", "n"], "--custom")
@@ -2119,7 +2119,7 @@ class InitTests(_AuthSandbox, unittest.TestCase):
         self.assertIn("skipping", out)
 
     def test_statusline_settings_added_minimally_and_skipped_if_present(self):
-        # v0.4.0: the statusLine now runs `teamctl statusline` — there is
+        # v0.4.0: the statusLine now runs `orchestrator statusline` — there is
         # no separate script to install, only the settings.json wiring
         settings = self.home / ".claude" / "settings.json"
         settings.parent.mkdir(parents=True)
@@ -2130,15 +2130,15 @@ class InitTests(_AuthSandbox, unittest.TestCase):
         data = json.loads(settings.read_text())
         self.assertEqual(data["model"], "opus")          # existing keys untouched
         self.assertEqual(data["statusLine"]["type"], "command")
-        self.assertIn("teamctl statusline", data["statusLine"]["command"])
-        self.assertTrue(Path(str(settings) + ".bak-teamctl").exists())
+        self.assertIn("orchestrator statusline", data["statusLine"]["command"])
+        self.assertTrue(Path(str(settings) + ".bak-orchestrator").exists())
         # second run: our own wiring is recognized and left alone
         before = settings.read_text()
         rc, out = self._run_init_extras(
             ["", "", "", "", "y", "n", "y", "n"], "--custom")
         self.assertEqual(rc, 0)
         self.assertEqual(settings.read_text(), before)
-        self.assertIn("already runs `teamctl statusline`", out)
+        self.assertIn("already runs `orchestrator statusline`", out)
 
     def test_statusline_creates_settings_when_absent(self):
         rc, _ = self._run_init_extras(
@@ -2147,7 +2147,7 @@ class InitTests(_AuthSandbox, unittest.TestCase):
         settings = self.home / ".claude" / "settings.json"
         data = json.loads(settings.read_text())
         self.assertEqual(data["statusLine"]["command"],
-                         "~/.local/bin/teamctl statusline")
+                         "~/.local/bin/orchestrator statusline")
 
     def test_update_migrates_legacy_statusline_wiring_and_script(self):
         # a pre-v0.4.0 install: separate script + old settings.json command
@@ -2160,10 +2160,10 @@ class InitTests(_AuthSandbox, unittest.TestCase):
         legacy.parent.mkdir(parents=True)
         legacy.write_text("# old script\n")
         notes = tc._migrate_legacy_statusline(legacy.parent)
-        self.assertTrue(any("teamctl statusline" in n for n in notes))
+        self.assertTrue(any("orchestrator statusline" in n for n in notes))
         data = json.loads(settings.read_text())
         self.assertEqual(data["statusLine"]["command"],
-                         "~/.local/bin/teamctl statusline")
+                         "~/.local/bin/orchestrator statusline")
         self.assertFalse(legacy.exists())               # orphan removed
         # idempotent: a second pass finds nothing to migrate
         self.assertEqual(tc._migrate_legacy_statusline(legacy.parent), [])
@@ -2291,7 +2291,7 @@ class ResultWaitLivenessTests(unittest.TestCase):
 
 @unittest.skipUnless(os.environ.get("TMUX"), "requires a live tmux session")
 class LiveTmuxTests(unittest.TestCase):
-    """Every live test runs in a dedicated throwaway tmux WINDOW: teamctl
+    """Every live test runs in a dedicated throwaway tmux WINDOW: orchestrator
     treats the window's own first pane as the lead (via TMUX_PANE). This
     keeps test panes out of the user's real window and gives them a
     predictably roomy layout — in a crowded real window, test panes came up
@@ -2310,14 +2310,14 @@ class LiveTmuxTests(unittest.TestCase):
         self.tmp = Path(self.statedir.name) / "state.json"
         os.environ["TEAMCTL_STATE"] = str(self.tmp)
         # worktree isolation is default-ON in v0.5.0, but these tests
-        # exercise the tmux mechanics from the teamctl checkout itself —
+        # exercise the tmux mechanics from the orchestrator checkout itself —
         # branching the REAL repo per test role would collide across
         # concurrent suite runs (the same class of bug the per-test temp
         # state fixed). Worktree behavior has its own suite over scratch
         # repos: tests/test_worktree.py.
         self._wt_settings = tc.worktree_settings
         tc.worktree_settings = lambda: {"enabled": False, "dir": "",
-                                        "branch_prefix": "teamctl/",
+                                        "branch_prefix": "orchestrator/",
                                         "cleanup": "auto"}
         out = tc.tmux("new-window", "-d", "-n", f"teamctl-tests-{os.getpid()}",
                       "-P", "-F", "#{window_id} #{pane_id}").stdout.split()
@@ -2416,7 +2416,7 @@ class LiveTmuxTests(unittest.TestCase):
         original = tc.load_config
         tc.load_config = lambda: {"layout": {"lead_width": 40}}
         try:
-            # a foreign (non-teamctl) pane already occupies the right side
+            # a foreign (non-orchestrator) pane already occupies the right side
             tc.tmux("split-window", "-h", "-d", "-P", "-F", "#{pane_id}",
                     "-t", self.lead_pane)
             # the lead is never a split candidate; the foreign pane is
@@ -2461,7 +2461,7 @@ class LiveTmuxTests(unittest.TestCase):
         # A just-SIGKILLed process can linger as an unreaped zombie for a
         # while — `os.kill(pid, 0)` (and so `_pid_alive`) still succeeds
         # until it is reaped, and a degraded CI runner was observed taking
-        # >5s to reap (teamctl itself had already verified the kill).
+        # >5s to reap (orchestrator itself had already verified the kill).
         # Poll generously instead: a genuine orphan (the regression this
         # guards) never dies within the window, so this still fails
         # loudly on a real leak — only the failure path waits long.
@@ -2546,7 +2546,7 @@ class LiveTmuxTests(unittest.TestCase):
                           "finished pane self-closed despite keep_finished")
             cap = tc.tmux("capture-pane", "-p", "-t", pane).stdout
             self.assertIn("DONE rc=0", cap)
-            self.assertIn("teamctl shutdown d_mate", cap)
+            self.assertIn("orchestrator shutdown d_mate", cap)
             # result reads fine while the pane sits there, visibly finished
             self.assertEqual(tc.main(["result", "d_mate"]), 0)
             # shutdown ends the blocking wrapper, closes the pane, clears all
@@ -2863,7 +2863,7 @@ class CursesLiveTests(unittest.TestCase):
         self.assertIn("model per provider", cap)
 
     def test_settings_cockpit_renders_cycles_and_saves(self):
-        # the `teamctl settings` cockpit rendered for real in tmux, driven
+        # the `orchestrator settings` cockpit rendered for real in tmux, driven
         # with send-keys — proves the dark-room curses view works and that
         # a cycled choice lands in config.toml
         cfg = self.home / ".config" / "agent-team" / "config.toml"
@@ -2902,7 +2902,7 @@ class CursesLiveTests(unittest.TestCase):
         cfg.write_text('[output]\nverbosity = "normal"\n\n'
                        '[lead]\ndelegation = "ask"\n')
         self._start("config --menu")
-        cap = self._wait_for("teamctl settings")
+        cap = self._wait_for("orchestrator settings")
         self.assertIn("output.verbosity", cap)
         self._tmux("send-keys", "Right")                # normal -> terse
         self._wait_for('"terse"')

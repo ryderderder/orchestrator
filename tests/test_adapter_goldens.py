@@ -7,7 +7,7 @@ registry refactor must reproduce these BYTE-IDENTICALLY: these tests are
 the proof that "refactor" meant refactor.
 
 New providers (gemini, custom) get their own goldens as they land, in the
-same table style, so the exact CLI surface teamctl emits is always pinned.
+same table style, so the exact CLI surface orchestrator emits is always pinned.
 
 Run with:  python3 -m unittest tests.test_adapter_goldens
 """
@@ -19,7 +19,7 @@ from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-TEAMCTL = HERE.parent / "teamctl"
+TEAMCTL = HERE.parent / "orchestrator"
 
 loader = SourceFileLoader("teamctl_goldens", str(TEAMCTL))
 spec = importlib.util.spec_from_loader("teamctl_goldens", loader)

@@ -1,4 +1,4 @@
-# teamctl demo — lead pane orchestrating teammates: usage → route reasoning →
+# orchestrator demo — lead pane orchestrating teammates: usage → route reasoning →
 # two interactive spawns + one headless dispatch (shell provider: real tmux
 # mechanics, zero tokens; neutral model labels) → result read-back → teardown.
 # Runs entirely inside an isolated environment (see setup-demo.sh).
@@ -18,7 +18,7 @@ Hide
 Type "source /tmp/teamhome/env.sh && clear"
 Enter
 Sleep 1s
-Type "tmux -S /tmp/teamhome/tmux.sock -f /tmp/teamhome/tmux.conf new-session -s teamctl -n lead"
+Type "tmux -S /tmp/teamhome/tmux.sock -f /tmp/teamhome/tmux.conf new-session -s orchestrator -n lead"
 Enter
 Sleep 2s
 Type "clear; tmux clear-history"
@@ -26,57 +26,57 @@ Enter
 Sleep 1s
 Show
 
-Type "teamctl usage"
+Type "orchestrator usage"
 Sleep 300ms
 Enter
 Sleep 3s
 
-Type "teamctl route reviewer --task 'Review the release diff for regressions.' --dry-run"
+Type "orchestrator route reviewer --task 'Review the release diff for regressions.' --dry-run"
 Sleep 300ms
 Enter
 Sleep 3.5s
 
-Type "teamctl spawn code-reviewer --provider shell --model model-a"
+Type "orchestrator spawn code-reviewer --provider shell --model model-a"
 Sleep 300ms
 Enter
 Sleep 2s
 
-Type "teamctl spawn researcher --provider shell --model model-b"
+Type "orchestrator spawn researcher --provider shell --model model-b"
 Sleep 300ms
 Enter
 Sleep 2s
 
-Type `teamctl dispatch analyst --provider shell --model model-c --task 'sleep 6; echo "{\"todos\": 4, \"hardest\": \"exact-session follow-ups\"}"'`
+Type `orchestrator dispatch analyst --provider shell --model model-c --task 'sleep 6; echo "{\"todos\": 4, \"hardest\": \"exact-session follow-ups\"}"'`
 Sleep 300ms
 Enter
 Sleep 1.5s
 
-Type "teamctl list"
+Type "orchestrator list"
 Sleep 300ms
 Enter
 Sleep 2.5s
 
-Type "teamctl result analyst --wait"
+Type "orchestrator result analyst --wait"
 Sleep 300ms
 Enter
 Sleep 4.5s
 
-Type "teamctl shutdown code-reviewer"
+Type "orchestrator shutdown code-reviewer"
 Sleep 300ms
 Enter
 Sleep 4s
 
-Type "teamctl shutdown researcher"
+Type "orchestrator shutdown researcher"
 Sleep 300ms
 Enter
 Sleep 4s
 
-Type "teamctl shutdown analyst"
+Type "orchestrator shutdown analyst"
 Sleep 300ms
 Enter
 Sleep 3s
 
-Type "teamctl list"
+Type "orchestrator list"
 Sleep 300ms
 Enter
 Sleep 4s

@@ -1,6 +1,6 @@
 """v0.5.0 worktree isolation + the land step.
 
-Every teammate gets its own branch in its own directory; `teamctl land`
+Every teammate gets its own branch in its own directory; `orchestrator land`
 closes the loop; shutdown can never strand work. All git interaction is
 exercised against SCRATCH repos created per test — never the real
 checkout the suite runs from.
@@ -21,7 +21,7 @@ from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-TEAMCTL = HERE.parent / "teamctl"
+TEAMCTL = HERE.parent / "orchestrator"
 
 loader = SourceFileLoader("teamctl_worktree", str(TEAMCTL))
 spec = importlib.util.spec_from_loader("teamctl_worktree", loader)
@@ -86,13 +86,13 @@ class AllocTests(_WorktreeSandbox):
     def test_alloc_creates_branch_path_and_registry(self):
         wt = self.alloc("builder")
         self.assertTrue(Path(wt["path"]).is_dir())
-        self.assertEqual(wt["branch"], "teamctl/builder")
+        self.assertEqual(wt["branch"], "orchestrator/builder")
         self.assertEqual(wt["repo"], str(self.repo.resolve()))
         head = _run_git(self.repo, "rev-parse", "HEAD").stdout.strip()
         self.assertEqual(wt["base_sha"], head)
         # branch really exists and points at HEAD
         tip = _run_git(self.repo, "rev-parse",
-                       "teamctl/builder").stdout.strip()
+                       "orchestrator/builder").stdout.strip()
         self.assertEqual(tip, head)
         # the path lives under the state dir, outside the repo
         self.assertTrue(str(wt["path"]).startswith(str(self.dir)))
@@ -103,14 +103,14 @@ class AllocTests(_WorktreeSandbox):
         self.assertEqual(reg[wt["path"]]["role"], "builder")
 
     def test_existing_branch_is_refused_never_suffixed(self):
-        _run_git(self.repo, "branch", "teamctl/builder")
+        _run_git(self.repo, "branch", "orchestrator/builder")
         with self.assertRaises(tc.TeamctlError) as cm:
             self.alloc("builder")
         self.assertIn("already exists", str(cm.exception))
-        self.assertIn("teamctl land builder", str(cm.exception))
+        self.assertIn("orchestrator land builder", str(cm.exception))
         # no surprise -2 branch was invented
         out = _run_git(self.repo, "branch", "--list",
-                       "teamctl/builder*").stdout
+                       "orchestrator/builder*").stdout
         self.assertNotIn("builder-2", out)
 
     def test_dirty_parent_gets_a_note_never_a_stash(self):
@@ -141,7 +141,7 @@ class AllocTests(_WorktreeSandbox):
         # config-off: off
         saved = tc.worktree_settings
         tc.worktree_settings = lambda: {"enabled": False, "dir": "",
-                                        "branch_prefix": "teamctl/",
+                                        "branch_prefix": "orchestrator/",
                                         "cleanup": "auto"}
         try:
             self.assertIsNone(tc._maybe_alloc_worktree("r", str(self.repo),
@@ -206,7 +206,7 @@ class ShutdownReconcileTests(_WorktreeSandbox):
         with contextlib.redirect_stdout(out):
             tc._shutdown_worktree("builder", wt)
         self.assertIn("kept worktree with un-landed work", out.getvalue())
-        self.assertIn("teamctl land builder", out.getvalue())
+        self.assertIn("orchestrator land builder", out.getvalue())
         self.assertTrue(Path(wt["path"]).exists())
         self.assertTrue((Path(wt["path"]) / "extra.txt").exists())
         self.assertIn(wt["path"], tc.load_worktree_registry())
@@ -215,7 +215,7 @@ class ShutdownReconcileTests(_WorktreeSandbox):
         wt = self.alloc()
         saved = tc.worktree_settings
         tc.worktree_settings = lambda: {"enabled": True, "dir": "",
-                                        "branch_prefix": "teamctl/",
+                                        "branch_prefix": "orchestrator/",
                                         "cleanup": "keep"}
         try:
             out = io.StringIO()
@@ -254,7 +254,7 @@ class LandTests(_WorktreeSandbox):
         self.assertEqual(show, "uncommitted work\n")
         # the checkpoint commit message is attributable
         log = _run_git(self.repo, "log", "--oneline", "-3").stdout
-        self.assertIn("teamctl checkpoint: builder", log)
+        self.assertIn("orchestrator checkpoint: builder", log)
 
     def test_declining_the_checkpoint_cancels_the_land(self):
         wt = self.alloc("builder")
@@ -278,7 +278,7 @@ class LandTests(_WorktreeSandbox):
         # committed on the teammate branch…
         log = _run_git(self.repo, "log", "--oneline",
                        wt["branch"]).stdout
-        self.assertIn("teamctl checkpoint", log)
+        self.assertIn("orchestrator checkpoint", log)
         # …but the default branch did not move
         res = subprocess.run(
             ["git", "-C", str(self.repo), "show",
@@ -343,7 +343,7 @@ class LandTests(_WorktreeSandbox):
         # a dry run changes nothing
         self.assertTrue(Path(wt["path"]).exists())
         log = _run_git(self.repo, "log", "--oneline").stdout
-        self.assertNotIn("teamctl land", log)
+        self.assertNotIn("orchestrator land", log)
 
     def test_land_refuses_live_teammate(self):
         wt = self.alloc("builder")
@@ -417,7 +417,7 @@ class WorktreeCommandTests(_WorktreeSandbox):
 
 class NeverForceTests(_WorktreeSandbox):
     """The git-safety invariant, audited: across alloc, shutdown-cleanup,
-    land, and prune, teamctl NEVER passes a force/destructive flag to
+    land, and prune, orchestrator NEVER passes a force/destructive flag to
     git."""
 
     FORBIDDEN = {"-D", "--force", "-f", "--hard", "reset", "clean"}

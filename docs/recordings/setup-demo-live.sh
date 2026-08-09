@@ -4,13 +4,13 @@
 # take: teammate state AND the seeded tinylog.py must be fresh (the builder
 # edits it for real).
 #
-#   ./setup-demo-live.sh [git-revision]     # pin teamctl to a pushed rev
+#   ./setup-demo-live.sh [git-revision]     # pin orchestrator to a pushed rev
 #
 # Isolation (same guarantees as setup-demo.sh, one honest difference):
 #   - HOME is /tmp/teamhome-live (scratch, rebuilt every run)
 #   - tmux runs on its own socket /tmp/teamhome-live/tmux.sock — NEVER the
 #     default server; the tape always passes -S
-#   - TEAMCTL_STATE + config are scratch; your real teamctl setup untouched
+#   - TEAMCTL_STATE + config are scratch; your real orchestrator setup untouched
 #   - DIFFERENT from the shell-provider harness: provider auth/session dirs
 #     are symlinked in and the CLIs WRITE THROUGH them (session logs, their
 #     own state) — exactly as any normal CLI run does. Real tokens are
@@ -39,12 +39,12 @@ mkdir -p "$DH/bin" "$DH/.local/state/agent-team" "$DH/.config/agent-team" "$DH/w
 
 REV="${1:-}"
 if [ -n "$REV" ]; then
-  git -C "$REPO" show "$REV:teamctl" > "$DH/bin/teamctl"
+  git -C "$REPO" show "$REV:orchestrator" > "$DH/bin/orchestrator"
 else
   echo "warning: recording from the working tree — pin a pushed revision for a shippable take" >&2
-  cp "$REPO/teamctl" "$DH/bin/teamctl"
+  cp "$REPO/orchestrator" "$DH/bin/orchestrator"
 fi
-chmod +x "$DH/bin/teamctl"
+chmod +x "$DH/bin/orchestrator"
 
 # provider auth + session dirs: symlinked, WRITE-THROUGH (see header).
 # ~/.claude (dir) is included alongside ~/.claude.json — interactive-auth
@@ -125,7 +125,7 @@ EOF
 
 # clean minimal prompt for lead and teammate panes; PATH re-pin is
 # load-bearing on macOS (path_helper reorders PATH in login shells and
-# /usr/bin/python3 has no tomllib -> teamctl silently ignores the config)
+# /usr/bin/python3 has no tomllib -> orchestrator silently ignores the config)
 {
   echo "export PATH=\"$DH/bin:/opt/homebrew/bin:\$PATH\""
   echo "PS1='\\[\\e[1;36m\\]\$\\[\\e[0m\\] '"
@@ -152,5 +152,5 @@ export SHELL=/bin/bash
 cd $DH/work
 EOF
 
-echo "live-demo env ready at $DH (teamctl: ${REV:-working tree})"
+echo "live-demo env ready at $DH (orchestrator: ${REV:-working tree})"
 echo "NEXT: run the per-provider preflight smoke tests before 'vhs demo-v2.tape'"

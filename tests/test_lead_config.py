@@ -1,4 +1,4 @@
-"""Tests for `teamctl lead` (manager identity tiers) and `teamctl config`.
+"""Tests for `orchestrator lead` (manager identity tiers) and `orchestrator config`.
 
 Everything runs against a throwaway HOME — the real ~/.claude, ~/.config and
 friends are never touched. No tmux needed.
@@ -18,10 +18,10 @@ from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-TEAMCTL = HERE.parent / "teamctl"
+TEAMCTL = HERE.parent / "orchestrator"
 
-loader = SourceFileLoader("teamctl", str(TEAMCTL))
-spec = importlib.util.spec_from_loader("teamctl", loader)
+loader = SourceFileLoader("orchestrator", str(TEAMCTL))
+spec = importlib.util.spec_from_loader("orchestrator", loader)
 tc = importlib.util.module_from_spec(spec)
 loader.exec_module(tc)
 
@@ -84,7 +84,7 @@ class ThrowawayHomeTestCase(unittest.TestCase):
         self.tmpdir.cleanup()
 
     def run_cli(self, argv, answers=()):
-        """Run teamctl with scripted answers; running out of answers means
+        """Run orchestrator with scripted answers; running out of answers means
         'accept the default' (same as EOF on a real terminal)."""
         it = iter(answers)
         tc._input = lambda prompt: next(it)
@@ -117,11 +117,11 @@ class LeadOnTests(ThrowawayHomeTestCase):
         text = self.skill_md.read_text()
         self.assertTrue(text.startswith("---\nname: teamctl-lead\n"))
         self.assertIn("description:", text.splitlines()[2])
-        self.assertIn("teamctl shutdown", text)
+        self.assertIn("orchestrator shutdown", text)
         cm = self.claude_md.read_text()
         self.assertEqual(cm.count(tc.LEAD_MD_BEGIN), 1)
         self.assertEqual(cm.count(tc.LEAD_MD_END), 1)
-        self.assertIn("teamctl usage", cm)
+        self.assertIn("orchestrator usage", cm)
         # hook declined: settings.json must not even be created
         self.assertFalse(self.settings.exists())
         self.assertIn("Summary of changes", out)
@@ -142,7 +142,7 @@ class LeadOnTests(ThrowawayHomeTestCase):
         cm = self.claude_md.read_text()
         self.assertIn("# my own rules", cm)
         self.assertIn(tc.LEAD_MD_BEGIN, cm)
-        bak = Path(str(self.claude_md) + ".bak-teamctl")
+        bak = Path(str(self.claude_md) + ".bak-orchestrator")
         self.assertTrue(bak.exists())
         self.assertNotIn(tc.LEAD_MD_BEGIN, bak.read_text())
 
@@ -155,12 +155,12 @@ class LeadOnTests(ThrowawayHomeTestCase):
         text = self.claude_md.read_text()
         self.assertEqual(text.count(tc.LEAD_MD_BEGIN), 1)
         self.assertNotIn("OLD RULES", text)
-        self.assertIn("teamctl usage", text)             # fresh block content
+        self.assertIn("orchestrator usage", text)             # fresh block content
         # refreshed IN PLACE: still between the surrounding content
         self.assertLess(text.index("# before"), text.index(tc.LEAD_MD_BEGIN))
         self.assertLess(text.index(tc.LEAD_MD_END), text.index("# after"))
         self.assertIn("updated the teamctl-lead block", out)
-        bak = Path(str(self.claude_md) + ".bak-teamctl")
+        bak = Path(str(self.claude_md) + ".bak-orchestrator")
         self.assertIn("OLD RULES", bak.read_text())
         # an up-to-date block is left alone
         rc, out, _ = self.run_cli(["lead", "on"], answers=["n"])
@@ -174,7 +174,7 @@ class LeadOnTests(ThrowawayHomeTestCase):
         rc, out, _ = self.run_cli(["lead", "on"])
         self.assertEqual(rc, 0)
         self.assertEqual(self.skill_md.read_text(), tc.LEAD_SKILL_MD)
-        bak = self.skill_md.with_name("SKILL.md.bak-teamctl")
+        bak = self.skill_md.with_name("SKILL.md.bak-orchestrator")
         self.assertEqual(bak.read_text(), "stale contents")
         self.assertIn("updated", out)
 
@@ -190,7 +190,7 @@ class LeadOffTests(ThrowawayHomeTestCase):
         self.assertIn("# my own rules", cm)
         self.assertIn("always be kind", cm)
         self.assertNotIn(tc.LEAD_MD_BEGIN, cm)
-        self.assertNotIn("teamctl lead mode", cm)
+        self.assertNotIn("orchestrator lead mode", cm)
         self.assertFalse(self.skill_md.parent.exists())
         self.assertTrue(Path(str(self.claude_md) + ".bak-teamctl-off").exists())
         self.assertIn("removed", out)
@@ -226,7 +226,7 @@ class LeadOffTests(ThrowawayHomeTestCase):
 
 
 class UninstallTests(ThrowawayHomeTestCase):
-    """`teamctl uninstall` reverses install.sh + init, backups first,
+    """`orchestrator uninstall` reverses install.sh + init, backups first,
     leaving config/state and lead mode alone (all against a throwaway
     HOME; no real files touched)."""
 
@@ -239,10 +239,10 @@ class UninstallTests(ThrowawayHomeTestCase):
         os.environ.pop("TEAMCTL_STATE", None)
         super().tearDown()
 
-    def _seed_install(self, statusline_cmd="~/.local/bin/teamctl statusline"):
+    def _seed_install(self, statusline_cmd="~/.local/bin/orchestrator statusline"):
         bin_dir = self.home / ".local" / "bin"
         bin_dir.mkdir(parents=True)
-        (bin_dir / "teamctl").write_text("#!/usr/bin/env python3\n")
+        (bin_dir / "orchestrator").write_text("#!/usr/bin/env python3\n")
         state = self.home / ".local" / "state" / "agent-team"
         state.mkdir(parents=True, exist_ok=True)
         (state / "install-meta.json").write_text(json.dumps(
@@ -260,7 +260,7 @@ class UninstallTests(ThrowawayHomeTestCase):
         bin_dir, tmux, settings = self._seed_install()
         rc, out, _ = self.run_cli(["uninstall", "--yes"])
         self.assertEqual(rc, 0)
-        self.assertFalse((bin_dir / "teamctl").exists())
+        self.assertFalse((bin_dir / "orchestrator").exists())
         # tmux block gone, the user's own line preserved
         text = tmux.read_text()
         self.assertNotIn(tc.TMUX_MARKER_BEGIN, text)
@@ -274,7 +274,7 @@ class UninstallTests(ThrowawayHomeTestCase):
             (self.home / ".local" / "state" / "agent-team"
              / "install-meta.json").exists())
         self.assertIn("rm -rf ~/.config/agent-team", out)
-        self.assertIn("teamctl lead off", out)
+        self.assertIn("orchestrator lead off", out)
 
     def test_uninstall_removes_legacy_statusline_wiring_too(self):
         bin_dir, _tmux, settings = self._seed_install(
@@ -292,18 +292,18 @@ class UninstallTests(ThrowawayHomeTestCase):
         self.assertEqual(rc, 0)
         self.assertIn("statusLine",
                       json.loads(settings.read_text()))     # not ours: kept
-        self.assertIn("not teamctl's", out)
+        self.assertIn("not orchestrator's", out)
 
     def test_uninstall_declined_without_yes(self):
         bin_dir, _t, _s = self._seed_install()
         rc, out, _ = self.run_cli(["uninstall"], answers=["n"])
         self.assertEqual(rc, 0)
         self.assertIn("nothing removed", out)
-        self.assertTrue((bin_dir / "teamctl").exists())
+        self.assertTrue((bin_dir / "orchestrator").exists())
 
 
 class SettingsModelTests(ThrowawayHomeTestCase):
-    """The `teamctl settings` MODEL layer (catalog / cycle / plain degrade)
+    """The `orchestrator settings` MODEL layer (catalog / cycle / plain degrade)
     is pure and headless — the curses view is tested live elsewhere."""
 
     def _write_cfg(self, text):
@@ -353,9 +353,9 @@ class SettingsModelTests(ThrowawayHomeTestCase):
         self.assertEqual(rc, 0)
         self.assertIn("current settings", out)
         self.assertIn("update mode", out)
-        self.assertIn("teamctl config update.mode auto", out)
+        self.assertIn("orchestrator config update.mode auto", out)
         # bools render as lowercase true/false in the one-liner
-        self.assertIn("teamctl config update.check true", out)
+        self.assertIn("orchestrator config update.check true", out)
         # sections present
         self.assertIn("[default chat]", out)
         self.assertIn("[updates]", out)
@@ -364,11 +364,11 @@ class SettingsModelTests(ThrowawayHomeTestCase):
         rc, out, _ = self.run_cli(["settings"])
         self.assertEqual(rc, 0)
         self.assertIn("no config yet", out)
-        self.assertIn("teamctl config update.mode prompt", out)   # defaults
+        self.assertIn("orchestrator config update.mode prompt", out)   # defaults
 
 
 class DoctorTests(ThrowawayHomeTestCase):
-    """`teamctl doctor` checks + worst-status exit code, against a sandboxed
+    """`orchestrator doctor` checks + worst-status exit code, against a sandboxed
     HOME (state/config live under it) with tmux/version monkeypatched."""
 
     def setUp(self):
@@ -485,7 +485,7 @@ class LeadHookTests(ThrowawayHomeTestCase):
         self.assertEqual(ups[0], foreign)
         self.assertIn("teamctl-lead", ups[1]["hooks"][0]["command"])
         self.assertEqual(ups[1]["hooks"][0]["type"], "command")
-        self.assertTrue(Path(str(self.settings) + ".bak-teamctl").exists())
+        self.assertTrue(Path(str(self.settings) + ".bak-orchestrator").exists())
 
         # second run must not add a duplicate
         rc, out, _ = self.run_cli(["lead", "on", "--hook"])
@@ -736,7 +736,7 @@ class GrokAuthHeuristicTests(ThrowawayHomeTestCase):
         self.assertFalse(tc.provider_authed("grok"))
 
     def test_lead_on_created_dir_is_not_login(self):
-        # exactly what `teamctl lead on --cli grok` leaves behind
+        # exactly what `orchestrator lead on --cli grok` leaves behind
         (self.home / ".grok").mkdir()
         (self.home / ".grok" / "AGENTS.md").write_text(tc.LEAD_CLAUDE_BLOCK)
         self.assertFalse(tc.provider_authed("grok"))
@@ -864,7 +864,7 @@ class ConfigShowSetTests(ThrowawayHomeTestCase):
         rc, out, _ = self.run_cli(["config"])
         self.assertEqual(rc, 1)
         self.assertIn("no config", out)
-        self.assertIn("teamctl init", out)
+        self.assertIn("orchestrator init", out)
 
     def test_bare_config_pretty_prints_dotted_keys(self):
         self._seed()
@@ -881,7 +881,7 @@ class ConfigShowSetTests(ThrowawayHomeTestCase):
         self.assertEqual(data["providers"]["claude"]["model"], "sonnet")
         self.assertEqual(data["providers"]["claude"]["effort"], "high")
         self.assertEqual(data["output"]["verbosity"], "normal")
-        bak = self.cfg.with_name("config.toml.bak-teamctl")
+        bak = self.cfg.with_name("config.toml.bak-orchestrator")
         self.assertTrue(bak.exists())
         self.assertIn('model = "opus"', bak.read_text())
         self.assertIn("set providers.claude.model", out)
@@ -1020,9 +1020,9 @@ class DelegationPostureTests(ThrowawayHomeTestCase):
             self.assertIn("ONE", text.upper())               # once-per-session
             self.assertIn("never nag", text.lower())
         flat = " ".join(tc.LEAD_SKILL_MD.split())            # unwrap lines
-        self.assertIn("Want me to use teamctl agent teams", flat)
+        self.assertIn("Want me to use orchestrator agent teams", flat)
         self.assertIn("I can remember this", flat)
-        self.assertIn("want me to spin up a teamctl team", flat)
+        self.assertIn("want me to spin up a orchestrator team", flat)
 
     def test_lead_status_shows_posture(self):
         self.cfg.parent.mkdir(parents=True)
@@ -1054,7 +1054,7 @@ class ConfigMenuTests(ThrowawayHomeTestCase):
         self.assertEqual(data["providers"]["claude"]["model"], "sonnet")
         self.assertEqual(data["output"]["verbosity"], "normal")
         self.assertIn("wrote", out)
-        self.assertTrue(self.cfg.with_name("config.toml.bak-teamctl").exists())
+        self.assertTrue(self.cfg.with_name("config.toml.bak-orchestrator").exists())
 
     def test_menu_rejects_bad_number_and_saves_nothing(self):
         self._seed()

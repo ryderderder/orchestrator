@@ -1,4 +1,4 @@
-# teamctl
+# Orchestrator
 
 > Provider-agnostic CLI that turns a tmux window into an AI agent team — a
 > lead agent delegates to Claude Code / Codex / Grok / Gemini CLI teammates
@@ -18,7 +18,7 @@ reason). Teammate states: active / busy / needs-input / idle (interactive)
 and running / done / failed(N) / died (dispatch). Provider states: ready /
 quiet / locked out / not installed / unknown. `list`, `status`,
 `providers`, `usage`, `worktree list`, `land --dry-run`, and
-`resurrect --dry-run` accept `--json`. Core rule: teamctl refuses instead
+`resurrect --dry-run` accept `--json`. Core rule: Orchestrator refuses instead
 of guessing — exact session or refusal, keep-and-report instead of
 discarding work, unknown stated as unknown. It never reads or stores
 credentials — it drives the official vendor CLIs under the user's own
@@ -27,7 +27,7 @@ logins.
 ## Docs
 
 - [Agent operating guide](docs/AGENT_GUIDE.md): canonical machine-oriented reference — exact command syntax, exit codes, state vocabulary, handoff protocol, worktree/land lifecycle, deterministic recovery recipes, custom-provider schema, the lead-agent operating rules verbatim
-- [Install instructions for agents](INSTALL.md): the canonical fetch-and-follow install flow (verify with `teamctl doctor`)
+- [Install instructions for agents](INSTALL.md): the canonical fetch-and-follow install flow (verify with `orchestrator doctor`)
 - [Complete guide](docs/GUIDE.md): every feature in depth, full configuration reference, security posture, FAQ, honest limitations
 - [README](README.md): the short human-oriented overview + install
 - [Use-case recipes](docs/use-cases.md): worked workflows with exact commands and expected on-screen output

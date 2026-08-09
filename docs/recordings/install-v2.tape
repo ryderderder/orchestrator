@@ -1,4 +1,4 @@
-# teamctl install v2 — cold machine -> one line -> the twelve-line dark
+# orchestrator install v2 — cold machine -> one line -> the twelve-line dark
 # room -> proof of life. Beat design in install-storyboard.md.
 # PRECONDITIONS for the final take:
 #   - repo public (raw.githubusercontent.com reachable anonymously) —
@@ -32,7 +32,7 @@ Enter
 Sleep 2s
 
 # ---- beat 1: the entire ask --------------------------------------------------
-Type "curl -fsSL https://raw.githubusercontent.com/ryderderder/teamctl/main/install.sh | bash"
+Type "curl -fsSL https://raw.githubusercontent.com/ryderderder/orchestrator/main/install.sh | bash"
 Sleep 800ms
 Enter
 
@@ -44,7 +44,7 @@ Sleep 4s
 Sleep 4s
 
 # ---- beat 4: the installer self-captions the swap ----------------------------
-# "entering tmux (session 'teamctl') and running the express setup…"
+# "entering tmux (session 'orchestrator') and running the express setup…"
 Sleep 2s
 
 # ---- beat 5: THE REVEAL — the twelve-line dark room ---------------------------
@@ -54,7 +54,7 @@ Sleep 7s
 Screenshot install-v2-darkroom.png
 
 # ---- beat 6: proof of life in the landed session ------------------------------
-Type "teamctl list"
+Type "orchestrator list"
 Sleep 300ms
 Enter
 Sleep 2.5s
