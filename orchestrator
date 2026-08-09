@@ -71,7 +71,7 @@ try:
 except Exception:  # pragma: no cover - platforms without curses
     curses = None
 
-VERSION = "0.5.3"
+VERSION = "0.5.4"
 
 # --------------------------------------------------------------------------
 # the provider-spec registry — every provider, built-in OR user-defined via

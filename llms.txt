@@ -10,7 +10,7 @@
 > busy/needs-input/idle detection, verified teardown, and a roster that
 > survives reboots (`resurrect`). Single-file Python, stdlib only;
 > macOS/Linux (WSL runs as Linux); requires tmux and at least one
-> signed-in provider CLI. Current release: v0.5.3.
+> signed-in provider CLI. Current release: v0.5.4.
 
 Key facts: commands exit 0 (success), 1 (operational failure), 2
 (precondition error, e.g. not inside tmux), 3 (internal refusal with a
