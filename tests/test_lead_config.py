@@ -110,6 +110,41 @@ class ThrowawayHomeTestCase(unittest.TestCase):
         return self.home / ".config" / "agent-team" / "config.toml"
 
 
+class ConfigPathOverrideTests(ThrowawayHomeTestCase):
+    """TEAMCTL_CONFIG selects the config file, mirroring TEAMCTL_STATE —
+    so a runtime can carry its own config without redirecting HOME."""
+
+    def setUp(self):
+        super().setUp()
+        self.override = self.home / "runtime, with comma" / "team.toml"
+        os.environ["TEAMCTL_CONFIG"] = str(self.override)
+
+    def tearDown(self):
+        os.environ.pop("TEAMCTL_CONFIG", None)
+        super().tearDown()
+
+    def test_default_path_without_override(self):
+        os.environ.pop("TEAMCTL_CONFIG", None)
+        self.assertEqual(tc.config_path(), self.cfg)
+
+    def test_override_is_read_and_global_config_ignored(self):
+        self.cfg.parent.mkdir(parents=True)
+        self.cfg.write_text('[providers.codex]\nmodel = "from-global"\n')
+        self.override.parent.mkdir(parents=True)
+        self.override.write_text('[providers.codex]\nmodel = "from-env"\n')
+        self.assertEqual(tc.config_path(), self.override)
+        self.assertEqual(tc.provider_defaults("codex")[0], "from-env")
+
+    def test_init_writes_the_override_not_the_global_path(self):
+        path, backed_up = tc._write_wizard_config(
+            {"codex": {"model": "", "effort": ""}}, "normal", ["codex"],
+            "ask", [])
+        self.assertEqual(path, self.override)
+        self.assertFalse(backed_up)
+        self.assertTrue(self.override.exists())
+        self.assertFalse(self.cfg.exists())
+
+
 class LeadOnTests(ThrowawayHomeTestCase):
     def test_on_installs_skill_and_claude_md_block(self):
         rc, out, _ = self.run_cli(["lead", "on"], answers=["n"])  # decline hook

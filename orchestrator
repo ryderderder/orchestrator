@@ -703,6 +703,9 @@ def provider_authed(provider: str) -> bool:
 
 
 def config_path() -> Path:
+    override = os.environ.get("TEAMCTL_CONFIG")
+    if override:
+        return Path(override).expanduser()
     return Path.home() / ".config" / "agent-team" / "config.toml"
 
 
@@ -4412,7 +4415,7 @@ def _plain_init(args: argparse.Namespace) -> int:
                 route = picked
     print()
 
-    cfg_path = Path.home() / ".config" / "agent-team" / "config.toml"
+    cfg_path = config_path()
     if not _ask_yn(f"  write {_tilde(cfg_path)}? [Y/n] ", default=True):
         print("  nothing written.")
         return 0
@@ -4621,7 +4624,7 @@ def _write_wizard_config(providers_cfg: dict[str, dict[str, str]],
     """Back up + write config.toml; returns (path, backed_up). Shared by the
     express, line-prompt, and curses init paths so all three write the exact
     same schema."""
-    cfg_path = Path.home() / ".config" / "agent-team" / "config.toml"
+    cfg_path = config_path()
     backed_up = False
     if cfg_path.exists():
         shutil.copy2(cfg_path, cfg_path.with_name("config.toml.bak-orchestrator"))
