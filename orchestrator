@@ -2333,7 +2333,8 @@ def _codex_rollout_glob(since: float | None) -> str | None:
 
 
 def _extract_session_id(provider: str, hd: Path,
-                        since: float | None = None) -> str | None:
+                        since: float | None = None,
+                        allow_fallback: bool = True) -> str | None:
     """Best-effort provider session id from a dispatch's artifacts, for
     exact-session follow-ups — driven by the spec's session_source.
 
@@ -2368,7 +2369,7 @@ def _extract_session_id(provider: str, hd: Path,
                 sid = (m.group(1) or "").strip()
                 if sid and (not src.get("uuid") or _UUID_RE.fullmatch(sid)):
                     return sid
-        if src.get("fallback") == "codex-rollout-glob":
+        if allow_fallback and src.get("fallback") == "codex-rollout-glob":
             return _codex_rollout_glob(since)
         return None
 
@@ -2394,11 +2395,14 @@ def _dispatch_started_at(info: dict) -> float | None:
 
 def _capture_session_id(info: dict, hd: Path) -> str | None:
     """Parse and persist the teammate's session id (hd/session). Refreshed
-    whenever newer artifacts yield one — a resumed run can mint a new id.
-    Returns the current best id, falling back to the persisted one."""
-    sid = _extract_session_id(info.get("provider", ""), hd,
-                              _dispatch_started_at(info))
+    whenever its own artifacts yield one — a resumed run can mint a new id.
+    An already-persisted exact id outranks heuristic fallbacks from shared
+    provider storage. Shared-provider fallbacks are never used to seed this
+    durable exact id; without a dispatch artifact, follow-up must refuse."""
     sf = hd / "session"
+    since = _dispatch_started_at(info)
+    sid = _extract_session_id(info.get("provider", ""), hd, since,
+                              allow_fallback=False)
     if sid:
         try:
             sf.write_text(sid + "\n")

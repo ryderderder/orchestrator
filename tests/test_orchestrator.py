@@ -628,6 +628,34 @@ class SessionCaptureTests(unittest.TestCase):
         (self.hd / "result.json").unlink()
         self.assertEqual(tc._capture_session_id(info, self.hd), "s2")
 
+    def test_persisted_codex_id_beats_later_rollout_fallback(self):
+        info = {"provider": "codex", "created_at": "2026-01-01T00:00:00"}
+        (self.hd / "error.log").write_text(
+            f"OpenAI Codex\nsession id: {self.UUID}\n")
+        self.assertEqual(tc._capture_session_id(info, self.hd), self.UUID)
+
+        # A follow-up can fail before Codex emits its banner. In that case a
+        # concurrent, newer global rollout is only a heuristic and must not
+        # replace the exact id already captured from this teammate's banner.
+        (self.hd / "error.log").write_text("failed before session banner\n")
+        other = "029f5468-ea9d-7562-a465-6d69cdd961fb"
+        day = self.dir / ".codex" / "sessions" / "2026" / "07" / "11"
+        day.mkdir(parents=True)
+        (day / f"rollout-new-{other}.jsonl").write_text("x")
+
+        self.assertEqual(tc._capture_session_id(info, self.hd), self.UUID)
+        self.assertEqual((self.hd / "session").read_text().strip(), self.UUID)
+
+    def test_codex_capture_refuses_to_guess_from_global_rollout(self):
+        info = {"provider": "codex", "created_at": "2026-01-01T00:00:00"}
+        (self.hd / "error.log").write_text("failed before session banner\n")
+        day = self.dir / ".codex" / "sessions" / "2026" / "07" / "11"
+        day.mkdir(parents=True)
+        (day / f"rollout-unrelated-{self.UUID}.jsonl").write_text("x")
+
+        self.assertIsNone(tc._capture_session_id(info, self.hd))
+        self.assertFalse((self.hd / "session").exists())
+
 
 class FollowupExactSessionTests(unittest.TestCase):
     """followup resumes the EXACT captured session, or refuses."""
